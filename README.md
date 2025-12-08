@@ -2,11 +2,21 @@
 
 Jetson-first capture + DeepStream inference stack for YOLOv11 detection/pose with a single operator GUI. The repo packages three Python envs (capture, inference, control/GUI), DeepStream configs + custom YOLO parser, and utilities to export Ultralytics weights to TensorRT.
 
+Additonal files for 3D printing and Ardiuno Firmware to flash the RP2040 controller board are included (these files can be removed on the Jetson deployment)
+
 ## What it does
 - FLIR/Spinnaker capture to GStreamer shared memory, with optional TTL trigger gating.
 - DeepStream pipeline (nvinfer + nvdsosd) for YOLOv11 bbox + pose, CSV logging, and dual MP4 recording.
 - Qt GUI for run control, experiment metadata, behavior dashboard, and log tails.
 - Engine builder notebook to convert `.pt` → ONNX → TensorRT and auto-generate matching DeepStream configs.
+
+## Demo
+- For a video walkthrough, see: https://www.youtube.com/watch?v=CRolGeF1rnc
+
+## Files
+- .STEP files for 3D printing are in the MouseHouse CAD folder
+- Arduino code for flashing the RP2040 is in the Arduino Firmware Folder
+- 
 
 ## Repo layout
 - `squeakview_gui.py` – entrypoint; re-execs into the control env if it exists.
@@ -29,7 +39,7 @@ Clone the repo to `/home/jetson/Desktop/squeakview` so the bundled wheel paths r
 
 ```bash
 cd /home/jetson/Desktop/squeakview
-pip install uv  # or use the official installer
+# use the official UV installer https://docs.astral.sh/uv/getting-started/installation/
 
 # Control / GUI env (PySide, serial, psutil)
 uv sync --directory environments/control
@@ -40,8 +50,6 @@ uv sync --directory environments/capture
 # DeepStream inference env (pyds)
 uv sync --directory environments/inference
 ```
-
-If your workspace is not the repo root, set `SQUEAKVIEW_WORKSPACE=/path/to/squeakview` before launching so helper paths resolve correctly.
 
 ## Build the DeepStream parser
 Compile the YOLO bbox/pose parser (match `CUDA_VER` to your Jetson CUDA version):
@@ -62,10 +70,9 @@ This produces `libnvdsinfer_custom_impl_Yolo.so`, which the configs reference.
 3) For pose models, set `pose-kpt-labels-path` (or `labelfile-path`) in the generated config to your keypoint labels.
 
 ## Run it
-- Launch the operator GUI (auto re-execs into the control env if it exists):
-  ```bash
-  python3 squeakview_gui.py
-  # or: environments/control/.venv/bin/python squeakview_gui.py
+- Launch the operator GUI:
+  ```
+  uv run squeakview_gui.py
   ```
 - In the GUI:
   - Select DeepStream config (`DeepStream-Yolo/configs/*.txt`) and socket (`/tmp/cam.sock` by default).
@@ -73,23 +80,8 @@ This produces `libnvdsinfer_custom_impl_Yolo.so`, which the configs reference.
   - Optional: enable serial (port + baud) for TTL start/stop and behavior events.
   - Click **Start Recording** to launch capture + inference; outputs land in `runs/<timestamp>` (or `runs/<mouse_id>_<timestamp>`).
 
-## Headless CLI snippets
-- Capture only:
-  ```bash
-  uv run --directory environments/capture -m squeakview.apps.capture.main --width 1440 --height 1080 --fps 30 --socket /tmp/cam.sock
-  ```
-- Inference only (reuse an existing run dir if desired):
-  ```bash
-  uv run --directory environments/inference -m squeakview.apps.inference.main \
-    --sock /tmp/cam.sock --cfg DeepStream-Yolo/configs/mousehouse_pose_fp16.txt \
-    --width 1440 --height 1080 --fps 30 --bitrate 4000 --run-dir runs/your_run_dir
-  ```
-
 ## Outputs and toggles
 - `runs/<timestamp>/raw.mp4` – encoded capture.
 - `runs/<timestamp>/detections.csv` – bbox/pose metadata.
 - `runs/<timestamp>/perf_stats.csv` – FPS/latency.
 - `preview_toggle.txt`, `skeleton_toggle.txt`, `video_toggle.txt` – runtime toggles monitored by the inference app.
-
-## Git/LFS hygiene
-- Large artifacts to ignore or keep in LFS: `runs/`, `DeepStream-Yolo/engines/`, `DeepStream-Yolo/artifacts/onnx/`, `DeepStream-Yolo/artifacts/weights/*.pt`, `*.engine`, `*.mp4`, `*.log`, `.venv/`, `*.so`, `*.whl`, `__pycache__/`.
