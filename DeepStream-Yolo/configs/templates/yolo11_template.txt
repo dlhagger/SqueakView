@@ -1,0 +1,33 @@
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+
+onnx-file=../artifacts/onnx/sample.onnx
+model-engine-file=../engines/sample.engine
+
+network-mode=0                  # 0=FP32, 1=INT8, 2=FP16
+network-type=0                  # detector
+infer-dims=3;640;640
+batch-size=1
+output-tensor-meta=1
+
+num-detected-classes=1
+labelfile-path=../artifacts/weights/labels.txt
+
+parse-bbox-func-name=NvDsInferParseYolo
+custom-lib-path=../nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
+engine-create-func-name=NvDsInferYoloCudaEngineGet
+
+cluster-mode=2
+maintain-aspect-ratio=1
+symmetric-padding=1
+workspace-size=2048
+gie-unique-id=1
+interval=0
+process-mode=1
+
+[class-attrs-all]
+nms-iou-threshold=0.15
+pre-cluster-threshold=0.9
+topk=20

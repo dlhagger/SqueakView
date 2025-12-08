@@ -1,0 +1,12 @@
+[project]
+name = "jetson-inference"
+version = "0.1.0"
+description = "DeepStream inference pipeline with shared memory input and dual recording."
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "numpy==1.26.4",
+  "pyds",
+]
+
+[tool.uv.sources]
+pyds = { path = '/home/jetson/Desktop/squeakview/wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl' }

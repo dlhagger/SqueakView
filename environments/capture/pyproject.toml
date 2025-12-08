@@ -1,0 +1,12 @@
+[project]
+name = "jetson-capture"
+version = "0.1.0"
+description = "Camera capture stack using Spinnaker and GStreamer shared memory output."
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "numpy==2.2.6",
+  "spinnaker-python",
+]
+
+[tool.uv.sources]
+spinnaker-python = { path = '/home/jetson/Desktop/squeakview/wheel_files/spinnaker_python-4.2.0.88-cp310-cp310-linux_aarch64.whl'}

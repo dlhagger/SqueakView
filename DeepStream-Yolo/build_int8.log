@@ -1,0 +1,6 @@
+Setting min object dimensions as 16x16 instead of 1x1 to support VIC compute mode.
+WARNING: Deserialize engine failed because file path: /home/neurodarden/DeepStream-Yolo/engines/best_11n_bbox_ds_int8_b1_gpu0.engine open error
+WARNING: INT8 calibration file not specified/accessible. INT8 calibration can be done through setDynamicRange API in 'NvDsInferCreateNetwork' implementation
+
+Building the TensorRT Engine
+
