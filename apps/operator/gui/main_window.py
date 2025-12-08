@@ -135,7 +135,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._config_data: dict | None = None
         self._preview_window_id: int | None = None
-        self._preview_enabled: bool = True
 
         self.backend = OperatorBackend(self._emit_log, self._forward_dashboard)
 
@@ -198,23 +197,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_btn.setEnabled(False)
         self.run_btn.clicked.connect(self._on_run)
         btn_row.addWidget(self.run_btn)
-        self.video_btn = QtWidgets.QPushButton("Video: On")
-        self.video_btn.setCheckable(True)
-        self.video_btn.setChecked(True)
-        self.video_btn.setEnabled(False)
-        self.video_btn.clicked.connect(self._on_video_toggle)
-        btn_row.addWidget(self.video_btn)
         self.skeleton_btn = QtWidgets.QPushButton("Skeleton: Off")
         self.skeleton_btn.setCheckable(True)
         self.skeleton_btn.setEnabled(False)
         self.skeleton_btn.clicked.connect(self._on_skeleton_toggle)
         btn_row.addWidget(self.skeleton_btn)
-        self.preview_btn = QtWidgets.QPushButton("Preview: On")
-        self.preview_btn.setCheckable(True)
-        self.preview_btn.setChecked(True)
-        self.preview_btn.setEnabled(False)
-        self.preview_btn.clicked.connect(self._on_preview_toggle)
-        btn_row.addWidget(self.preview_btn)
         self.stop_btn = QtWidgets.QPushButton("Stop Recording")
         self.stop_btn.setObjectName("dangerButton")
         self.stop_btn.setEnabled(False)
@@ -382,7 +369,6 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.mouse_id = data.get("mouse_id", "")
         self.run_btn.setEnabled(True)
         self._set_skeleton_button_state(enabled=False, checked=cfg.draw_skeleton)
-        self._set_video_button_state(enabled=False, checked=True)
 
     def _build_launch_config(self) -> process.LaunchConfig:
         if not self._config_data:
@@ -455,15 +441,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview.show_hint(False)
         self.preview.set_status("Live", color="#5c6df5")
         self.preview.set_preview_enabled(True)
-        self._preview_enabled = True
         self._emit_log("[GUI] Run started")
         self.run_btn.setEnabled(False)
-        self.preview_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
         self.configure_btn.setEnabled(False)
         # Enable skeleton toggle once a run is active (only meaningful when inference is on)
         self._set_skeleton_button_state(enabled=config.inference_enabled, checked=config.draw_skeleton)
-        self._set_video_button_state(enabled=config.inference_enabled, checked=True)
 
     def _on_stop(self) -> None:
         self.backend.stop_run()
@@ -472,11 +455,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview.set_preview_enabled(True)
         self._emit_log("[GUI] Run stopped")
         self.run_btn.setEnabled(True)
-        self.preview_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
         self.configure_btn.setEnabled(True)
         self._set_skeleton_button_state(enabled=False, checked=self.skeleton_btn.isChecked())
-        self._set_video_button_state(enabled=False, checked=self.video_btn.isChecked())
 
     # ---- Logging --------------------------------------------------------
     def _emit_log(self, msg: str) -> None:
@@ -486,17 +467,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _append_log(self, msg: str) -> None:
         self.statusBar().showMessage(msg, 5000)
         print(msg, flush=True)
-
-    def _on_preview_toggle(self, enabled: bool | None = None) -> None:
-        state = enabled if isinstance(enabled, bool) else self.preview_btn.isChecked()
-        self._preview_enabled = state
-        self.preview_btn.setText(f"Preview: {'On' if state else 'Off'}")
-        self.preview_btn.setChecked(state)
-        self.preview.set_preview_enabled(state)
-        try:
-            self.backend.set_preview_enabled(state)
-        except Exception:
-            pass
 
     def _set_skeleton_button_state(self, *, enabled: bool, checked: bool) -> None:
         self.skeleton_btn.setEnabled(enabled)
@@ -508,19 +478,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_skeleton_button_state(enabled=True, checked=state)
         try:
             self.backend.set_skeleton_enabled(state)
-        except Exception:
-            pass
-
-    def _set_video_button_state(self, *, enabled: bool, checked: bool) -> None:
-        self.video_btn.setEnabled(enabled)
-        self.video_btn.setChecked(checked)
-        self.video_btn.setText(f"Video: {'On' if checked else 'Off'}")
-
-    def _on_video_toggle(self) -> None:
-        state = self.video_btn.isChecked()
-        self._set_video_button_state(enabled=True, checked=state)
-        try:
-            self.backend.set_video_enabled(state)
         except Exception:
             pass
 

@@ -230,18 +230,6 @@ class OperatorBackend:
     def shutdown(self) -> None:
         self.stop_run()
 
-    def set_preview_enabled(self, enabled: bool) -> None:
-        run_dir = self._maybe_set_run_dir_from_marker()
-        if not run_dir:
-            self._log("[BACKEND] preview toggle ignored; run dir unknown")
-            return
-        path = run_dir / "preview_toggle.txt"
-        try:
-            path.write_text("on" if enabled else "off")
-            self._log(f"[BACKEND] preview {'on' if enabled else 'off'}")
-        except Exception as exc:
-            self._log(f"[BACKEND] preview toggle failed: {exc}")
-
     def set_skeleton_enabled(self, enabled: bool) -> None:
         """Toggle pose skeleton drawing at runtime by touching the control file."""
         run_dir = self._maybe_set_run_dir_from_marker()
@@ -254,16 +242,3 @@ class OperatorBackend:
             self._log(f"[BACKEND] skeleton {'on' if enabled else 'off'}")
         except Exception as exc:
             self._log(f"[BACKEND] skeleton toggle failed: {exc}")
-
-    def set_video_enabled(self, enabled: bool) -> None:
-        """Toggle whether the live camera feed (vs black background) is shown in the overlay."""
-        run_dir = self._maybe_set_run_dir_from_marker()
-        if not run_dir:
-            self._log("[BACKEND] video toggle ignored; run dir unknown")
-            return
-        path = run_dir / "video_toggle.txt"
-        try:
-            path.write_text("on" if enabled else "off")
-            self._log(f"[BACKEND] video {'on' if enabled else 'off'}")
-        except Exception as exc:
-            self._log(f"[BACKEND] video toggle failed: {exc}")

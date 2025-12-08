@@ -239,6 +239,7 @@ class App:
         self.pipeline = None
         self.loop = GLib.MainLoop()
         self._stopping = False
+        self._preview_valve = None
         self._window_handle = config.window_xid
         self._infer_starts: dict[int, float] = {}
         self._perf_window_sec = 5.0
@@ -475,8 +476,7 @@ class App:
             pad = osd.get_static_pad("sink")
             assert pad is not None, "osd sink pad missing"
             pad.add_probe(Gst.PadProbeType.BUFFER, self.on_probe)
-
-            self._preview_valve = self.pipeline.get_by_name("preview_valve")
+        self._preview_valve = self.pipeline.get_by_name("preview_valve")
         if self._preview_valve is None:
             print(f"[{ts()}] [WARN] preview valve missing; preview toggle unavailable")
         else:
