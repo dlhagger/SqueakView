@@ -173,7 +173,6 @@ class App:
         else:
             self.run_dir = run_context.timestamped_run_dir("ds")
         self.artifacts = run_context.run_artifacts(self.run_dir)
-        self.preview_ctrl_path = self.run_dir / "preview_toggle.txt"
         self.preview_enabled = True
         if self.enable_infer:
             self.pose_mode, self.pose_kpt_count, self.pose_input_dims = self._detect_pose_mode(config)
@@ -217,12 +216,6 @@ class App:
             self.skeleton_ctrl_path.write_text("on" if self.draw_skeleton else "off")
         except Exception:
             pass
-        self.video_ctrl_path = self.run_dir / "video_toggle.txt"
-        self.video_enabled = True
-        try:
-            self.video_ctrl_path.write_text("on")
-        except Exception:
-            pass
         self.csv: CSVWriter | None = None
         if self.enable_infer:
             self.csv = CSVWriter(
@@ -240,6 +233,7 @@ class App:
         self.loop = GLib.MainLoop()
         self._stopping = False
         self._preview_valve = None
+        self.video_enabled = True
         self._window_handle = config.window_xid
         self._infer_starts: dict[int, float] = {}
         self._perf_window_sec = 5.0
@@ -272,16 +266,11 @@ class App:
         except Exception:
             self._surf_debug_limit = 15
         GLib.timeout_add_seconds(1, self._poll_skeleton_toggle)
-        GLib.timeout_add_seconds(1, self._poll_video_toggle)
         if self.pose_mode:
             self._init_pose_cache_helper()
         print(f"[{ts()}] [INFO] run dir:      {self.run_dir}", flush=True)
         print(f"[{ts()}] [INFO] run marker:   {run_context.RUN_MARKER}", flush=True)
         atexit.register(self._atexit_cleanup)
-        try:
-            self.preview_ctrl_path.write_text("on")
-        except Exception:
-            pass
 
     @staticmethod
     def _detect_pose_mode(config: InferenceConfig) -> tuple[bool, int, tuple[float, float]]:
@@ -490,12 +479,13 @@ class App:
                 live_pad = self._vis_select.get_static_pad("sink_0")
                 if live_pad:
                     self._vis_select.set_property("active-pad", live_pad)
+                self._apply_video_state()
             except Exception as exc:
                 print(f"[{ts()}] [WARN] could not set initial video pad: {exc}")
         else:
             if self.enable_infer:
                 print(f"[{ts()}] [WARN] vis_select missing; video toggle unavailable")
-        GLib.timeout_add_seconds(1, self._poll_preview_toggle)
+        # Preview/video toggles were removed; always keep preview enabled when a window is available.
 
     def _collect_debug_queues(self) -> None:
         """Gather queue elements to log their levels with frame metadata."""
@@ -1124,26 +1114,6 @@ class App:
         except Exception:
             pass
 
-    def _poll_preview_toggle(self):
-        try:
-            text = self.preview_ctrl_path.read_text().strip().lower()
-        except FileNotFoundError:
-            text = ""
-        except Exception:
-            return True
-        new_state = text != "off"
-        if not self._window_handle:
-            new_state = False
-        if new_state != self.preview_enabled:
-            self.preview_enabled = new_state
-            if getattr(self, "_preview_valve", None):
-                try:
-                    self._preview_valve.set_property("drop", not new_state)
-                    print(f"[{ts()}] [PREVIEW] {'enabled' if new_state else 'disabled'}")
-                except Exception as exc:
-                    print(f"[{ts()}] [PREVIEW] toggle failed: {exc}")
-        return True
-
     def _poll_skeleton_toggle(self):
         try:
             text = self.skeleton_ctrl_path.read_text().strip().lower()
@@ -1157,30 +1127,16 @@ class App:
             print(f"[{ts()}] [POSE] skeleton {'enabled' if new_state else 'disabled'}")
         return True
 
-    def _poll_video_toggle(self):
-        try:
-            text = self.video_ctrl_path.read_text().strip().lower()
-        except FileNotFoundError:
-            text = "on"
-        except Exception:
-            return True
-        new_state = text != "off"
-        if new_state != self.video_enabled:
-            self.video_enabled = new_state
-            self._apply_video_state()
-        return True
-
     def _apply_video_state(self):
+        """Ensure the live feed stays selected on the visualizer input selector."""
         if not getattr(self, "_vis_select", None):
             return
-        pad_name = "sink_0" if self.video_enabled else "sink_1"
         try:
-            pad = self._vis_select.get_static_pad(pad_name)
+            pad = self._vis_select.get_static_pad("sink_0")
             if pad:
                 self._vis_select.set_property("active-pad", pad)
-                print(f"[{ts()}] [VIDEO] feed {'enabled' if self.video_enabled else 'black background'}")
-        except Exception as exc:
-            print(f"[{ts()}] [VIDEO] toggle failed: {exc}")
+        except Exception:
+            pass
 
 
 def run(config: InferenceConfig) -> None:

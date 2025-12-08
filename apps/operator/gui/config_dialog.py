@@ -91,7 +91,7 @@ class ConfigDialog(QtWidgets.QDialog):
         serial_row.addWidget(self.serial_baud_edit)
         form.addRow("", serial_row)
 
-        default_cfg = cfg.get("ds_cfg", squeakview_config.DEEPSTREAM_ROOT / "configs" / "best_11n_bbox_fp16.txt")
+        default_cfg = cfg.get("ds_cfg", "")
         self.cfg_edit = QtWidgets.QLineEdit(str(default_cfg))
         browse_btn = QtWidgets.QPushButton("Browse…")
         browse_btn.clicked.connect(self._on_browse_cfg)
