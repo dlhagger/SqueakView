@@ -85,3 +85,9 @@ This produces `libnvdsinfer_custom_impl_Yolo.so`, which the configs reference.
 - `runs/<timestamp>/detections.csv` – bbox/pose metadata.
 - `runs/<timestamp>/perf_stats.csv` – FPS/latency.
 - `preview_toggle.txt`, `skeleton_toggle.txt`, `video_toggle.txt` – runtime toggles monitored by the inference app.
+
+## License & notice
+Temporary Research Use Only License
+Copyright © 2025 National Institutes of Health
+
+This software is available for academic and non-profit research use under a temporary Research Use Only license. Commercial use may require a separate license from the NIH Office of Technology Transfer. All use, redistribution, and modification must additionally comply with the licensing terms of third-party software dependencies incorporated into the system. The licensing terms will be updated upon completion of the NIH review.
