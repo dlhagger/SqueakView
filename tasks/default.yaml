@@ -1,0 +1,51 @@
+task_name: SqueakView Default
+schema_version: 1
+
+events:
+  - name: POKE
+    match:
+      event_contains: "POKE"
+      phase: "start"
+    split_by_side: true
+    use_count_field: true
+    plot: "Poke"
+
+  - name: DRINK
+    match:
+      event_contains: "DRINK"
+      phase: "start"
+    split_by_side: true
+    use_count_field: true
+    plot: "Drink"
+
+  - name: PELLET
+    match:
+      event_contains: "PELLET"
+      phase: "retrieval"
+    split_by_side: false
+    plot: "Pellet"
+
+  - name: WELL_CHECK
+    match:
+      event_contains: "WELL_CHECK"
+      phase: "start"
+    split_by_side: false
+    plot: "Pellet"
+
+dashboard:
+  plots:
+    - id: "Poke"
+      title: "Pokes"
+      series:
+        - "POKE_L"
+        - "POKE_R"
+    - id: "Drink"
+      title: "Drinks"
+      series:
+        - "DRINK_L"
+        - "DRINK_R"
+    - id: "Pellet"
+      title: "Pellet & Well"
+      series:
+        - "PELLET"
+        - "WELL_CHECK"

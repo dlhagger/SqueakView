@@ -1,0 +1,20 @@
+# Local run outputs
+runs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+
+# DS/engine artifacts (large binaries) can live outside git; keep local outputs clean
+DeepStream-Yolo/engines/
+DeepStream-Yolo/artifacts/onnx/
+DeepStream-Yolo/artifacts/weights/*.pt
+
+#tool omit
+tools/
+
+# OS cruft
+.DS_Store

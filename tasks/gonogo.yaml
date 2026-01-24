@@ -1,0 +1,95 @@
+task_name: Go NoGo
+schema_version: 1
+
+events:
+  - name: POKE
+    match:
+      event_contains: "POKE"
+      phase: "start"
+    split_by_side: true
+    use_count_field: true
+    plot: "Poke"
+
+  - name: DRINK
+    match:
+      event_contains: "DRINK"
+      phase: "start"
+    split_by_side: true
+    use_count_field: true
+    plot: "Drink"
+
+  - name: PELLET
+    match:
+      event_contains: "PELLET"
+      phase: "retrieval"
+    split_by_side: false
+    plot: "Pellet"
+
+  - name: WELL_CHECK
+    match:
+      event_contains: "WELL_CHECK"
+      phase: "start"
+    split_by_side: false
+    plot: "Pellet"
+
+  - name: GO_CORRECT
+    match:
+      event_equals: "TRIAL_RESULT"
+      reason_equals: "GO"
+      value_equals: "1"
+    split_by_side: false
+    plot: "Outcome"
+
+  - name: GO_INCORRECT
+    match:
+      event_equals: "TRIAL_RESULT"
+      reason_equals: "GO"
+      value_equals: "0"
+    split_by_side: false
+    plot: "Outcome"
+
+  - name: NOGO_CORRECT
+    match:
+      event_equals: "TRIAL_RESULT"
+      reason_equals: "NOGO"
+      value_equals: "1"
+    split_by_side: false
+    plot: "Outcome"
+
+  - name: NOGO_INCORRECT
+    match:
+      event_equals: "TRIAL_RESULT"
+      reason_equals: "NOGO"
+      value_equals: "0"
+    split_by_side: false
+    plot: "Outcome"
+
+dashboard:
+  plots:
+    - id: "Poke"
+      title: "Pokes"
+      series:
+        - "POKE_L"
+        - "POKE_R"
+    - id: "Drink"
+      title: "Drinks"
+      series:
+        - "DRINK_L"
+        - "DRINK_R"
+    - id: "Pellet"
+      title: "Pellet & Well"
+      series:
+        - "PELLET"
+        - "WELL_CHECK"
+    - id: "Outcome"
+      title: "Go/NoGo Outcome"
+      type: "matrix"
+      layout:
+        rows:
+          - ["GO_CORRECT", "NOGO_CORRECT"]
+          - ["GO_INCORRECT", "NOGO_INCORRECT"]
+        style_map:
+          GO_CORRECT: correct
+          NOGO_CORRECT: correct
+          GO_INCORRECT: incorrect
+          NOGO_INCORRECT: incorrect
