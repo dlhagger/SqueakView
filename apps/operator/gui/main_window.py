@@ -171,7 +171,8 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(preview_group, 0, 0, 1, 2)
 
         # Dashboard (plots) and meters (top-right)
-        self.dashboard = BehaviorDashboard(window_sec=300.0, pellet_mode="arrival")
+        # Count pellets on retrieval events by default (arrival-only counting was confusing)
+        self.dashboard = BehaviorDashboard(window_sec=300.0, pellet_mode="retrieval")
         meters_only = self.dashboard.detach_meters()
         meters_group = QtWidgets.QGroupBox("System Load")
         meters_layout = QtWidgets.QVBoxLayout(meters_group)
@@ -336,6 +337,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Pixel: {data['pixel_format']}",
             f"Trigger: {'On' if data['trigger_on'] else 'Off'}",
             f"Config: {Path(data['ds_cfg']).name}",
+            f"Task: {Path(data['task_cfg']).name}",
         ]
         if data.get("mouse_id"):
             summary_parts.append(f"Mouse: {data['mouse_id']}")
@@ -349,6 +351,10 @@ class MainWindow(QtWidgets.QMainWindow):
         info = f"{data['width']}×{data['height']} · {data['fps']} FPS · {'Trig' if data['trigger_on'] else 'Free'} · {data['bitrate']} kbps"
         self.preview.set_info(info)
         self.statusBar().showMessage("Configuration committed.", 4000)
+        try:
+            self.dashboard.apply_task_config(Path(data["task_cfg"]))
+        except Exception as exc:
+            self._emit_log(f"[GUI] Task config load failed: {exc}")
 
         cfg = self.backend.launch_cfg
         cfg.width = data["width"]
@@ -367,6 +373,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.serial_baud = data["serial_baud"]
         cfg.arduino_fps = data["arduino_fps"]
         cfg.mouse_id = data.get("mouse_id", "")
+        cfg.task_cfg = Path(data["task_cfg"])
         self.run_btn.setEnabled(True)
         self._set_skeleton_button_state(enabled=False, checked=cfg.draw_skeleton)
 
@@ -391,6 +398,7 @@ class MainWindow(QtWidgets.QMainWindow):
             arduino_fps=data["arduino_fps"],
             mouse_id=data.get("mouse_id", ""),
             draw_skeleton=data.get("draw_skeleton", False),
+            task_cfg=Path(data["task_cfg"]),
         )
         cfg.preview_window_id = self._preview_window_id
         return cfg

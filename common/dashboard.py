@@ -78,7 +78,7 @@ def is_start_event(data: Dict[str, object]) -> bool:
     reason = str(data.get("reason", "")).strip().upper()
     if reason in START_TOK or context in START_TOK:
         return True
-    return any(tok in event_uc for tok in ("_START", " START", " ON", " DOWN", " PRESS", " ARRIVAL"))
+    return any(tok in event_uc for tok in ("_START", " START", " ON", " DOWN", " PRESS", " ARRIVAL", "_ARRIVAL"))
 
 
 def is_end_event(data: Dict[str, object]) -> bool:
@@ -87,7 +87,7 @@ def is_end_event(data: Dict[str, object]) -> bool:
     reason = str(data.get("reason", "")).strip().upper()
     if reason in END_TOK or context in END_TOK:
         return True
-    return any(tok in event_uc for tok in ("_END", " END", " OFF", " UP", " RELEASE", " RETRIEVAL"))
+    return any(tok in event_uc for tok in ("_END", " END", " OFF", " UP", " RELEASE", " RETRIEVAL", "_RETRIEVAL"))
 
 
 def choose_event_time(data: Dict[str, object]) -> float:

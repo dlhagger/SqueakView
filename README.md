@@ -86,6 +86,30 @@ This produces `libnvdsinfer_custom_impl_Yolo.so`, which the configs reference.
 - `runs/<timestamp>/perf_stats.csv` – FPS/latency.
 - `preview_toggle.txt`, `skeleton_toggle.txt`, `video_toggle.txt` – runtime toggles monitored by the inference app.
 
+
+## Email alerts (optional)
+- The serial reader can fire an email when a serial line contains a phrase (default: “Feeder jammed”). Configure via env vars before launching the GUI:
+  - `SQUEAKVIEW_ALERT_EMAIL_HOST` / `SQUEAKVIEW_ALERT_EMAIL_PORT` (e.g., smtp.gmail.com / 587)
+  - `SQUEAKVIEW_ALERT_EMAIL_USER` / `SQUEAKVIEW_ALERT_EMAIL_PASS` (SMTP/app password)
+  - `SQUEAKVIEW_ALERT_EMAIL_FROM` / `SQUEAKVIEW_ALERT_EMAIL_TO`
+  - `SQUEAKVIEW_ALERT_EMAIL_TLS` (1/0), `SQUEAKVIEW_ALERT_EMAIL_SUBJECT` (optional)
+  - `SQUEAKVIEW_SERIAL_ALERT_PHRASE` to override the trigger text
+- Example (use an app password for Gmail):
+  ```bash
+  export SQUEAKVIEW_ALERT_EMAIL_HOST="smtp.gmail.com"
+  export SQUEAKVIEW_ALERT_EMAIL_PORT="587"
+  export SQUEAKVIEW_ALERT_EMAIL_USER="squeakview.alerts@gmail.com"
+  export SQUEAKVIEW_ALERT_EMAIL_PASS="your_app_password"
+  export SQUEAKVIEW_ALERT_EMAIL_FROM="squeakview.alerts@gmail.com"
+  export SQUEAKVIEW_ALERT_EMAIL_TO="you@example.com"
+  export SQUEAKVIEW_ALERT_EMAIL_TLS="1"
+  export SQUEAKVIEW_SERIAL_ALERT_PHRASE="Feeder jammed"
+  export SQUEAKVIEW_ALERT_EMAIL_SUBJECT="SqueakView serial alert test"
+  uv run squeakview_gui.py
+  ```
+  alerts dont block capture/serial log. user must config app password with an email domain (this is not your gmail password :))
+
+
 ## License & notice
 Temporary Research Use Only License
 Copyright © 2025 National Institutes of Health

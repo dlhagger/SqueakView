@@ -14,7 +14,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = "==1.26.4" },
-    { name = "pyds", path = "../../wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl" },
+    { name = "pyds", path = "../../../../../jetson/Desktop/squeakview/wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl" },
 ]
 
 [[package]]
@@ -36,7 +36,7 @@ wheels = [
 [[package]]
 name = "pyds"
 version = "1.2.0"
-source = { path = "../../wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl" }
+source = { path = "../../../../../jetson/Desktop/squeakview/wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl" }
 wheels = [
     { filename = "pyds-1.2.0-cp310-cp310-linux_aarch64.whl", hash = "sha256:e448f8eefa69f0ba3b76b54e9370e33d78ad45f304b86e70d51721827832d16c" },
 ]

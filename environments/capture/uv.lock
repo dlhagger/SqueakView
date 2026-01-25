@@ -14,7 +14,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = "==2.2.6" },
-    { name = "spinnaker-python", path = "../../wheel_files/spinnaker_python-4.2.0.88-cp310-cp310-linux_aarch64.whl" },
+    { name = "spinnaker-python", path = "../../../../../jetson/Desktop/squeakview/wheel_files/spinnaker_python-4.2.0.88-cp310-cp310-linux_aarch64.whl" },
 ]
 
 [[package]]
@@ -42,7 +42,7 @@ wheels = [
 [[package]]
 name = "spinnaker-python"
 version = "4.2.0.88"
-source = { path = "../../wheel_files/spinnaker_python-4.2.0.88-cp310-cp310-linux_aarch64.whl" }
+source = { path = "../../../../../jetson/Desktop/squeakview/wheel_files/spinnaker_python-4.2.0.88-cp310-cp310-linux_aarch64.whl" }
 dependencies = [
     { name = "numpy" },
 ]

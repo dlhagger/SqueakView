@@ -82,6 +82,18 @@ class ConfigDialog(QtWidgets.QDialog):
         self.mouse_id_edit = QtWidgets.QLineEdit(str(cfg.get("mouse_id", "")))
         form.addRow("Mouse ID:", self.mouse_id_edit)
 
+        task_default = cfg.get("task_cfg", "")
+        if not task_default:
+            candidate = squeakview_config.TASKS_DIR / "default.yaml"
+            task_default = str(candidate) if candidate.exists() else ""
+        self.task_cfg_edit = QtWidgets.QLineEdit(str(task_default))
+        task_browse_btn = QtWidgets.QPushButton("Browse…")
+        task_browse_btn.clicked.connect(self._on_browse_task_cfg)
+        task_layout = QtWidgets.QHBoxLayout()
+        task_layout.addWidget(self.task_cfg_edit, 1)
+        task_layout.addWidget(task_browse_btn, 0)
+        form.addRow("Task config:", task_layout)
+
         serial_row = QtWidgets.QHBoxLayout()
         self.serial_port_edit = QtWidgets.QLineEdit(cfg.get("serial_port", "/dev/ttyACM0"))
         serial_row.addWidget(QtWidgets.QLabel("Port:"))
@@ -137,6 +149,21 @@ class ConfigDialog(QtWidgets.QDialog):
         if path:
             self.cfg_edit.setText(path)
 
+    def _on_browse_task_cfg(self) -> None:
+        start_dir = (
+            Path(self.task_cfg_edit.text()).parent
+            if self.task_cfg_edit.text()
+            else squeakview_config.TASKS_DIR
+        )
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select task config",
+            str(start_dir),
+            "Task config (*.yaml *.yml *.json);;All files (*)",
+        )
+        if path:
+            self.task_cfg_edit.setText(path)
+
     def accept(self) -> None:
         try:
             width = int(self.width_edit.text()) or 1280
@@ -164,12 +191,23 @@ class ConfigDialog(QtWidgets.QDialog):
             "ds_cfg": Path(self.cfg_edit.text().strip()),
             "inference_enabled": self.inference_enable.isChecked(),
             "draw_skeleton": self.skeleton_chk.isChecked(),
+            "task_cfg": Path(self.task_cfg_edit.text().strip()),
             "socket_path": self.socket_edit.text().strip() or "/tmp/cam.sock",
             "bitrate": bitrate,
             "mouse_id": self.mouse_id_edit.text().strip(),
         }
         if not self._result["ds_cfg"].exists():
             QtWidgets.QMessageBox.warning(self, "Config missing", f"DeepStream config not found:\n{self._result['ds_cfg']}")
+            return
+        if not str(self._result["task_cfg"]):
+            QtWidgets.QMessageBox.warning(self, "Task config required", "Please select a task config before starting.")
+            return
+        if not self._result["task_cfg"].exists():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Task config missing",
+                f"Task config not found:\n{self._result['task_cfg']}",
+            )
             return
         super().accept()
 

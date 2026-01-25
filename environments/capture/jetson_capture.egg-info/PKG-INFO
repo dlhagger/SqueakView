@@ -1,7 +1,0 @@
-Metadata-Version: 2.4
-Name: jetson-capture
-Version: 0.1.0
-Summary: Camera capture stack using Spinnaker and GStreamer shared memory output.
-Requires-Python: <3.11,>=3.10
-Requires-Dist: numpy==2.2.6
-Requires-Dist: spinnaker-python@ file:../../spinnaker_python-4.2.0.88-cp310-cp310-linux_aarch64.whl

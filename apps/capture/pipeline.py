@@ -2,11 +2,13 @@ from __future__ import annotations
 
 """Capture pipeline wrapping PySpin → GStreamer shared memory."""
 
+import csv
 import os
 import signal
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import PySpin
 import gi
@@ -132,10 +134,15 @@ def pyspin_setup(
     enable_node = PySpin.CBooleanPtr(nm.GetNode("AcquisitionFrameRateEnable"))
     fps_node = PySpin.CFloatPtr(nm.GetNode("AcquisitionFrameRate"))
     try:
-        if PySpin.IsAvailable(enable_node) and PySpin.IsWritable(enable_node):
-            enable_node.SetValue(True)
-        if PySpin.IsAvailable(fps_node) and PySpin.IsWritable(fps_node):
-            fps_node.SetValue(float(fps))
+        if trigger_on:
+            # In external trigger mode, let triggers drive timing; avoid internal FPS cap.
+            if PySpin.IsAvailable(enable_node) and PySpin.IsWritable(enable_node):
+                enable_node.SetValue(False)
+        else:
+            if PySpin.IsAvailable(enable_node) and PySpin.IsWritable(enable_node):
+                enable_node.SetValue(True)
+            if PySpin.IsAvailable(fps_node) and PySpin.IsWritable(fps_node):
+                fps_node.SetValue(float(fps))
     except Exception:
         pass
 
@@ -218,6 +225,9 @@ class CaptureConfig:
     gain: float | None = None
     trig_timeout_ms: int = 1000
     socket_path: str = DEFAULT_SOCKET
+    ready_file: str | None = None
+    stats_file: str | None = None
+    frame_log: str | None = None
 
 
 def run_capture(config: CaptureConfig) -> None:
@@ -233,8 +243,72 @@ def run_capture(config: CaptureConfig) -> None:
     system = cam_list = cam = None
     pipeline = None
     appsrc = None
+    stats_fh = None
+    stats_writer = None
+    stats_started = None
+    stats_last_log = None
+    events_fh = None
+    events_writer = None
+    frames_ok = 0
+    frames_incomplete = 0
+    frames_timeout = 0
+    frames_push_error = 0
+    frame_seq = 0
+
+    def _stats_log(force: bool = False) -> None:
+        nonlocal stats_last_log
+        if not stats_writer or stats_started is None:
+            return
+        now = time.time()
+        if not force and stats_last_log is not None and (now - stats_last_log) < 5.0:
+            return
+        stats_last_log = now
+        elapsed = now - stats_started
+        stats_writer.writerow(
+            [f"{elapsed:.3f}", frames_ok, frames_incomplete, frames_timeout, frames_push_error]
+        )
+        try:
+            stats_fh.flush()
+        except Exception:
+            pass
+
+    def _event_log(event: str) -> None:
+        if not events_writer:
+            return
+        try:
+            events_writer.writerow([f"{time.time():.6f}", event, frame_seq])
+            events_fh.flush()
+        except Exception:
+            pass
 
     try:
+        if config.stats_file:
+            try:
+                stats_path = Path(config.stats_file)
+                stats_path.parent.mkdir(parents=True, exist_ok=True)
+                stats_fh = stats_path.open("w", newline="", buffering=1)
+                stats_writer = csv.writer(stats_fh)
+                stats_writer.writerow(
+                    ["elapsed_s", "frames_ok", "frames_incomplete", "frames_timeout", "frames_push_error"]
+                )
+                stats_started = time.time()
+                stats_last_log = stats_started
+            except Exception:
+                stats_fh = None
+                stats_writer = None
+                stats_started = None
+                stats_last_log = None
+        if config.frame_log:
+            try:
+                events_path = Path(config.frame_log)
+                events_path.parent.mkdir(parents=True, exist_ok=True)
+                events_fh = events_path.open("w", newline="", buffering=1)
+                events_writer = csv.writer(events_fh)
+                events_writer.writerow(["ts_epoch_s", "event", "frame_seq"])
+            except Exception:
+                events_fh = None
+                events_writer = None
+
         system, cam_list, cam = pyspin_setup(
             config.width,
             config.height,
@@ -258,12 +332,24 @@ def run_capture(config: CaptureConfig) -> None:
 
         with _signal_handler(on_sig):
             cam.BeginAcquisition()
+            if config.ready_file:
+                try:
+                    path = Path(config.ready_file)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("ready\n")
+                except Exception:
+                    pass
             t0 = time.time()
+            _stats_log(force=True)
+            _event_log("START")
 
             while not stop:
                 try:
                     image = cam.GetNextImage(config.trig_timeout_ms)
                     if image.IsIncomplete():
+                        frames_incomplete += 1
+                        _event_log("INCOMPLETE")
+                        _stats_log()
                         image.Release()
                         continue
                     frame = image.GetNDArray()
@@ -274,6 +360,9 @@ def run_capture(config: CaptureConfig) -> None:
                         break
                     msg = str(exc) or repr(exc)
                     if "Timeout" in msg or "Timeout" in repr(exc):
+                        frames_timeout += 1
+                        _event_log("TIMEOUT")
+                        _stats_log()
                         continue
                     if "EventData" in msg or "-1011" in msg:
                         # Occurs when acquisition is being torn down; treat as benign.
@@ -291,11 +380,32 @@ def run_capture(config: CaptureConfig) -> None:
                     buf.dts = pts_ns
                     buf.duration = 0
                     appsrc.emit("push-buffer", buf)
+                    frames_ok += 1
+                    frame_seq += 1
+                    _event_log("OK")
+                    _stats_log()
                 except Exception as exc:
+                    frames_push_error += 1
+                    _event_log("PUSH_ERROR")
+                    _stats_log()
                     warn(f"GStreamer push-buffer: {exc}")
                     time.sleep(0.01)
 
     finally:
+        _stats_log(force=True)
+        try:
+            if stats_fh:
+                stats_fh.flush()
+                stats_fh.close()
+        except Exception:
+            pass
+        try:
+            if events_fh:
+                events_fh.flush()
+                events_fh.close()
+        except Exception:
+            pass
+
         try:
             if appsrc:
                 appsrc.emit("end-of-stream")

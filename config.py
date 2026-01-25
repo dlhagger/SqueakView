@@ -37,6 +37,7 @@ def _resolve_deepstream(workspace: Path) -> Path:
 WORKSPACE = _resolve_workspace()
 DEEPSTREAM_ROOT = _resolve_deepstream(WORKSPACE)
 RUNS_DIR = _resolve_path("SQUEAKVIEW_RUNS_DIR", "PRODUCT_RUNS_DIR", WORKSPACE / "runs")
+TASKS_DIR = WORKSPACE / "tasks"
 
 
 def ensure_runs_dir() -> Path:

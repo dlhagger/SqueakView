@@ -14,5 +14,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-pyds = { path = '/home/jetson/Desktop/squeakview/wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl' }
-
+pyds = { path = '/home/jetson/Desktop/SqueakView/wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl' }

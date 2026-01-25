@@ -97,7 +97,7 @@ class CSVWriter:
         self._row_count = 0
         headers = [
             "frame",
-            "ts_ms",
+            "ts_us",
             "stream_id",
             "obj_id",
             "class_id",
@@ -384,7 +384,7 @@ class App:
               identity name=perf_tap silent=true !
               tee name=T
 
-              T. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream !
+              T. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 !
                    nvvideoconvert compute-hw=1 copy-hw=2 !
                    video/x-raw,format=NV12,width={cfg.width},height={cfg.height} !
                    x264enc tune=zerolatency speed-preset=ultrafast bitrate={cfg.bitrate} key-int-max={cfg.fps} !
@@ -785,7 +785,7 @@ class App:
 
                 frame_num = int(getattr(fmeta, "frame_num", -1))
                 pts_value = getattr(fmeta, "buf_pts", 0)
-                ts_ms = int(pts_value / 1_000_000) if pts_value else -1
+                ts_us = int(pts_value / 1_000) if pts_value else -1
                 stream_id = int(getattr(fmeta, "pad_index", 0))
 
                 pose_detections = self._decode_pose_tensor(fmeta) if self.pose_mode else None
@@ -827,7 +827,7 @@ class App:
 
                         row_values: list[object] = [
                             frame_num,
-                            ts_ms,
+                            ts_us,
                             stream_id,
                             obj_id,
                             class_id,
@@ -1061,7 +1061,7 @@ class App:
             try:
                 fmeta = pyds.NvDsFrameMeta.cast(l_frame.data)
                 print(
-                    f"[{ts()}] [DEBUG] {label} frame_id={fmeta.frame_num} "
+                    f"[{ts()}] [DEBUG] {label} frame_num={fmeta.frame_num} "
                     f"batch_id={fmeta.batch_id} src_id={fmeta.source_id} "
                     f"w={fmeta.source_frame_width} h={fmeta.source_frame_height} "
                     f"buf_pts={fmeta.buf_pts} rss_kb={_read_rss_kb()} fds={_fd_count()}",

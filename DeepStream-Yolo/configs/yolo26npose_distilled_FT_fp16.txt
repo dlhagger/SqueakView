@@ -3,8 +3,8 @@ gpu-id=0
 net-scale-factor=0.0039215697906911373
 model-color-format=0
 
-onnx-file=/home/jetson/Desktop/squeakview/DeepStream-Yolo/artifacts/onnx/yolo26npose_distilled_FT_fp16.onnx
-model-engine-file=/home/jetson/Desktop/squeakview/DeepStream-Yolo/engines/yolo26npose_distilled_FT_fp16.engine
+onnx-file=/home/jetson/Desktop/SqueakView/DeepStream-Yolo/artifacts/onnx/yolo26npose_distilled_FT_fp16.onnx
+model-engine-file=/home/jetson/Desktop/SqueakView/DeepStream-Yolo/engines/yolo26npose_distilled_FT_fp16.engine
 
 network-mode=2                  # 0=FP32, 1=INT8, 2=FP16
 network-type=0                  # detector
@@ -13,10 +13,10 @@ batch-size=1
 output-tensor-meta=1
 
 num-detected-classes=1
-labelfile-path=/home/jetson/Desktop/squeakview/DeepStream-Yolo/artifacts/labels/mouse_class.txt
-pose-kpt-labels-path=/home/jetson/Desktop/squeakview/DeepStream-Yolo/artifacts/labels/mouse_labels.txt
+labelfile-path=/home/jetson/Desktop/SqueakView/DeepStream-Yolo/artifacts/labels/mouse_class.txt
+pose-kpt-labels-path=/home/jetson/Desktop/SqueakView/DeepStream-Yolo/artifacts/labels/mouse_labels.txt
 parse-bbox-func-name=NvDsInferParseYolo26Pose
-custom-lib-path=/home/jetson/Desktop/squeakview/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
+custom-lib-path=/home/jetson/Desktop/SqueakView/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 engine-create-func-name=NvDsInferYoloCudaEngineGet
 pose-draw-threshold=0.5
 
@@ -30,5 +30,5 @@ process-mode=1
 
 [class-attrs-all]
 nms-iou-threshold=0.15
-pre-cluster-threshold=0.92
-topk=5
+pre-cluster-threshold=0.9
+topk=20

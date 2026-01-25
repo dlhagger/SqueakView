@@ -46,9 +46,13 @@ class LaunchConfig:
     arduino_fps: int = 30
     preview_window_id: int | None = None
     run_dir: Path | None = None
+    capture_ready_path: Path | None = None
+    capture_stats_path: Path | None = None
+    capture_frame_log_path: Path | None = None
     mouse_id: str | None = None
     experiment_name: str | None = None
     draw_skeleton: bool = False
+    task_cfg: Path | None = None
 
 
 class ProcessHandle:
@@ -155,6 +159,12 @@ def spawn_capture(config: LaunchConfig, emit: Callable[[str], None]) -> ProcessH
     args += ["--trigger", "on" if config.trigger_on else "off"]
     args += ["--activation", config.trigger_activation]
     args += ["--socket", config.socket_path]
+    if config.capture_ready_path is not None:
+        args += ["--ready-file", str(config.capture_ready_path)]
+    if config.capture_stats_path is not None:
+        args += ["--stats-file", str(config.capture_stats_path)]
+    if config.capture_frame_log_path is not None:
+        args += ["--frame-log", str(config.capture_frame_log_path)]
     return _spawn(CAPTURE_ENV, CAPTURE_ENTRY, args, emit, "【CAP】")
 
 

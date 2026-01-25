@@ -5,10 +5,13 @@ from __future__ import annotations
 import atexit
 import csv
 import os
+import smtplib
+import ssl
 import tempfile
 import threading
 import time
 import uuid
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -16,6 +19,19 @@ try:
     import serial  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     serial = None
+
+SERIAL_HEADER = [
+    "eventType",
+    "unixTime",
+    "rp2040Time",
+    "side",
+    "count",
+    "duration",
+    "latency",
+    "value",
+    "context",
+    "reason",
+]
 
 
 def have_pyserial() -> bool:
@@ -48,12 +64,24 @@ class SerialHandle:
         self._row_count = 0
         # Allow silencing serial logs in the terminal; still record CSV.
         self._emit_serial_logs = os.environ.get("SQUEAKVIEW_SERIAL_LOG", "1") != "0"
+        # Alert phrase and state for optional email notifications.
+        self._alert_phrase = (os.environ.get("SQUEAKVIEW_SERIAL_ALERT_PHRASE") or "Feeder jammed").strip()
+        self._alert_warned = False
         atexit.register(self.close)
 
     def _open_csv(self, path: Path) -> None:
         """Open CSV at the given path and flush any buffered lines."""
+        try:
+            is_empty = (not path.exists()) or path.stat().st_size == 0
+        except Exception:
+            is_empty = True
         f = open(path, "a", newline="", buffering=1)
         writer = csv.writer(f)
+        if is_empty:
+            try:
+                writer.writerow(SERIAL_HEADER)
+            except Exception:
+                pass
         with self._csv_lock:
             self._row_count = 0
             self._csv_file = f
@@ -158,6 +186,7 @@ class SerialHandle:
                         if s.startswith("CAMERA_"):
                             self._ttl_seen.set()
                         self._write_csv_line(s)
+                        self._maybe_send_alert(s)
                 except Exception as exc:
                     if self._stop.is_set():
                         break
@@ -185,6 +214,15 @@ class SerialHandle:
             else:
                 self._buffer_rows.append(row)
 
+    def log_marker(self, marker: str) -> None:
+        """Write a non-serial marker row into the CSV for later alignment."""
+        try:
+            self._write_csv_line(f"MARKER,{marker},{timestamp()}")
+            if self._emit_serial_logs:
+                self.emit(f"[{timestamp()}] 【SER】 MARKER,{marker}")
+        except Exception:
+            pass
+
     def send_line(self, text: str) -> None:
         if not self.ser or not self.ser.is_open:
             self.emit(f"[{timestamp()}] [SER] cannot send, port not open")
@@ -203,6 +241,52 @@ class SerialHandle:
             f"[{timestamp()}] [SER] {'TTL detected.' if hit else 'TTL not detected within timeout — continuing anyway.'}"
         )
         return hit
+
+    # ---- Alerts -------------------------------------------------------
+    def _maybe_send_alert(self, line: str) -> None:
+        """Fire an email alert if the configured phrase is present; non-blocking."""
+        phrase = self._alert_phrase
+        if not phrase:
+            return
+        if phrase.lower() not in line.lower():
+            return
+        threading.Thread(target=self._send_email_alert, args=(line,), daemon=True).start()
+
+    def _send_email_alert(self, line: str) -> None:
+        """Send a minimal SMTP email using env vars; best-effort and non-fatal."""
+        host = os.environ.get("SQUEAKVIEW_ALERT_EMAIL_HOST")
+        to_addr = os.environ.get("SQUEAKVIEW_ALERT_EMAIL_TO")
+        if not host or not to_addr:
+            if not self._alert_warned:
+                self.emit(f"[{timestamp()}] [SER] alert skipped (set SQUEAKVIEW_ALERT_EMAIL_HOST and ..._TO)")
+                self._alert_warned = True
+            return
+        try:
+            port = int(os.environ.get("SQUEAKVIEW_ALERT_EMAIL_PORT", "587"))
+        except Exception:
+            port = 587
+        user = os.environ.get("SQUEAKVIEW_ALERT_EMAIL_USER")
+        password = os.environ.get("SQUEAKVIEW_ALERT_EMAIL_PASS")
+        from_addr = os.environ.get("SQUEAKVIEW_ALERT_EMAIL_FROM", user or to_addr)
+        use_tls = os.environ.get("SQUEAKVIEW_ALERT_EMAIL_TLS", "1") != "0"
+        subject = os.environ.get("SQUEAKVIEW_ALERT_EMAIL_SUBJECT", "SqueakView serial alert")
+
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = from_addr
+        msg["To"] = to_addr
+        msg.set_content(f"Serial alert detected at {timestamp()}:\n\n{line}\n")
+
+        try:
+            with smtplib.SMTP(host, port, timeout=10) as server:
+                if use_tls:
+                    server.starttls(context=ssl.create_default_context())
+                if user and password:
+                    server.login(user, password)
+                server.send_message(msg)
+            self.emit(f"[{timestamp()}] [SER] alert email sent to {to_addr}")
+        except Exception as exc:
+            self.emit(f"[{timestamp()}] [SER] alert email failed: {exc}")
 
     def close(self) -> None:
         self.emit(f"[{timestamp()}] [SER] closing …")

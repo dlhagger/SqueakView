@@ -9,4 +9,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-spinnaker-python = { path = '/home/jetson/Desktop/squeakview/wheel_files/spinnaker_python-4.2.0.88-cp310-cp310-linux_aarch64.whl'}
+spinnaker-python = { path = '/home/jetson/Desktop/SqueakView/wheel_files/spinnaker_python-4.2.0.88-cp310-cp310-linux_aarch64.whl'}

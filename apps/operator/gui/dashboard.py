@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Behavior dashboard widget reused inside the unified operator GUI."""
 
+import json
 import os
 import queue
 import re
@@ -17,6 +18,11 @@ try:
     import pyqtgraph as pg
 except Exception as exc:  # pragma: no cover - runtime dependency
     raise RuntimeError("pyqtgraph is required for the dashboard") from exc
+
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    yaml = None
 
 try:
     import psutil  # type: ignore
@@ -271,17 +277,13 @@ class BehaviorDashboard(QtWidgets.QWidget):
         super().__init__(parent)
         self.window_sec = float(max(30.0, window_sec))
         self.pellet_mode = pellet_mode
-
-        self.counters = {
-            "POKE_L": 0,
-            "POKE_R": 0,
-            "DRINK_L": 0,
-            "DRINK_R": 0,
-            "PELLET": 0,
-            "WELL": 0,
-        }
-        self.series_x = {k: [] for k in self.counters}
-        self.series_y = {k: [] for k in self.counters}
+        self.counters: dict[str, int] = {}
+        self.series_x: dict[str, list[float]] = {}
+        self.series_y: dict[str, list[int]] = {}
+        self.series_order: list[str] = []
+        self._rules: list[dict] = []
+        self._plots: list[dict] = []
+        self._task_cfg_path: Path | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -297,55 +299,22 @@ class BehaviorDashboard(QtWidgets.QWidget):
         pg.setConfigOption("background", "k")
         pg.setConfigOption("foreground", "w")
 
-        def mk_plot(title: str):
-            axis = pg.graphicsItems.DateAxisItem.DateAxisItem(orientation="bottom", fmt="%H:%M:%S")
-            plot = pg.PlotWidget(axisItems={"bottom": axis})
-            plot.setTitle(title)
-            plot.setMenuEnabled(False)
-            plot.setMouseEnabled(x=False, y=False)
-            plot.showGrid(x=True, y=True, alpha=0.15)
-            plot.getAxis("left").setTextPen(pg.mkPen("#cfd4ea"))
-            plot.getAxis("bottom").setTextPen(pg.mkPen("#cfd4ea"))
-            plot.setBackground("#0f1118")
-            return plot
-
-        self.plot_poke = mk_plot("POKE")
-        layout.addWidget(self.plot_poke, 1)
-        self.plot_poke.addLegend(offset=(10, 10), labelTextColor="#cfd4ea", brush=pg.mkBrush(20, 20, 30, 200))
-        self.cur_poke_L = self.plot_poke.plot(
-            pen=pg.mkPen("#37d67a", width=2.5),
-            name="Left poke",
-            fillLevel=0,
-            brush=pg.mkBrush(55, 214, 122, 60),
-        )
-        self.cur_poke_R = self.plot_poke.plot(
-            pen=pg.mkPen("#6fa8ff", width=2.5),
-            name="Right poke",
-            fillLevel=0,
-            brush=pg.mkBrush(111, 168, 255, 60),
-        )
-
-        self.plot_drink = mk_plot("DRINK")
-        layout.addWidget(self.plot_drink, 1)
-        self.plot_drink.addLegend(offset=(10, 10), labelTextColor="#cfd4ea", brush=pg.mkBrush(20, 20, 30, 200))
-        self.cur_drink_L = self.plot_drink.plot(
-            pen=pg.mkPen("#a29bfe", width=2.5),
-            name="Left drink",
-            fillLevel=0,
-            brush=pg.mkBrush(162, 155, 254, 60),
-        )
-        self.cur_drink_R = self.plot_drink.plot(
-            pen=pg.mkPen("#ff7eb6", width=2.5),
-            name="Right drink",
-            fillLevel=0,
-            brush=pg.mkBrush(255, 126, 182, 60),
-        )
-
-        self.plot_pellet = mk_plot("PELLET & WELL_CHECK")
-        layout.addWidget(self.plot_pellet, 1)
-        self.plot_pellet.addLegend(offset=(10, 10), labelTextColor="#cfd4ea", brush=pg.mkBrush(20, 20, 30, 200))
-        self.cur_pellet = self.plot_pellet.plot(pen=pg.mkPen("#f5a623", width=2.5), name="Pellet", fillLevel=0, brush=pg.mkBrush(245, 166, 35, 60))
-        self.cur_well = self.plot_pellet.plot(pen=pg.mkPen("#50e3c2", width=2.5), name="Well check", fillLevel=0, brush=pg.mkBrush(80, 227, 194, 60))
+        self._plot_container = QtWidgets.QWidget(self)
+        self._plot_layout = QtWidgets.QHBoxLayout(self._plot_container)
+        self._plot_layout.setContentsMargins(0, 0, 0, 0)
+        self._plot_layout.setSpacing(8)
+        self._plot_left = QtWidgets.QWidget(self._plot_container)
+        self._plot_left_layout = QtWidgets.QVBoxLayout(self._plot_left)
+        self._plot_left_layout.setContentsMargins(0, 0, 0, 0)
+        self._plot_left_layout.setSpacing(8)
+        self._plot_right = QtWidgets.QWidget(self._plot_container)
+        self._plot_right_layout = QtWidgets.QVBoxLayout(self._plot_right)
+        self._plot_right_layout.setContentsMargins(0, 0, 0, 0)
+        self._plot_right_layout.setSpacing(8)
+        self._plot_layout.addWidget(self._plot_left, 3)
+        self._plot_layout.addWidget(self._plot_right, 1)
+        layout.addWidget(self._plot_container, 1)
+        self._build_from_task_config(self._default_task_config())
 
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._refresh)
@@ -353,6 +322,186 @@ class BehaviorDashboard(QtWidgets.QWidget):
 
         self._meters = JetsonMeters(self, interval_ms=500)
         self._meters.updated.connect(self._on_meters)
+
+    def apply_task_config(self, path: Path) -> None:
+        cfg = self._load_task_config(path)
+        self._task_cfg_path = path
+        self._build_from_task_config(cfg)
+
+    def _load_task_config(self, path: Path) -> dict:
+        raw = path.read_text()
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            return json.loads(raw)
+        if yaml is None:
+            raise RuntimeError("PyYAML is not installed; cannot read task config.")
+        return yaml.safe_load(raw)
+
+    @staticmethod
+    def _default_task_config() -> dict:
+        return {
+            "task_name": "SqueakView Default",
+            "schema_version": 1,
+            "events": [
+                {"name": "POKE", "match": {"event_contains": "POKE", "phase": "start"}, "split_by_side": True, "plot": "Poke"},
+                {"name": "DRINK", "match": {"event_contains": "DRINK", "phase": "start"}, "split_by_side": True, "plot": "Drink"},
+                {"name": "PELLET", "match": {"event_contains": "PELLET", "phase": "retrieval"}, "split_by_side": False, "plot": "Pellet"},
+                {"name": "WELL_CHECK", "match": {"event_contains": "WELL_CHECK", "phase": "start"}, "split_by_side": False, "plot": "Pellet"},
+            ],
+            "dashboard": {
+                "plots": [
+                    {"id": "Poke", "title": "Pokes", "series": ["POKE_L", "POKE_R"]},
+                    {"id": "Drink", "title": "Drinks", "series": ["DRINK_L", "DRINK_R"]},
+                    {"id": "Pellet", "title": "Pellet & Well", "series": ["PELLET", "WELL_CHECK"]},
+                ]
+            },
+        }
+
+    def _build_from_task_config(self, cfg: dict) -> None:
+        if not isinstance(cfg, dict):
+            cfg = {}
+        events = cfg.get("events") or []
+        dashboard = cfg.get("dashboard") or {}
+        plots_cfg = dashboard.get("plots") or []
+        if not events or not plots_cfg:
+            cfg = self._default_task_config()
+            events = cfg["events"]
+            plots_cfg = cfg["dashboard"]["plots"]
+
+        self._rules = []
+        for rule in events:
+            name = str(rule.get("name", "")).strip()
+            if not name:
+                continue
+            match = rule.get("match") or {}
+            self._rules.append(
+                {
+                    "name": name.upper(),
+                    "match": {k: str(v).strip() for k, v in match.items() if v is not None},
+                    "split_by_side": bool(rule.get("split_by_side", False)),
+                }
+            )
+
+        series_order: list[str] = []
+        for plot in plots_cfg:
+            for series in plot.get("series", []) or []:
+                key = self._norm_series(series)
+                if key and key not in series_order:
+                    series_order.append(key)
+        for rule in self._rules:
+            base = rule["name"]
+            if rule["split_by_side"]:
+                for side in ("L", "R"):
+                    key = f"{base}_{side}"
+                    if key not in series_order:
+                        series_order.append(key)
+            else:
+                if base not in series_order:
+                    series_order.append(base)
+
+        self.series_order = series_order
+        self.counters = {k: 0 for k in series_order}
+        self.series_x = {k: [] for k in series_order}
+        self.series_y = {k: [] for k in series_order}
+
+        self._clear_plots()
+        for plot in plots_cfg:
+            title = str(plot.get("title") or plot.get("id") or "Plot")
+            plot_type = str(plot.get("type") or "timeseries").lower()
+            if plot_type == "matrix":
+                matrix = MatrixWidget(title, plot.get("layout") or {})
+                self._plot_right_layout.addWidget(matrix, 1)
+                series_keys = matrix.series_keys()
+                self._plots.append({"kind": "matrix", "plot": matrix, "series": series_keys})
+            else:
+                widget = self._make_plot(title)
+                self._plot_left_layout.addWidget(widget, 1)
+                widget.addLegend(offset=(10, 10), labelTextColor="#cfd4ea", brush=pg.mkBrush(20, 20, 30, 200))
+                series_keys = []
+                curves: dict[str, object] = {}
+                for idx, series in enumerate(plot.get("series", []) or []):
+                    key = self._norm_series(series)
+                    if not key:
+                        continue
+                    series_keys.append(key)
+                    pen, brush = self._series_style(key, idx)
+                    curve = widget.plot(pen=pen, name=self._series_label(key), fillLevel=0, brush=brush)
+                    curves[key] = curve
+                self._plots.append({"kind": "timeseries", "plot": widget, "series": series_keys, "curves": curves})
+
+        self._update_counts_label()
+
+    def _clear_plots(self) -> None:
+        for entry in self._plots:
+            plot = entry.get("plot")
+            if plot is not None:
+                try:
+                    if entry.get("kind") == "matrix":
+                        self._plot_right_layout.removeWidget(plot)
+                    else:
+                        self._plot_left_layout.removeWidget(plot)
+                    plot.setParent(None)
+                    plot.deleteLater()
+                except Exception:
+                    pass
+        self._plots = []
+
+    @staticmethod
+    def _norm_series(name: str) -> str:
+        return str(name).strip().upper()
+
+    @staticmethod
+    def _make_plot(title: str) -> pg.PlotWidget:
+        axis = pg.graphicsItems.DateAxisItem.DateAxisItem(orientation="bottom", fmt="%H:%M:%S")
+        plot = pg.PlotWidget(axisItems={"bottom": axis})
+        plot.setTitle(title)
+        plot.setMenuEnabled(False)
+        plot.setMouseEnabled(x=False, y=False)
+        plot.showGrid(x=True, y=True, alpha=0.15)
+        plot.getAxis("left").setTextPen(pg.mkPen("#cfd4ea"))
+        plot.getAxis("bottom").setTextPen(pg.mkPen("#cfd4ea"))
+        plot.setBackground("#0f1118")
+        return plot
+
+    @staticmethod
+    def _series_label(key: str) -> str:
+        labels = {
+            "POKE_L": "Left poke",
+            "POKE_R": "Right poke",
+            "DRINK_L": "Left drink",
+            "DRINK_R": "Right drink",
+            "PELLET": "Pellet",
+            "WELL_CHECK": "Well check",
+            "WELL": "Well check",
+            "GO_CORRECT": "Go correct",
+            "GO_INCORRECT": "Go incorrect",
+            "NOGO_CORRECT": "NoGo correct",
+            "NOGO_INCORRECT": "NoGo incorrect",
+        }
+        return labels.get(key, key.replace("_", " ").title())
+
+    @staticmethod
+    def _series_style(key: str, idx: int):
+        color_map = {
+            "POKE_L": "#37d67a",
+            "POKE_R": "#6fa8ff",
+            "DRINK_L": "#a29bfe",
+            "DRINK_R": "#ff7eb6",
+            "PELLET": "#f5a623",
+            "WELL_CHECK": "#50e3c2",
+            "WELL": "#50e3c2",
+            "GO_CORRECT": "#2ecc71",
+            "GO_INCORRECT": "#e74c3c",
+            "NOGO_CORRECT": "#4aa3df",
+            "NOGO_INCORRECT": "#f39c12",
+        }
+        palette = ["#ffd166", "#06d6a0", "#118ab2", "#ef476f", "#9b5de5", "#f15bb5"]
+        hex_color = color_map.get(key, palette[idx % len(palette)])
+        pen = pg.mkPen(hex_color, width=2.5)
+        color = QtGui.QColor(hex_color)
+        color.setAlpha(60)
+        brush = pg.mkBrush(color)
+        return pen, brush
 
     def detach_meters(self) -> MetersBar:
         """Detach the meters widget so it can be re-parented elsewhere."""
@@ -381,8 +530,26 @@ class BehaviorDashboard(QtWidgets.QWidget):
         event = str(data.get("event_uc", ""))
         tsec = dash_util.choose_event_time(data)
         now = time.time()
-        if tsec < (now - 2.0 * self.window_sec):
+        if tsec < (now - 2.0 * self.window_sec) or tsec > (now + 2.0 * self.window_sec):
             tsec = now
+
+        if self._rules:
+            for rule in self._rules:
+                if not self._match_rule(data, event, rule):
+                    continue
+                if rule["split_by_side"]:
+                    side = str(data.get("side_uc", "")).upper()
+                    if side not in ("L", "R"):
+                        side = "L"
+                    key = f"{rule['name']}_{side}"
+                else:
+                    key = rule["name"]
+                if rule.get("use_count_field"):
+                    count_val = self._parse_int_field(data.get("count"))
+                    self._append_point(key, tsec, new_value=count_val)
+                else:
+                    self._append_point(key, tsec)
+            return
 
         if "POKE" in event and dash_util.is_start_event(data):
             key = "POKE_R" if data.get("side_uc") == "R" else "POKE_L"
@@ -407,11 +574,16 @@ class BehaviorDashboard(QtWidgets.QWidget):
             if ok:
                 self._append_point("PELLET", tsec)
         elif "WELL_CHECK" in event and dash_util.is_start_event(data):
-            self._append_point("WELL", tsec)
+            self._append_point("WELL_CHECK", tsec)
 
-    def _append_point(self, key: str, tsec: float) -> None:
+    def _append_point(self, key: str, tsec: float, *, new_value: int | None = None) -> None:
+        if key not in self.counters:
+            return
         prev = self.counters[key]
-        new_value = prev + 1
+        if new_value is None:
+            new_value = prev + 1
+        elif new_value <= prev:
+            return
         xs, ys = self.series_x[key], self.series_y[key]
 
         if xs and xs[-1] == tsec:
@@ -448,51 +620,169 @@ class BehaviorDashboard(QtWidgets.QWidget):
             else:
                 curve.setData([], [])
 
-        set_curve(self.cur_poke_L, self.series_x["POKE_L"], self.series_y["POKE_L"])
-        set_curve(self.cur_poke_R, self.series_x["POKE_R"], self.series_y["POKE_R"])
-        ymax_poke = max(
-            [
-                1,
-                self.series_y["POKE_L"][-1] if self.series_y["POKE_L"] else 0,
-                self.series_y["POKE_R"][-1] if self.series_y["POKE_R"] else 0,
-            ]
-        )
-        self.plot_poke.setXRange(xstart, xend, padding=0.0)
-        self.plot_poke.setYRange(0, max(1.0, ymax_poke * 1.2), padding=0.0)
+        for plot_entry in self._plots:
+            if plot_entry.get("kind") == "matrix":
+                matrix = plot_entry["plot"]
+                series = plot_entry.get("series", [])
+                values = {key: self.counters.get(key, 0) for key in series}
+                matrix.update_values(values)
+                continue
+            plot = plot_entry["plot"]
+            keys = plot_entry["series"]
+            ymax = 1
+            for key in keys:
+                curve = plot_entry["curves"].get(key)
+                if curve is None:
+                    continue
+                xs = self.series_x.get(key, [])
+                ys = self.series_y.get(key, [])
+                set_curve(curve, xs, ys)
+                if ys:
+                    ymax = max(ymax, ys[-1])
+            plot.setXRange(xstart, xend, padding=0.0)
+            plot.setYRange(0, max(1.0, ymax * 1.2), padding=0.0)
 
-        set_curve(self.cur_drink_L, self.series_x["DRINK_L"], self.series_y["DRINK_L"])
-        set_curve(self.cur_drink_R, self.series_x["DRINK_R"], self.series_y["DRINK_R"])
-        ymax_drink = max(
-            [
-                1,
-                self.series_y["DRINK_L"][-1] if self.series_y["DRINK_L"] else 0,
-                self.series_y["DRINK_R"][-1] if self.series_y["DRINK_R"] else 0,
-            ]
-        )
-        self.plot_drink.setXRange(xstart, xend, padding=0.0)
-        self.plot_drink.setYRange(0, max(1.0, ymax_drink * 1.2), padding=0.0)
-
-        set_curve(self.cur_pellet, self.series_x["PELLET"], self.series_y["PELLET"])
-        set_curve(self.cur_well, self.series_x["WELL"], self.series_y["WELL"])
-        ymax_pw = max(
-            [
-                1,
-                self.series_y["PELLET"][-1] if self.series_y["PELLET"] else 0,
-                self.series_y["WELL"][-1] if self.series_y["WELL"] else 0,
-            ]
-        )
-        self.plot_pellet.setXRange(xstart, xend, padding=0.0)
-        self.plot_pellet.setYRange(0, max(1.0, ymax_pw * 1.2), padding=0.0)
-        # Update counts label
-        self.counts_label.setText(
-            "Counts: "
-            f"POKE L {self.counters['POKE_L']} · POKE R {self.counters['POKE_R']} | "
-            f"DRINK L {self.counters['DRINK_L']} · DRINK R {self.counters['DRINK_R']} | "
-            f"PELLET {self.counters['PELLET']} · WELL {self.counters['WELL']}"
-        )
+        self._update_counts_label()
 
     def close(self) -> None:
         try:
             self._meters.stop()
         except Exception:
             pass
+
+    def _match_rule(self, data: dict, event: str, rule: dict) -> bool:
+        match = rule.get("match") or {}
+        contains = match.get("event_contains")
+        if contains and str(contains).upper() not in event:
+            return False
+        equals = match.get("event_equals")
+        if equals and str(equals).upper() != event:
+            return False
+        reason_equals = match.get("reason_equals")
+        if reason_equals and str(reason_equals).upper() != str(data.get("reason", "")).upper():
+            return False
+        reason_contains = match.get("reason_contains")
+        if reason_contains and str(reason_contains).upper() not in str(data.get("reason", "")).upper():
+            return False
+        value_equals = match.get("value_equals")
+        if value_equals is not None and str(value_equals) != str(data.get("value", "")).strip():
+            return False
+        side = match.get("side")
+        if side and str(side).upper() != str(data.get("side_uc", "")).upper():
+            return False
+        phase = str(match.get("phase", "")).strip().lower()
+        if phase in ("start", "arrival"):
+            return dash_util.is_start_event(data)
+        if phase in ("end", "retrieval"):
+            return dash_util.is_end_event(data)
+        return True
+
+    def _update_counts_label(self) -> None:
+        parts: list[str] = []
+        for plot in self._plots:
+            series = plot.get("series", [])
+            group = []
+            for key in series:
+                label = key.replace("_", " ")
+                group.append(f"{label} {self.counters.get(key, 0)}")
+            if group:
+                parts.append(" · ".join(group))
+        if parts:
+            self.counts_label.setText("Counts: " + " | ".join(parts))
+        else:
+            self.counts_label.setText("Counts: --")
+
+    @staticmethod
+    def _parse_int_field(value: object) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return int(value)
+            except Exception:
+                return None
+        text = str(value).strip()
+        if not text or text.lower() == "nan":
+            return None
+        try:
+            return int(float(text))
+        except Exception:
+            return None
+
+
+class MatrixWidget(QtWidgets.QWidget):
+    def __init__(self, title: str, layout_cfg: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        self._cells: dict[tuple[int, int], tuple[str, QtWidgets.QLabel, QtWidgets.QFrame]] = {}
+        self._series_keys: list[str] = []
+        self._style_map = self._build_style_map(layout_cfg)
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+
+        title_label = QtWidgets.QLabel(title)
+        title_label.setStyleSheet("color: #cfd4ea; font-size: 12px; font-weight: 600;")
+        outer.addWidget(title_label)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        outer.addLayout(grid)
+
+        rows = layout_cfg.get("rows") or []
+        if not rows:
+            rows = [["A", "B"], ["C", "D"]]
+
+        for r_idx, row in enumerate(rows):
+            grid.setRowStretch(r_idx, 1)
+            for c_idx, series in enumerate(row):
+                if r_idx == 0:
+                    grid.setColumnStretch(c_idx, 1)
+                key = str(series).strip().upper()
+                self._series_keys.append(key)
+                cell = QtWidgets.QFrame()
+                cell.setStyleSheet(self._style_for_key(key))
+                cell_layout = QtWidgets.QVBoxLayout(cell)
+                cell_layout.setContentsMargins(10, 8, 10, 8)
+                cell_layout.setSpacing(4)
+                name_label = QtWidgets.QLabel(key.replace("_", " ").title())
+                name_label.setStyleSheet("color: #aeb8ff; font-size: 11px;")
+                value_label = QtWidgets.QLabel("0")
+                value_label.setStyleSheet("color: #e8ebf4; font-size: 18px; font-weight: 700;")
+                cell_layout.addWidget(name_label)
+                cell_layout.addWidget(value_label)
+                grid.addWidget(cell, r_idx, c_idx)
+                self._cells[(r_idx, c_idx)] = (key, value_label, cell)
+
+        self.setStyleSheet("QLabel { color: #e8ebf4; }")
+
+    def series_keys(self) -> list[str]:
+        return [key for key in self._series_keys if key]
+
+    def update_values(self, values: dict[str, int]) -> None:
+        for (r_idx, c_idx), (key, label, _cell) in self._cells.items():
+            label.setText(str(values.get(key, 0)))
+
+    def _build_style_map(self, layout_cfg: dict) -> dict[str, str]:
+        raw = layout_cfg.get("style_map") or {}
+        return {str(k).upper(): str(v) for k, v in raw.items() if k is not None and v is not None}
+
+    def _style_for_key(self, key: str) -> str:
+        role = self._style_map.get(key.upper(), "neutral")
+        if role == "correct":
+            bg = "#1f8f5a"
+            border = "#23a166"
+        elif role == "incorrect":
+            bg = "#8f2f3b"
+            border = "#a53644"
+        else:
+            bg = "#0f1118"
+            border = "#2a2d3d"
+        return (
+            "QFrame { "
+            f"background-color: {bg}; border: 1px solid {border}; border-radius: 8px; "
+            "}"
+        )

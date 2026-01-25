@@ -13,6 +13,7 @@
 #include <mutex>
 #include <vector>
 #include "nvdsinfer_custom_impl.h"
+#include "nvdsinfer.h"
 
 struct PoseDet {
   float x1,y1,x2,y2, conf; int cls;
@@ -255,14 +256,171 @@ static bool decode(const NvDsInferLayerInfo& L,
   std::sort(dets.begin(), dets.end(), [](const PoseDet&a,const PoseDet&b){return a.conf>b.conf;});
   std::vector<char> rem(dets.size(),0); std::vector<PoseDet> keep; keep.reserve(dets.size());
   for (size_t i=0;i<dets.size();++i) {
-    if (rem[i]) continue; keep.push_back(dets[i]);
-    for (size_t j=i+1;j<dets.size();++j) if (!rem[j] && iou_xyxy(dets[i],dets[j])>iou_thr) rem[j]=1;
+    if (rem[i]) continue;
+    keep.push_back(dets[i]);
+    for (size_t j=i+1;j<dets.size();++j) {
+      if (!rem[j] && iou_xyxy(dets[i],dets[j])>iou_thr) rem[j]=1;
+    }
   }
   std::cout << "[POSE][parser] preds=" << num_preds << " dim=" << dim
             << " dets_before_nms=" << dets.size() << " dets_after_nms=" << keep.size()
             << " channel_major=" << (channel_major ? 1 : 0) << std::endl;
   update_pose_cache(keep, kpts);
   out.swap(keep);
+  return true;
+}
+
+static inline float class_threshold(const NvDsInferParseDetectionParams& params, int cls, float fallback) {
+  if (cls >= 0 && static_cast<size_t>(cls) < params.perClassPreclusterThreshold.size()) {
+    return params.perClassPreclusterThreshold[cls];
+  }
+  if (!params.perClassPreclusterThreshold.empty()) {
+    return params.perClassPreclusterThreshold[0];
+  }
+  return fallback;
+}
+
+static bool decode_yolo26_pose(const NvDsInferLayerInfo& L,
+                               const NvDsInferNetworkInfo& net,
+                               const NvDsInferParseDetectionParams& params,
+                               std::vector<PoseDet>& dets,
+                               std::vector<NvDsInferInstanceMaskInfo>& objects,
+                               float conf_thr = 0.25f) {
+  if (!L.buffer) return false;
+  const float* data = static_cast<const float*>(L.buffer);
+
+  int num_preds = 0;
+  int stride = 0;
+  bool channel_major = false;
+  auto stride_matches = [](int d) -> bool { return d >= 6 && ((d - 6) % 3 == 0); };
+
+  if (L.inferDims.numDims == 2) {
+    int d0 = L.inferDims.d[0];
+    int d1 = L.inferDims.d[1];
+    if (stride_matches(d1)) {
+      num_preds = d0;
+      stride = d1;
+      channel_major = false;
+    } else if (stride_matches(d0)) {
+      num_preds = d1;
+      stride = d0;
+      channel_major = true;
+    } else {
+      std::cout << "[POSE][yolo26] invalid dims=" << d0 << "x" << d1 << " (2D)" << std::endl;
+      return false;
+    }
+  } else if (L.inferDims.numDims == 3) {
+    int d0 = L.inferDims.d[0];
+    int d1 = L.inferDims.d[1];
+    int d2 = L.inferDims.d[2];
+    (void)d0;
+    if (stride_matches(d2)) {
+      num_preds = d1;
+      stride = d2;
+      channel_major = false;  // [B, N, stride]
+    } else if (stride_matches(d1)) {
+      num_preds = d2;
+      stride = d1;
+      channel_major = true;   // [B, stride, N]
+    } else {
+      std::cout << "[POSE][yolo26] invalid dims=" << d0 << "x" << d1 << "x" << d2 << " (3D)" << std::endl;
+      return false;
+    }
+  } else {
+    return false;
+  }
+
+  if (stride < 6 || ((stride - 6) % 3 != 0)) {
+    std::cout << "[POSE][yolo26] stride mismatch: stride=" << stride << std::endl;
+    return false;
+  }
+  const int kpts = (stride - 6) / 3;
+
+  const float inW = static_cast<float>(net.width);
+  const float inH = static_cast<float>(net.height);
+  const float src_w = env_or_default("SQUEAKVIEW_SRC_W", inW);
+  const float src_h = env_or_default("SQUEAKVIEW_SRC_H", inH);
+  const float gain = std::min(inW / src_w, inH / src_h);
+  const float pad_x = 0.5f * (inW - src_w * gain);
+  const float pad_y = 0.5f * (inH - src_h * gain);
+
+  dets.clear();
+  dets.reserve(num_preds);
+  objects.clear();
+  objects.reserve(num_preds);
+
+  std::vector<float> row;
+  if (channel_major) {
+    row.resize(static_cast<size_t>(stride));
+  }
+
+  for (int i = 0; i < num_preds; ++i) {
+    const float* p = nullptr;
+    if (channel_major) {
+      for (int c = 0; c < stride; ++c) {
+        row[c] = data[c * num_preds + i];
+      }
+      p = row.data();
+    } else {
+      p = data + i * stride;
+    }
+
+    float x1 = p[0];
+    float y1 = p[1];
+    float x2 = p[2];
+    float y2 = p[3];
+    float obj = p[4];
+    int cls = static_cast<int>(std::lround(p[5]));
+    if (cls < 0) continue;
+    if (params.numClassesConfigured > 0 && static_cast<unsigned int>(cls) >= params.numClassesConfigured) {
+      continue;
+    }
+    float thr = class_threshold(params, cls, conf_thr);
+    if (obj < thr) continue;
+
+    // Unletterbox xyxy coords from net space back to src space.
+    unletterbox(x1, y1, gain, pad_x, pad_y, src_w, src_h);
+    unletterbox(x2, y2, gain, pad_x, pad_y, src_w, src_h);
+    float bx1 = std::min(x1, x2);
+    float by1 = std::min(y1, y2);
+    float bx2 = std::max(x1, x2);
+    float by2 = std::max(y1, y2);
+
+    PoseDet d{};
+    d.cls = cls;
+    d.conf = obj;
+    d.x1 = bx1;
+    d.y1 = by1;
+    d.x2 = bx2;
+    d.y2 = by2;
+    d.kpts.resize(static_cast<size_t>(3 * kpts));
+    const float* kp = p + 6;
+    for (int k = 0; k < kpts; ++k) {
+      float kx = kp[3 * k + 0];
+      float ky = kp[3 * k + 1];
+      float ks = kp[3 * k + 2];
+      unletterbox(kx, ky, gain, pad_x, pad_y, src_w, src_h);
+      d.kpts[3 * k + 0] = kx;
+      d.kpts[3 * k + 1] = ky;
+      d.kpts[3 * k + 2] = ks;
+    }
+    dets.emplace_back(std::move(d));
+
+    NvDsInferInstanceMaskInfo o{};
+    o.classId = static_cast<unsigned int>(cls);
+    o.left = bx1;
+    o.top = by1;
+    o.width = std::max(0.f, bx2 - bx1);
+    o.height = std::max(0.f, by2 - by1);
+    o.detectionConfidence = obj;
+    o.mask = nullptr;
+    o.mask_width = 0;
+    o.mask_height = 0;
+    o.mask_size = 0;
+    objects.emplace_back(o);
+  }
+
+  update_pose_cache(dets, kpts);
   return true;
 }
 
@@ -307,3 +465,20 @@ extern "C" bool NvDsInferParseYoloV8PoseBoxes(
 {
   return parse_pose_internal(layers, net, params, objects);
 }
+
+extern "C" bool NvDsInferParseYolo26Pose(
+  const std::vector<NvDsInferLayerInfo>& layers,
+  const NvDsInferNetworkInfo& net,
+  const NvDsInferParseDetectionParams& params,
+  std::vector<NvDsInferInstanceMaskInfo>& objects)
+{
+  if (layers.empty()) return false;
+  const NvDsInferLayerInfo* L = &layers[0];
+  for (auto& li : layers) {
+    if (li.dataType == NvDsInferDataType::FLOAT) { L = &li; break; }
+  }
+  std::vector<PoseDet> dets;
+  return decode_yolo26_pose(*L, net, params, dets, objects);
+}
+
+CHECK_CUSTOM_INSTANCE_MASK_PARSE_FUNC_PROTOTYPE(NvDsInferParseYolo26Pose);

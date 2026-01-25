@@ -92,6 +92,16 @@ class OperatorBackend:
         self._run_dir_watch_thread = thread
         thread.start()
 
+    def _wait_for_capture_ready(self, ready_path: Path | None, timeout_s: float = 6.0) -> bool:
+        if ready_path is None:
+            return True
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if ready_path.exists():
+                return True
+            time.sleep(0.05)
+        return ready_path.exists()
+
     def _set_fan_max(self) -> None:
         """Best-effort attempt to crank the fan; non-fatal on failure."""
         try:
@@ -135,6 +145,7 @@ class OperatorBackend:
                 "bitrate_kbps": cfg.bitrate,
                 "preview_window_id": cfg.preview_window_id,
             },
+            "task_config": str(cfg.task_cfg) if cfg.task_cfg else None,
             "serial": {
                 "enabled": cfg.serial_enabled,
                 "port": cfg.serial_port if cfg.serial_enabled else None,
@@ -149,9 +160,16 @@ class OperatorBackend:
         except Exception as exc:  # pragma: no cover
             self._log(f"[BACKEND] metadata write failed: {exc}")
 
+
     def start_run(self, cfg: process.LaunchConfig) -> bool:
         if self.state.any_running():
             self._log("[BACKEND] run already active")
+            return False
+        if not cfg.task_cfg:
+            self._log("[BACKEND] task config required; aborting run")
+            return False
+        if not Path(cfg.task_cfg).exists():
+            self._log(f"[BACKEND] task config missing: {cfg.task_cfg}")
             return False
 
         self.launch_cfg = cfg
@@ -171,12 +189,6 @@ class OperatorBackend:
                     self._log("[SER] failed to open port; aborting run")
                     return False
                 serial_handle = handle
-                if cfg.trigger_on:
-                    try:
-                        handle.send_line(f"START,{int(cfg.arduino_fps)}")
-                        handle.wait_for_ttl(timeout_s=3.0)
-                    except Exception:
-                        pass
 
         mouse_id = (cfg.mouse_id or "").strip()
         if mouse_id:
@@ -186,6 +198,9 @@ class OperatorBackend:
         else:
             run_dir = run_context.timestamped_run_dir("ds")
         cfg.run_dir = run_dir
+        cfg.capture_ready_path = run_dir / "capture_ready.txt"
+        cfg.capture_stats_path = run_dir / "capture_stats.csv"
+        cfg.capture_frame_log_path = run_dir / "capture_frames.csv"
         self.state.run_dir = run_dir
 
         if serial_handle:
@@ -199,6 +214,16 @@ class OperatorBackend:
 
         self.state.inference = process.spawn_inference(cfg, self._inference_emit)
         self._log("[DS] inference launched")
+        if serial_handle and cfg.trigger_on:
+            ready = self._wait_for_capture_ready(cfg.capture_ready_path, timeout_s=6.0)
+            if not ready:
+                self._log("[SER] capture not ready; starting TTL anyway")
+            try:
+                serial_handle.log_marker("START_SENT")
+                serial_handle.send_line(f"START,{int(cfg.arduino_fps)}")
+                serial_handle.wait_for_ttl(timeout_s=3.0)
+            except Exception:
+                pass
         self._start_run_dir_watch()
         return True
 

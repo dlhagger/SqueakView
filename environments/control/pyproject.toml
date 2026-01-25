@@ -6,6 +6,7 @@ requires-python = ">=3.10,<3.11"
 dependencies = [
   "PySide6==6.8.0.2",
   "pyqtgraph==0.13.7",
+  "PyYAML==6.0.3",
   "pyserial==3.5",
   "psutil==7.1.0",
 ]

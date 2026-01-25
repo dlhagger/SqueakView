@@ -1,6 +1,0 @@
-pyproject.toml
-jetson_capture.egg-info/PKG-INFO
-jetson_capture.egg-info/SOURCES.txt
-jetson_capture.egg-info/dependency_links.txt
-jetson_capture.egg-info/requires.txt
-jetson_capture.egg-info/top_level.txt

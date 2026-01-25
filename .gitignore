@@ -9,7 +9,6 @@ __pycache__/
 .venv/
 
 # DS/engine artifacts (large binaries) can live outside git; keep local outputs clean
-DeepStream-Yolo/engines/
 DeepStream-Yolo/artifacts/onnx/
 DeepStream-Yolo/artifacts/weights/*.pt
 
