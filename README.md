@@ -108,10 +108,3 @@ This produces `libnvdsinfer_custom_impl_Yolo.so`, which the configs reference.
   uv run squeakview_gui.py
   ```
   alerts dont block capture/serial log. user must config app password with an email domain (this is not your gmail password :))
-
-
-## License & notice
-Temporary Research Use Only License
-Copyright © 2025 National Institutes of Health
-
-This software is available for academic and non-profit research use under a temporary Research Use Only license. Commercial use may require a separate license from the NIH Office of Technology Transfer. All use, redistribution, and modification must additionally comply with the licensing terms of third-party software dependencies incorporated into the system. The licensing terms will be updated upon completion of the NIH review.
