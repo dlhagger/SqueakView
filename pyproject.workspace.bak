@@ -1,6 +1,0 @@
-[tool.uv.workspace]
-members = [
-  "environments/capture",
-  "environments/inference",
-  "environments/control"
-]

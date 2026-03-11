@@ -102,6 +102,7 @@ def pyspin_setup(
     activation: str = "rising",
     exposure_us: float | None = 10000.0,
     gain: float | None = None,
+    camera_index: int = 0,
 ):
     system = PySpin.System.GetInstance()
     cam_list = system.GetCameras()
@@ -109,7 +110,12 @@ def pyspin_setup(
         system.ReleaseInstance()
         raise RuntimeError("No cameras found")
 
-    cam = cam_list.GetByIndex(0)
+    count = int(cam_list.GetSize())
+    if camera_index < 0 or camera_index >= count:
+        cam_list.Clear()
+        system.ReleaseInstance()
+        raise RuntimeError(f"Camera index {camera_index} out of range (found {count} camera(s))")
+    cam = cam_list.GetByIndex(camera_index)
     cam.Init()
     nm = cam.GetNodeMap()
 
@@ -187,7 +193,7 @@ def pyspin_setup(
     )
 
     log(
-        f"[PySpin] Using PixelFormat={pix} @ {width}x{height} ~{fps} FPS | Trigger={'ON' if trigger_on else 'OFF'} | {exposure_desc}"
+        f"[PySpin] CamIndex={camera_index} PixelFormat={pix} @ {width}x{height} ~{fps} FPS | Trigger={'ON' if trigger_on else 'OFF'} | {exposure_desc}"
     )
     return system, cam_list, cam
 
@@ -228,6 +234,7 @@ class CaptureConfig:
     ready_file: str | None = None
     stats_file: str | None = None
     frame_log: str | None = None
+    camera_index: int = 0
 
 
 def run_capture(config: CaptureConfig) -> None:
@@ -318,6 +325,7 @@ def run_capture(config: CaptureConfig) -> None:
             activation=config.trigger_activation,
             exposure_us=config.exposure_us,
             gain=config.gain,
+            camera_index=config.camera_index,
         )
 
         pipeline = make_pipeline(config.width, config.height, config.fps, config.socket_path)

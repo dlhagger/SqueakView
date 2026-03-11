@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -27,6 +28,13 @@ struct PoseCache {
   uint64_t seq{0};
   int kpts{0};
   std::vector<float> flat; // [x1,y1,x2,y2,conf, kpts...]
+  std::deque<uint64_t> queue_seq;
+  std::deque<int> queue_kpts;
+  std::deque<std::vector<float>> queue_flat;
+  std::vector<float> pop_flat;
+  int pop_kpts{0};
+  uint64_t pop_seq{0};
+  size_t max_queue{32};
 } g_pose_cache;
 
 constexpr int kBaseValuesPerDet = 5;
@@ -45,6 +53,14 @@ void update_pose_cache(const std::vector<PoseDet>& dets, int kpts) {
     g_pose_cache.flat.push_back(d.y2);
     g_pose_cache.flat.push_back(d.conf);
     g_pose_cache.flat.insert(g_pose_cache.flat.end(), d.kpts.begin(), d.kpts.end());
+  }
+  g_pose_cache.queue_seq.push_back(g_pose_cache.seq);
+  g_pose_cache.queue_kpts.push_back(g_pose_cache.kpts);
+  g_pose_cache.queue_flat.push_back(g_pose_cache.flat);
+  while (g_pose_cache.queue_seq.size() > g_pose_cache.max_queue) {
+    g_pose_cache.queue_seq.pop_front();
+    g_pose_cache.queue_kpts.pop_front();
+    g_pose_cache.queue_flat.pop_front();
   }
   std::cout << std::fixed << std::setprecision(4);
   if (!dets.empty()) {
@@ -73,6 +89,40 @@ extern "C" uint64_t NvDsInferGetPoseCache(float** data, int* count, int* kpts) {
     *kpts = g_pose_cache.kpts;
   }
   return g_pose_cache.seq;
+}
+
+extern "C" uint64_t NvDsInferPopPoseCache(float** data, int* count, int* kpts) {
+  std::lock_guard<std::mutex> lock(g_pose_cache.mtx);
+  if (g_pose_cache.queue_seq.empty()) {
+    if (data) {
+      *data = nullptr;
+    }
+    if (count) {
+      *count = 0;
+    }
+    if (kpts) {
+      *kpts = 0;
+    }
+    return 0;
+  }
+
+  g_pose_cache.pop_seq = g_pose_cache.queue_seq.front();
+  g_pose_cache.pop_kpts = g_pose_cache.queue_kpts.front();
+  g_pose_cache.pop_flat = std::move(g_pose_cache.queue_flat.front());
+  g_pose_cache.queue_seq.pop_front();
+  g_pose_cache.queue_kpts.pop_front();
+  g_pose_cache.queue_flat.pop_front();
+
+  if (data) {
+    *data = g_pose_cache.pop_flat.empty() ? nullptr : g_pose_cache.pop_flat.data();
+  }
+  if (count) {
+    *count = static_cast<int>(g_pose_cache.pop_flat.size());
+  }
+  if (kpts) {
+    *kpts = g_pose_cache.pop_kpts;
+  }
+  return g_pose_cache.pop_seq;
 }
 
 static inline float iou_xyxy(const PoseDet& a, const PoseDet& b) {

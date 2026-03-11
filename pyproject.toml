@@ -1,0 +1,28 @@
+[project]
+name = "squeakview"
+version = "0.1.0"
+description = "Jetson capture + DeepStream inference + operator GUI stack."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "numpy==1.26.4",
+  "PySide6==6.8.0.2",
+  "pyqtgraph==0.13.7",
+  "PyYAML==6.0.3",
+  "pyserial==3.5",
+  "psutil==7.1.0",
+  "spinnaker-python",
+  "pyds",
+]
+
+[project.optional-dependencies]
+build-engine = [
+  "ipykernel>=7.1.0",
+  "onnxruntime>=1.23.2",
+  "onnxslim==0.1.78",
+  "ultralytics>=8.3.235",
+]
+
+[tool.uv.sources]
+spinnaker-python = { path = "wheel_files/spinnaker_python-4.3.0.189-cp310-cp310-linux_aarch64.whl" }
+pyds = { path = "wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl" }

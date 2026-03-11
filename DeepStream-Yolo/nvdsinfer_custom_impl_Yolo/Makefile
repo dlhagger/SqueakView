@@ -25,17 +25,17 @@
 
 CUDA_VER?=
 ifeq ($(CUDA_VER),)
-	$(error "CUDA_VER is not set")
+$(error "CUDA_VER is not set")
 endif
 
 OPENCV?=
 ifeq ($(OPENCV),)
-	OPENCV=0
+OPENCV=0
 endif
 
 GRAPH?=
 ifeq ($(GRAPH),)
-	GRAPH=0
+GRAPH=0
 endif
 
 CC:= g++
@@ -45,19 +45,19 @@ CFLAGS:= -Wall -std=c++11 -shared -fPIC -Wno-error=deprecated-declarations
 CFLAGS+= -I/opt/nvidia/deepstream/deepstream/sources/includes -I/usr/local/cuda-$(CUDA_VER)/include
 
 ifeq ($(OPENCV), 1)
-	COMMON+= -DOPENCV
-	CFLAGS+= $(shell pkg-config --cflags opencv4 2> /dev/null || pkg-config --cflags opencv)
-	LIBS+= $(shell pkg-config --libs opencv4 2> /dev/null || pkg-config --libs opencv)
+COMMON+= -DOPENCV
+CFLAGS+= $(shell pkg-config --cflags opencv4 2> /dev/null || pkg-config --cflags opencv)
+LIBS+= $(shell pkg-config --libs opencv4 2> /dev/null || pkg-config --libs opencv)
 endif
 
 ifeq ($(GRAPH), 1)
-	COMMON+= -DGRAPH
+COMMON+= -DGRAPH
 endif
 
 CUFLAGS:= -I/opt/nvidia/deepstream/deepstream/sources/includes -I/usr/local/cuda-$(CUDA_VER)/include
 
 ifeq ($(shell ldconfig -p | grep -q libnvparsers && echo 1 || echo 0), 1)
-	LIBS+= -lnvparsers
+LIBS+= -lnvparsers
 endif
 
 LIBS+= -lnvinfer_plugin -lnvinfer -lnvonnxparser -L/usr/local/cuda-$(CUDA_VER)/lib64 -lcudart -lcublas -lstdc++fs
@@ -69,7 +69,7 @@ INCS+= $(wildcard *.h)
 SRCFILES:= $(filter-out calibrator.cpp, $(wildcard *.cpp))
 
 ifeq ($(OPENCV), 1)
-	SRCFILES+= calibrator.cpp
+SRCFILES+= calibrator.cpp
 endif
 
 SRCFILES+= $(wildcard layers/*.cpp)

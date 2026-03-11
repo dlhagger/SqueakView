@@ -11,9 +11,19 @@ __pycache__/
 # DS/engine artifacts (large binaries) can live outside git; keep local outputs clean
 DeepStream-Yolo/artifacts/onnx/
 DeepStream-Yolo/artifacts/weights/*.pt
+!DeepStream-Yolo/artifacts/weights/yolo26s_dino_10kpts.pt
+DeepStream-Yolo/engines/
+DeepStream-Yolo/configs/*
+!DeepStream-Yolo/configs/templates/
+!DeepStream-Yolo/configs/templates/**
+!DeepStream-Yolo/configs/inference_off.txt
+!DeepStream-Yolo/configs/yolo26s_dino_10kpts_fp16.txt
 
 #tool omit
 tools/
+
+# local credentials / secrets
+client_secret_*.json
 
 # OS cruft
 .DS_Store

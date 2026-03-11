@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ready-file", default=None, help="Write a file once capture is ready.")
     ap.add_argument("--stats-file", default=None, help="Write capture stats CSV to this path.")
     ap.add_argument("--frame-log", default=None, help="Write per-event capture log CSV to this path.")
+    ap.add_argument("--camera-index", type=int, default=0, help="Camera index in Spinnaker camera list.")
     return ap.parse_args()
 
 
@@ -40,6 +41,7 @@ def main() -> None:
         ready_file=args.ready_file,
         stats_file=args.stats_file,
         frame_log=args.frame_log,
+        camera_index=args.camera_index,
     )
     pipeline.run_capture(config)
 

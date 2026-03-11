@@ -294,6 +294,7 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self.counts_label = QtWidgets.QLabel("Counts: --")
         self.counts_label.setStyleSheet("color: #cfd4ea; font-size: 12px; padding: 2px 4px;")
         layout.addWidget(self.counts_label)
+        self._settings_widget = self._build_settings_panel()
 
         pg.setConfigOptions(antialias=False, useOpenGL=False)
         pg.setConfigOption("background", "k")
@@ -367,6 +368,19 @@ class BehaviorDashboard(QtWidgets.QWidget):
             cfg = self._default_task_config()
             events = cfg["events"]
             plots_cfg = cfg["dashboard"]["plots"]
+
+        settings_panel = False
+        if isinstance(dashboard, dict):
+            settings_panel = bool(dashboard.get("settings_panel", False))
+        self._settings_widget.setVisible(settings_panel)
+        if settings_panel:
+            try:
+                parent = self._settings_widget.parent()
+                if parent is not None:
+                    parent.layout().removeWidget(self._settings_widget)
+            except Exception:
+                pass
+            self._plot_right_layout.insertWidget(0, self._settings_widget, 0)
 
         self._rules = []
         for rule in events:
@@ -528,6 +542,12 @@ class BehaviorDashboard(QtWidgets.QWidget):
         if not data:
             return
         event = str(data.get("event_uc", ""))
+        if event == "TASK_INFO":
+            self._update_settings_from_task_info(data)
+        elif event == "NOGO_STAGE_INFO":
+            self._update_settings_from_nogo_stage_info(data)
+        elif event in ("SIDE_SET", "TRIAL_START"):
+            self._update_settings_from_side_set(data)
         tsec = dash_util.choose_event_time(data)
         now = time.time()
         if tsec < (now - 2.0 * self.window_sec) or tsec > (now + 2.0 * self.window_sec):
@@ -691,6 +711,89 @@ class BehaviorDashboard(QtWidgets.QWidget):
             self.counts_label.setText("Counts: " + " | ".join(parts))
         else:
             self.counts_label.setText("Counts: --")
+
+    def _build_settings_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        panel.setObjectName("settingsPanel")
+        panel.setStyleSheet(
+            "#settingsPanel { background-color: #141622; border: 1px solid #2b2f3b; border-radius: 6px; }"
+        )
+        outer = QtWidgets.QVBoxLayout(panel)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+        title = QtWidgets.QLabel("Current Task Settings")
+        title.setStyleSheet("color: #cfd4ea; font-size: 12px; font-weight: 600;")
+        outer.addWidget(title)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(2)
+        outer.addLayout(grid)
+
+        self._settings_labels: dict[str, QtWidgets.QLabel] = {}
+        rows = [
+            ("Stage", "stage"),
+            ("Hold (ms)", "hold_ms"),
+            ("Go (ms)", "go_ms"),
+            ("NoGo (ms)", "nogo_ms"),
+            ("Go %", "go_pct"),
+            ("Side", "side"),
+            ("Reason", "reason"),
+        ]
+        for r, (label_text, key) in enumerate(rows):
+            label = QtWidgets.QLabel(label_text)
+            label.setStyleSheet("color: #a7adbf; font-size: 11px;")
+            value = QtWidgets.QLabel("--")
+            value.setStyleSheet("color: #e4e7f2; font-size: 11px; font-weight: 600;")
+            grid.addWidget(label, r, 0)
+            grid.addWidget(value, r, 1)
+            self._settings_labels[key] = value
+        return panel
+
+    def _update_settings_from_task_info(self, data: dict) -> None:
+        if not hasattr(self, "_settings_labels"):
+            return
+        stage = self._parse_int_field(data.get("count"))
+        hold_us = self._parse_int_field(data.get("duration_us"))
+        go_us = self._parse_int_field(data.get("latency_us"))
+        go_pct = self._parse_int_field(data.get("value"))
+        reason = str(data.get("reason", "")).strip() or "--"
+
+        if stage is not None:
+            self._settings_labels["stage"].setText(str(stage))
+        if hold_us is not None:
+            self._settings_labels["hold_ms"].setText(str(int(round(hold_us / 1000.0))))
+        if go_us is not None:
+            self._settings_labels["go_ms"].setText(str(int(round(go_us / 1000.0))))
+        if go_pct is not None:
+            self._settings_labels["go_pct"].setText(str(go_pct))
+        self._settings_labels["reason"].setText(reason)
+
+    def _update_settings_from_nogo_stage_info(self, data: dict) -> None:
+        if not hasattr(self, "_settings_labels"):
+            return
+        stage = self._parse_int_field(data.get("count"))
+        nogo_us = self._parse_int_field(data.get("duration_us"))
+        go_pct = self._parse_int_field(data.get("value"))
+        reason = str(data.get("reason", "")).strip() or "--"
+
+        if stage is not None:
+            self._settings_labels["stage"].setText(str(stage))
+        if nogo_us is not None:
+            self._settings_labels["nogo_ms"].setText(str(int(round(nogo_us / 1000.0))))
+        if go_pct is not None:
+            self._settings_labels["go_pct"].setText(str(go_pct))
+        self._settings_labels["reason"].setText(reason)
+
+    def _update_settings_from_side_set(self, data: dict) -> None:
+        if not hasattr(self, "_settings_labels"):
+            return
+        side = str(data.get("side_uc", "")).strip().upper()
+        if side not in ("L", "R"):
+            side = str(data.get("side", "")).strip().upper()
+        if side in ("L", "R"):
+            self._settings_labels["side"].setText(side)
 
     @staticmethod
     def _parse_int_field(value: object) -> int | None:

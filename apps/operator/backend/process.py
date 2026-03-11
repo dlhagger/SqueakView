@@ -6,6 +6,7 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -20,8 +21,6 @@ def _now() -> str:
 
 
 WORKSPACE = squeakview_config.WORKSPACE
-CAPTURE_ENV = WORKSPACE / "environments" / "capture"
-INFERENCE_ENV = WORKSPACE / "environments" / "inference"
 
 CAPTURE_ENTRY = "squeakview.apps.capture.main"
 INFERENCE_ENTRY = "squeakview.apps.inference.main"
@@ -29,15 +28,28 @@ INFERENCE_ENTRY = "squeakview.apps.inference.main"
 
 @dataclass(slots=True)
 class LaunchConfig:
+    capture_backend: str = "flir"
+    zed_depth_enabled: bool = False
+    zed_depth_mode: str = "NEURAL"
+    zed_depth_socket: str = "/tmp/cam_depth.sock"
+    zed_depth_record: bool = False
+    zed_confidence_threshold: int = 100
+    zed_texture_confidence_threshold: int = 100
+    zed_depth_minimum_distance_mm: int = 300
+    zed_depth_maximum_distance_mm: int = 20000
+    zed_fill_mode: bool = False
+    zed_depth_stabilization: int = 30
     width: int | None = 1440
     height: int | None = 1080
     fps: int | None = None
     pixel_format: str | None = None
     trigger_on: bool = True
     trigger_activation: str = "rising"
-    ds_cfg: Path = squeakview_config.DEEPSTREAM_ROOT / "configs" / "yolo11n_pose_fp32.txt"
+    ds_cfg: Path | None = squeakview_config.DEEPSTREAM_ROOT / "configs" / "yolo11s_distilledFT_fp16.txt"
     inference_enabled: bool = True
     socket_path: str = "/tmp/cam.sock"
+    socket_path_2: str = "/tmp/cam1.sock"
+    num_cameras: int = 1
     bitrate: int = 4000
     exposure_us: float | None = 10000.0
     serial_enabled: bool = True
@@ -49,6 +61,9 @@ class LaunchConfig:
     capture_ready_path: Path | None = None
     capture_stats_path: Path | None = None
     capture_frame_log_path: Path | None = None
+    capture_depth_ready_path: Path | None = None
+    capture_depth_stats_path: Path | None = None
+    capture_depth_frame_log_path: Path | None = None
     mouse_id: str | None = None
     experiment_name: str | None = None
     draw_skeleton: bool = False
@@ -116,13 +131,8 @@ class ProcessHandle:
                 self.emit(f"{self.name} SIGKILL error: {exc}")
 
 
-def _python_from_env(env_dir: Path) -> Path:
-    return env_dir / ".venv" / "bin" / "python"
-
-
-def _spawn(env_dir: Path, module: str, args: Sequence[str], emit: Callable[[str], None], name: str) -> ProcessHandle:
-    python = _python_from_env(env_dir)
-    cmd = [str(python), "-m", module, *args]
+def _spawn(module: str, args: Sequence[str], emit: Callable[[str], None], name: str) -> ProcessHandle:
+    cmd = [sys.executable, "-m", module, *args]
     emit(f"{name} CMD: {' '.join(shlex.quote(c) for c in cmd)}")
     env = os.environ.copy()
     pkg_root = str(WORKSPACE.parent)
@@ -145,6 +155,27 @@ def _spawn(env_dir: Path, module: str, args: Sequence[str], emit: Callable[[str]
 
 
 def spawn_capture(config: LaunchConfig, emit: Callable[[str], None]) -> ProcessHandle:
+    return spawn_capture_for_camera(config, emit, camera_index=0)
+
+
+def spawn_capture_for_camera(
+    config: LaunchConfig,
+    emit: Callable[[str], None],
+    *,
+    camera_index: int,
+    socket_path: str | None = None,
+    socket_path_2: str | None = None,
+    ready_path: Path | None = None,
+    ready_path_2: Path | None = None,
+    stats_path: Path | None = None,
+    stats_path_2: Path | None = None,
+    frame_log_path: Path | None = None,
+    frame_log_path_2: Path | None = None,
+    trigger_on: bool | None = None,
+) -> ProcessHandle:
+    backend = str(getattr(config, "capture_backend", "flir") or "flir").lower().strip()
+    if backend == "zed":
+        raise RuntimeError("spawn_capture_for_camera() is only valid for FLIR backend")
     args: list[str] = []
     if config.width:
         args += ["--width", str(config.width)]
@@ -152,24 +183,64 @@ def spawn_capture(config: LaunchConfig, emit: Callable[[str], None]) -> ProcessH
         args += ["--height", str(config.height)]
     if config.fps:
         args += ["--fps", str(config.fps)]
-    if config.pixel_format:
+    if config.pixel_format and backend != "zed":
         args += ["--pix", config.pixel_format]
     if config.exposure_us is not None:
         args += ["--exposure-us", str(config.exposure_us)]
-    args += ["--trigger", "on" if config.trigger_on else "off"]
+    args += ["--socket", socket_path or config.socket_path]
+    args += ["--camera-index", str(int(camera_index))]
+    effective_trigger = config.trigger_on if trigger_on is None else bool(trigger_on)
+    args += ["--trigger", "on" if effective_trigger else "off"]
     args += ["--activation", config.trigger_activation]
-    args += ["--socket", config.socket_path]
-    if config.capture_ready_path is not None:
-        args += ["--ready-file", str(config.capture_ready_path)]
-    if config.capture_stats_path is not None:
-        args += ["--stats-file", str(config.capture_stats_path)]
-    if config.capture_frame_log_path is not None:
-        args += ["--frame-log", str(config.capture_frame_log_path)]
-    return _spawn(CAPTURE_ENV, CAPTURE_ENTRY, args, emit, "【CAP】")
+    ready = ready_path if ready_path is not None else config.capture_ready_path
+    stats = stats_path if stats_path is not None else config.capture_stats_path
+    frame_log = frame_log_path if frame_log_path is not None else config.capture_frame_log_path
+    if ready is not None:
+        args += ["--ready-file", str(ready)]
+    if stats is not None:
+        args += ["--stats-file", str(stats)]
+    if frame_log is not None:
+        args += ["--frame-log", str(frame_log)]
+    return _spawn(CAPTURE_ENTRY, args, emit, f"【CAP{camera_index}】")
 
 
 def spawn_inference(config: LaunchConfig, emit: Callable[[str], None]) -> ProcessHandle:
-    args: list[str] = ["--sock", config.socket_path, "--cfg", str(config.ds_cfg)]
+    backend = str(getattr(config, "capture_backend", "flir") or "flir").lower().strip()
+    args: list[str] = []
+    if config.ds_cfg is not None:
+        args += ["--cfg", str(config.ds_cfg)]
+    args += ["--capture-backend", backend]
+    args += ["--num-cameras", str(max(1, int(getattr(config, "num_cameras", 1))))]
+    if backend != "zed":
+        socks = [config.socket_path]
+        if int(getattr(config, "num_cameras", 1)) > 1:
+            if config.socket_path_2:
+                socks.append(config.socket_path_2)
+        for sock in socks:
+            args += ["--sock", sock]
+    else:
+        if bool(getattr(config, "zed_depth_enabled", False)):
+            args.append("--zed-depth-enabled")
+        args += ["--zed-depth-mode", str(getattr(config, "zed_depth_mode", "NEURAL"))]
+        args += ["--zed-depth-socket", str(getattr(config, "zed_depth_socket", "/tmp/cam_depth.sock"))]
+        args += ["--zed-confidence-threshold", str(int(getattr(config, "zed_confidence_threshold", 100) or 100))]
+        args += [
+            "--zed-texture-confidence-threshold",
+            str(int(getattr(config, "zed_texture_confidence_threshold", 100) or 100)),
+        ]
+        args += [
+            "--zed-depth-minimum-distance-mm",
+            str(int(getattr(config, "zed_depth_minimum_distance_mm", 300) or 300)),
+        ]
+        args += [
+            "--zed-depth-maximum-distance-mm",
+            str(int(getattr(config, "zed_depth_maximum_distance_mm", 20000) or 20000)),
+        ]
+        args += ["--zed-depth-stabilization", str(int(getattr(config, "zed_depth_stabilization", 30) or 30))]
+        if bool(getattr(config, "zed_fill_mode", False)):
+            args.append("--zed-fill-mode")
+        if bool(getattr(config, "zed_depth_record", False)):
+            args.append("--zed-depth-record")
     if config.width:
         args += ["--width", str(config.width)]
     if config.height:
@@ -185,4 +256,4 @@ def spawn_inference(config: LaunchConfig, emit: Callable[[str], None]) -> Proces
         args.append("--disable-infer")
     if config.draw_skeleton:
         args.append("--draw-skeleton")
-    return _spawn(INFERENCE_ENV, INFERENCE_ENTRY, args, emit, "【DS】")
+    return _spawn(INFERENCE_ENTRY, args, emit, "【DS】")

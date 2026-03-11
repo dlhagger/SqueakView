@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import csv
 import ctypes
+import json
 import math
 import os
 import signal
@@ -87,7 +88,7 @@ class CSVWriter:
         kp_names: list[str] | None = None,
     ):
         self.path = run_dir / "detections.csv"
-        self.pose_enabled = pose and kpt_count > 0 and kpt_dims > 0
+        self.pose_enabled = bool(pose)
         self.kpt_count = int(kpt_count)
         self.kpt_dims = int(kpt_dims)
         self.kp_names = kp_names if (kp_names and len(kp_names) >= self.kpt_count) else None
@@ -99,6 +100,7 @@ class CSVWriter:
             "frame",
             "ts_us",
             "stream_id",
+            "source",
             "obj_id",
             "class_id",
             "class_label",
@@ -109,11 +111,14 @@ class CSVWriter:
             "h",
         ]
         if self.pose_enabled:
-            for idx in range(self.kpt_count):
-                base = self.kp_names[idx] if self.kp_names else f"kp{idx}"
-                headers.append(f"{base}_x")
-                headers.append(f"{base}_y")
-                headers.append(f"{base}_conf")
+            headers.extend(
+                [
+                    "pose_schema",
+                    "kpt_count",
+                    "kpt_names_json",
+                    "kpt_values_json",
+                ]
+            )
         self._writer.writerow(headers)
         self._f.flush()
         atexit.register(self.close)
@@ -135,6 +140,13 @@ class CSVWriter:
             pass
 
 
+@dataclass(slots=True)
+class PoseSchema:
+    name: str
+    offset: int
+    names: list[str]
+
+
 def _safe_object_id(ometa) -> int:
     """Return integer object_id or -1 across DS versions."""
     try:
@@ -151,7 +163,20 @@ def _safe_object_id(ometa) -> int:
 @dataclass(slots=True)
 class InferenceConfig:
     sock: str = "/tmp/cam.sock"
-    cfg_path: Path = field(default_factory=lambda: Path.cwd() / "config_infer_primary_11m.txt")
+    socks: list[str] | None = None
+    cfg_path: Path | None = field(default_factory=lambda: Path.cwd() / "config_infer_primary_11m.txt")
+    capture_backend: str = "flir"
+    num_cameras: int = 1
+    zed_depth_enabled: bool = False
+    zed_depth_mode: str = "NEURAL"
+    zed_depth_socket: str = "/tmp/cam_depth.sock"
+    zed_depth_record: bool = False
+    zed_confidence_threshold: int = 100
+    zed_texture_confidence_threshold: int = 100
+    zed_depth_minimum_distance_mm: int = 300
+    zed_depth_maximum_distance_mm: int = 20000
+    zed_fill_mode: bool = False
+    zed_depth_stabilization: int = 30
     width: int = 1280
     height: int = 720
     fps: int = 30
@@ -173,6 +198,40 @@ class App:
         else:
             self.run_dir = run_context.timestamped_run_dir("ds")
         self.artifacts = run_context.run_artifacts(self.run_dir)
+        self.capture_backend = str(getattr(config, "capture_backend", "flir") or "flir").lower().strip()
+        self.requested_cam_count = max(1, int(getattr(config, "num_cameras", 1)))
+        self.zed_depth_enabled = bool(getattr(config, "zed_depth_enabled", False))
+        self.zed_depth_mode = str(getattr(config, "zed_depth_mode", "NEURAL")).upper().strip()
+        self.zed_depth_socket = str(getattr(config, "zed_depth_socket", "/tmp/cam_depth.sock"))
+        self.zed_depth_record = bool(getattr(config, "zed_depth_record", False))
+        self.zed_confidence_threshold = max(
+            0, min(100, int(getattr(config, "zed_confidence_threshold", 100) or 100))
+        )
+        self.zed_texture_confidence_threshold = max(
+            0, min(100, int(getattr(config, "zed_texture_confidence_threshold", 100) or 100))
+        )
+        self.zed_depth_minimum_distance_mm = max(
+            100, min(3000, int(getattr(config, "zed_depth_minimum_distance_mm", 300) or 300))
+        )
+        self.zed_depth_maximum_distance_mm = max(
+            500, min(40000, int(getattr(config, "zed_depth_maximum_distance_mm", 20000) or 20000))
+        )
+        self.zed_fill_mode = bool(getattr(config, "zed_fill_mode", False))
+        self.zed_depth_stabilization = max(
+            0, min(100, int(getattr(config, "zed_depth_stabilization", 30) or 30))
+        )
+        raw_socks = list(config.socks or [])
+        if not raw_socks:
+            raw_socks = [config.sock]
+        if config.sock not in raw_socks:
+            raw_socks.insert(0, config.sock)
+        self.socks = [s for s in raw_socks if s] if self.capture_backend != "zed" else []
+        self._extra_raw_videos: list[Path] = []
+        self._depth_video: Path | None = None
+        self._zed_svo_file: Path | None = None
+        self._zed_svo_compression = "H264"
+        self._zed_svo_enable_attempts = 0
+        self._zed_svo_enabled_runtime = False
         self.preview_enabled = True
         if self.enable_infer:
             self.pose_mode, self.pose_kpt_count, self.pose_input_dims = self._detect_pose_mode(config)
@@ -181,6 +240,9 @@ class App:
         self.pose_kpt_dims = 3 if self.pose_mode else 0
         self.draw_skeleton = bool(config.draw_skeleton)
         self.kp_names: list[str] | None = None
+        self.class_names: list[str] = []
+        self.pose_schemas_by_name: dict[str, PoseSchema] = {}
+        self.pose_schemas_by_id: dict[int, PoseSchema] = {}
         if self.pose_mode:
             # Load labels file (pose models use labels as keypoint names)
             try:
@@ -202,12 +264,13 @@ class App:
                         except Exception:
                             kp_label_path = None
                 # keypoint labels: prefer explicit pose-kpt-labels-path, fallback to labelfile-path
+                if label_path:
+                    lp = Path(label_path)
+                    if lp.exists():
+                        self.class_names = [ln.strip() for ln in lp.read_text().splitlines() if ln.strip()]
                 kp_label_path = kp_label_path or label_path
                 if kp_label_path:
-                    lp = Path(kp_label_path)
-                    if lp.exists():
-                        names = [ln.strip() for ln in lp.read_text().splitlines() if ln.strip()]
-                        self.kp_names = names if names else None
+                    self.kp_names = self._load_pose_labels(Path(kp_label_path))
             except Exception as exc:
                 print(f"[{ts()}] [POSE] unable to load keypoint labels: {exc}")
         # Skeleton toggle via file
@@ -240,6 +303,8 @@ class App:
         self._infer_history: deque[tuple[float, float]] = deque()
         self._stream_history: deque[float] = deque()
         self._stream_fps: float = float("nan")
+        self._stream_frame_seq: dict[int, int] = {}
+        self._csv_probe_pre_tiler: bool = False
         self._pose_cache_seq: int = 0
         self._pose_cache_last: list[dict] | None = None
         self._pose_cache_fn = None
@@ -274,6 +339,8 @@ class App:
 
     @staticmethod
     def _detect_pose_mode(config: InferenceConfig) -> tuple[bool, int, tuple[float, float]]:
+        if not config.cfg_path:
+            return False, 0, (float(config.width), float(config.height))
         try:
             text = Path(config.cfg_path).read_text().splitlines()
         except Exception:
@@ -312,7 +379,9 @@ class App:
         return True, 0, net_dims or (float(config.width), float(config.height))
 
     @staticmethod
-    def _load_pose_draw_thresh(cfg_path: Path) -> float:
+    def _load_pose_draw_thresh(cfg_path: Path | None) -> float:
+        if not cfg_path:
+            return 0.0
         try:
             lines = Path(cfg_path).read_text().splitlines()
         except Exception:
@@ -328,19 +397,330 @@ class App:
                     return 0.0
         return 0.0
 
+    @staticmethod
+    def _load_cfg_batch_size(cfg_path: Path | None) -> int | None:
+        if not cfg_path:
+            return None
+        try:
+            lines = Path(cfg_path).read_text().splitlines()
+        except Exception:
+            return None
+        for line in lines:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            if raw.lower().startswith("batch-size"):
+                try:
+                    return int(raw.split("=", 1)[1].strip())
+                except Exception:
+                    return None
+        return None
+
+    def _load_pose_labels(self, labels_path: Path) -> list[str] | None:
+        try:
+            lines = labels_path.read_text().splitlines()
+        except Exception:
+            return None
+
+        plain_names: list[str] = []
+        section_name: str | None = None
+        section_names: list[str] = []
+        section_offset = 0
+        saw_section = False
+
+        def _commit_section() -> None:
+            nonlocal section_name, section_names, section_offset
+            if not section_name or not section_names:
+                return
+            schema = PoseSchema(name=section_name, offset=section_offset, names=list(section_names))
+            self.pose_schemas_by_name[section_name.lower()] = schema
+            section_offset += len(section_names)
+            section_names = []
+
+        for line in lines:
+            raw = line.strip()
+            if not raw:
+                continue
+            if raw.startswith("#"):
+                continue
+            if raw.startswith("[") and raw.endswith("]") and len(raw) > 2:
+                saw_section = True
+                _commit_section()
+                section_name = raw[1:-1].strip()
+                continue
+            if saw_section:
+                section_names.append(raw)
+            else:
+                plain_names.append(raw)
+
+        if saw_section:
+            _commit_section()
+            if self.class_names:
+                for idx, class_name in enumerate(self.class_names):
+                    schema = self.pose_schemas_by_name.get(class_name.strip().lower())
+                    if schema:
+                        self.pose_schemas_by_id[idx] = schema
+            ordered: list[str] = []
+            for schema in sorted(self.pose_schemas_by_name.values(), key=lambda s: s.offset):
+                ordered.extend(schema.names)
+            return ordered or None
+
+        return plain_names or None
+
+    def _pose_schema_for_detection(self, class_id: int, label: str) -> PoseSchema | None:
+        schema = self.pose_schemas_by_id.get(class_id)
+        if schema:
+            return schema
+        norm = (label or "").strip().lower()
+        if norm:
+            schema = self.pose_schemas_by_name.get(norm)
+            if schema:
+                return schema
+        if 0 <= class_id < len(self.class_names):
+            return self.pose_schemas_by_name.get(self.class_names[class_id].strip().lower())
+        return None
+
+    def _effective_cam_count(self) -> int:
+        if self.capture_backend != "zed":
+            return max(1, len(self.socks))
+        if self.zed_depth_enabled and self.requested_cam_count > 1:
+            print(
+                f"[{ts()}] [WARN] ZED depth mode currently uses one DeepStream source (left image only). "
+                "Set batch-size=1 config for this mode.",
+                flush=True,
+            )
+            return 1
+        return 2 if self.requested_cam_count > 1 else 1
+
+    @staticmethod
+    def _zed_resolution_enum(width: int, height: int) -> int:
+        dims = (int(width), int(height))
+        if dims == (2208, 1242):
+            return 0  # HD2K
+        if dims == (1920, 1080):
+            return 1  # HD1080
+        if dims == (1920, 1200):
+            return 2  # HD1200
+        if dims == (1280, 720):
+            return 3  # HD720
+        if dims == (960, 600):
+            return 4  # SVGA
+        if dims == (672, 376):
+            return 5  # VGA
+        return 6  # auto
+
+    @staticmethod
+    def _zed_depth_mode_enum(mode: str) -> int:
+        mapping = {
+            "NONE": 0,
+            "PERFORMANCE": 1,
+            "QUALITY": 2,
+            "ULTRA": 3,
+            "NEURAL": 5,
+            "NEURAL_PLUS": 6,
+            "NEURAL_LIGHT": 1,  # best available fallback in this plugin enum set
+        }
+        return mapping.get(str(mode).upper().strip(), 5)
+
+    def _build_shm_source_launch(self, cfg: InferenceConfig, cam_count: int) -> str:
+        source_blocks: list[str] = []
+        self._extra_raw_videos = []
+        for idx, sock in enumerate(self.socks):
+            tee_name = f"T{idx}"
+            raw_out = self.artifacts.raw_video if idx == 0 else (self.run_dir / f"raw_cam{idx}.mp4")
+            if idx > 0:
+                self._extra_raw_videos.append(raw_out)
+            source_blocks.append(
+                f"""
+            shmsrc socket-path={sock} is-live=true do-timestamp=true !
+              video/x-raw,format=GRAY8,width={cfg.width},height={cfg.height},framerate={cfg.fps}/1 !
+              nvvideoconvert compute-hw=1 copy-hw=2 !
+              video/x-raw(memory:NVMM),format=NV12,width={cfg.width},height={cfg.height} !
+              tee name={tee_name}
+
+              {tee_name}. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream !
+                   nvvideoconvert compute-hw=1 copy-hw=2 !
+                   video/x-raw,format=NV12,width={cfg.width},height={cfg.height} !
+                   x264enc tune=zerolatency speed-preset=ultrafast bitrate={cfg.bitrate} key-int-max={cfg.fps} !
+                   h264parse ! mp4mux !
+                   filesink location=\"{raw_out}\" sync=false
+
+              {tee_name}. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! m.sink_{idx}
+                """.rstrip()
+            )
+        return "\n\n".join(source_blocks)
+
+    def _build_zed_source_launch(self, cfg: InferenceConfig, cam_count: int) -> str:
+        self._extra_raw_videos = []
+        self._depth_video = None
+        self._zed_svo_file = self.run_dir / "zed_capture.svo2"
+        self._zed_svo_enable_attempts = 0
+        self._zed_svo_enabled_runtime = False
+        if self.zed_depth_enabled:
+            try:
+                if os.path.exists(self.zed_depth_socket):
+                    os.unlink(self.zed_depth_socket)
+            except Exception:
+                pass
+        zed_res = self._zed_resolution_enum(cfg.width, cfg.height)
+        zed_depth_mode = self._zed_depth_mode_enum(self.zed_depth_mode)
+        stream_type = 4 if self.zed_depth_enabled else 2
+        is_depth = "true" if self.zed_depth_enabled else "false"
+        print(
+            f"[{ts()}] [INFO] ZED DeepStream source: stream-type={stream_type} "
+            f"depth-mode={self.zed_depth_mode} confidence-threshold={self.zed_confidence_threshold} "
+            f"texture-confidence={self.zed_texture_confidence_threshold} "
+            f"depth-range-mm={self.zed_depth_minimum_distance_mm}-{self.zed_depth_maximum_distance_mm} "
+            f"fill-mode={'on' if self.zed_fill_mode else 'off'} depth-stabilization={self.zed_depth_stabilization} "
+            f"requested_cams={self.requested_cam_count} effective_cams={cam_count}",
+            flush=True,
+        )
+
+        raw_left = self.artifacts.raw_video
+        raw_aux = self.run_dir / "raw_cam1.mp4"
+        if cam_count > 1:
+            self._extra_raw_videos.append(raw_aux)
+        preview_w = 640
+        preview_h = 400
+        preview_fps = min(15, int(cfg.fps))
+
+        left_block = f"""
+            zed_demux.src_left ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 !
+                autovideoconvert !
+                nvvideoconvert compute-hw=1 copy-hw=2 !
+                video/x-raw(memory:NVMM),format=NV12,width={cfg.width},height={cfg.height} !
+                tee name=T0
+            T0. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream !
+                nvvideoconvert compute-hw=1 copy-hw=2 !
+                video/x-raw,format=NV12,width={cfg.width},height={cfg.height} !
+                x264enc tune=zerolatency speed-preset=ultrafast bitrate={cfg.bitrate} key-int-max={cfg.fps} !
+                h264parse ! mp4mux ! filesink location=\"{raw_left}\" sync=false
+            T0. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! m.sink_0
+        """.rstrip()
+
+        aux_block = ""
+        if cam_count > 1:
+            aux_block = f"""
+            zed_demux.src_aux ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 !
+                autovideoconvert !
+                nvvideoconvert compute-hw=1 copy-hw=2 !
+                video/x-raw(memory:NVMM),format=NV12,width={cfg.width},height={cfg.height} !
+                tee name=T1
+            T1. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream !
+                nvvideoconvert compute-hw=1 copy-hw=2 !
+                video/x-raw,format=NV12,width={cfg.width},height={cfg.height} !
+                x264enc tune=zerolatency speed-preset=ultrafast bitrate={cfg.bitrate} key-int-max={cfg.fps} !
+                h264parse ! mp4mux ! filesink location=\"{raw_aux}\" sync=false
+            T1. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! m.sink_1
+            """.rstrip()
+        elif self.zed_depth_enabled:
+            aux_record_block = ""
+            if self.zed_depth_record:
+                depth_out = self.run_dir / "raw_depth.mp4"
+                self._depth_video = depth_out
+                aux_record_block = f"""
+            TDEP. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream !
+                videoconvert ! video/x-raw,format=I420,width={cfg.width},height={cfg.height},framerate={cfg.fps}/1 !
+                x264enc tune=zerolatency speed-preset=ultrafast bitrate={cfg.bitrate} key-int-max={cfg.fps} !
+                h264parse ! mp4mux ! filesink location=\"{depth_out}\" sync=false
+                """.rstrip()
+            aux_block = f"""
+            zed_demux.src_aux ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 !
+                autovideoconvert !
+                video/x-raw,format=BGRA,width={cfg.width},height={cfg.height},framerate={cfg.fps}/1 !
+                tee name=TDEP
+            TDEP. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream !
+                videorate ! videoscale !
+                video/x-raw,format=BGRA,width={preview_w},height={preview_h},framerate={preview_fps}/1 !
+                shmsink socket-path={self.zed_depth_socket} wait-for-connection=false sync=false async=false shm-size=20000000
+            {aux_record_block}
+            """.rstrip()
+
+        return f"""
+            zedsrc name=zedsrc camera-resolution={zed_res} camera-fps={cfg.fps} stream-type={stream_type} depth-mode={zed_depth_mode}
+                confidence-threshold={self.zed_confidence_threshold} texture-confidence-threshold={self.zed_texture_confidence_threshold}
+                depth-minimum-distance={self.zed_depth_minimum_distance_mm} depth-maximum-distance={self.zed_depth_maximum_distance_mm}
+                fill-mode={'true' if self.zed_fill_mode else 'false'} depth-stabilization={self.zed_depth_stabilization}
+                ctrl-saturation=4 ctrl-sharpness=1 ctrl-gamma=2 ctrl-whitebalance-auto=true ctrl-aec-agc=true
+                svo-recording-filename=\"{self._zed_svo_file}\" svo-recording-compression={self._zed_svo_compression} !
+                zeddemux name=zed_demux is-depth={is_depth}
+            {left_block}
+            {aux_block}
+        """.rstrip()
+
+    def _enable_zed_svo_runtime(self) -> bool:
+        if self._stopping or self.capture_backend != "zed" or self._zed_svo_file is None:
+            return False
+        self._zed_svo_enable_attempts += 1
+        try:
+            zedsrc = self.pipeline.get_by_name("zedsrc")
+            if zedsrc is None:
+                raise RuntimeError("zedsrc element not found in pipeline")
+            zedsrc.set_property("svo-recording-filename", str(self._zed_svo_file))
+            # Force H264 because H265 SVO playback/export is failing on this stack.
+            zedsrc.set_property("svo-recording-compression", 1)
+            zedsrc.set_property("svo-recording-enable", True)
+            active = bool(zedsrc.get_property("svo-recording-enable"))
+            try:
+                compression = int(zedsrc.get_property("svo-recording-compression"))
+            except Exception:
+                compression = -1
+            if active:
+                self._zed_svo_enabled_runtime = True
+                print(
+                    f"[{ts()}] [INFO] ZED SVO recording enabled at runtime "
+                    f"(compression={compression}) -> {self._zed_svo_file}",
+                    flush=True,
+                )
+                return False
+            if self._zed_svo_enable_attempts % 5 == 0:
+                print(
+                    f"[{ts()}] [WARN] ZED SVO recording not active yet "
+                    f"(attempt {self._zed_svo_enable_attempts})",
+                    flush=True,
+                )
+        except Exception as exc:
+            if self._zed_svo_enable_attempts % 5 == 0:
+                print(
+                    f"[{ts()}] [WARN] ZED SVO runtime enable failed "
+                    f"(attempt {self._zed_svo_enable_attempts}): {exc}",
+                    flush=True,
+                )
+        # Retry for a short window after PLAYING because zedsrc only starts recording once started.
+        return self._zed_svo_enable_attempts < 20
+
     def build(self) -> None:
         cfg = self.config
-        sock = cfg.sock
-
-        for _ in range(200):
-            if os.path.exists(sock):
-                break
-            time.sleep(0.01)
+        if self.enable_infer and not cfg.cfg_path:
+            raise RuntimeError("DeepStream config (--cfg) is required when inference is enabled.")
+        if self.capture_backend != "zed":
+            for sock in self.socks:
+                for _ in range(300):
+                    if os.path.exists(sock):
+                        break
+                    time.sleep(0.01)
+        cam_count = self._effective_cam_count()
+        cfg_batch = self._load_cfg_batch_size(cfg.cfg_path)
+        if self.enable_infer and cfg_batch is not None and cfg_batch != cam_count:
+            raise RuntimeError(
+                f"nvinfer config batch-size ({cfg_batch}) does not match camera count ({cam_count}). "
+                f"Update {cfg.cfg_path} and rebuild/use a matching engine."
+            )
+        mux_timeout_us = max(10_000, int(1_000_000 / max(1, int(cfg.fps or 30))))
+        tile_rows = 1 if cam_count <= 2 else int(math.ceil(math.sqrt(cam_count)))
+        tile_cols = int(math.ceil(cam_count / max(1, tile_rows)))
+        tiler_block = ""
+        if cam_count > 1:
+            tiler_block = (
+                f"nvmultistreamtiler rows={tile_rows} columns={tile_cols} "
+                f"width={cfg.width} height={cfg.height} !"
+            )
 
         if self.enable_infer:
             if self.osd_cpu:
                 infer_block = f"""
-                  nvinfer name=pgie config-file-path=\"{cfg.cfg_path}\" batch-size=1 !
+                  nvinfer name=pgie config-file-path=\"{cfg.cfg_path}\" batch-size={cam_count} !
+                  {tiler_block}
                   nvvideoconvert compute-hw=1 copy-hw=2 !
                   video/x-raw,format=RGBA,width={cfg.width},height={cfg.height} !
                   tee name=vis_tee
@@ -355,7 +735,8 @@ class App:
                 """
             else:
                 infer_block = f"""
-                  nvinfer name=pgie config-file-path=\"{cfg.cfg_path}\" batch-size=1 !
+                  nvinfer name=pgie config-file-path=\"{cfg.cfg_path}\" batch-size={cam_count} !
+                  {tiler_block}
                   nvvideoconvert compute-hw=1 copy-hw=2 !
                   video/x-raw(memory:NVMM),format=RGBA,width={cfg.width},height={cfg.height} !
                   tee name=vis_tee
@@ -372,28 +753,21 @@ class App:
                 """
         else:
             infer_block = f"""
+              {tiler_block}
               nvvideoconvert compute-hw=1 copy-hw=2 !
               video/x-raw(memory:NVMM),format=RGBA,width={cfg.width},height={cfg.height} !
             """
 
+        if self.capture_backend == "zed":
+            sources_launch = self._build_zed_source_launch(cfg, cam_count)
+        else:
+            sources_launch = self._build_shm_source_launch(cfg, cam_count)
+
         launch = f"""
-            shmsrc socket-path={sock} is-live=true do-timestamp=true !
-              video/x-raw,format=GRAY8,width={cfg.width},height={cfg.height},framerate={cfg.fps}/1 !
-              nvvideoconvert compute-hw=1 copy-hw=2 !
-              video/x-raw(memory:NVMM),format=NV12,width={cfg.width},height={cfg.height} !
+{sources_launch}
+
+              nvstreammux name=m batch-size={cam_count} width={cfg.width} height={cfg.height} live-source=1 batched-push-timeout={mux_timeout_us} !
               identity name=perf_tap silent=true !
-              tee name=T
-
-              T. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 !
-                   nvvideoconvert compute-hw=1 copy-hw=2 !
-                   video/x-raw,format=NV12,width={cfg.width},height={cfg.height} !
-                   x264enc tune=zerolatency speed-preset=ultrafast bitrate={cfg.bitrate} key-int-max={cfg.fps} !
-                   h264parse ! mp4mux !
-                   filesink location=\"{self.artifacts.raw_video}\" sync=false
-
-              T. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream ! m.sink_0
-
-              nvstreammux name=m batch-size=1 width={cfg.width} height={cfg.height} live-source=1 batched-push-timeout=33000 !
               queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream !
 {infer_block}
               tee name=TA
@@ -404,6 +778,12 @@ class App:
         """
         print(f"[{ts()}] [INFO] building pipeline…")
         self.pipeline = Gst.parse_launch(launch)
+        mux = self.pipeline.get_by_name("m")
+        if mux and cam_count > 1:
+            try:
+                mux.set_property("sync-inputs", True)
+            except Exception:
+                pass
         self._install_caps_logging()
         tap = self.pipeline.get_by_name("perf_tap")
         if tap:
@@ -413,6 +793,7 @@ class App:
 
         osd = self.pipeline.get_by_name("osd") if self.enable_infer else None
         if self.enable_infer:
+            self._csv_probe_pre_tiler = cam_count > 1
             if osd is None:
                 raise AssertionError("nvdsosd element missing")
             pgie = self.pipeline.get_by_name("pgie")
@@ -427,6 +808,8 @@ class App:
                     print(f"[{ts()}] [WARN] nvinfer sink pad missing; cannot time inference")
                 if src_pad is not None:
                     src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_pgie_src)
+                    if self._csv_probe_pre_tiler:
+                        src_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_probe)
                 else:
                     print(f"[{ts()}] [WARN] nvinfer src pad missing; cannot time inference")
             try:
@@ -461,10 +844,15 @@ class App:
         bus.connect("message", self.on_bus_msg)
 
         if self.enable_infer and osd is not None:
-            # Attach probe on OSD sink pad so display meta is drawn by nvdsosd
-            pad = osd.get_static_pad("sink")
-            assert pad is not None, "osd sink pad missing"
-            pad.add_probe(Gst.PadProbeType.BUFFER, self.on_probe)
+            if self._csv_probe_pre_tiler:
+                # In multi-camera mode, process metadata on pgie src (pre-tiler)
+                # so source/frame identity is preserved for both CSV and pose draws.
+                pass
+            else:
+                # Single-camera mode can use OSD sink directly.
+                pad = osd.get_static_pad("sink")
+                assert pad is not None, "osd sink pad missing"
+                pad.add_probe(Gst.PadProbeType.BUFFER, self.on_probe)
         self._preview_valve = self.pipeline.get_by_name("preview_valve")
         if self._preview_valve is None:
             print(f"[{ts()}] [WARN] preview valve missing; preview toggle unavailable")
@@ -603,31 +991,50 @@ class App:
                 ctypes.POINTER(ctypes.c_int),
                 ctypes.POINTER(ctypes.c_int),
             ]
+            pop_fn = getattr(lib, "NvDsInferPopPoseCache", None)
+            if pop_fn is not None:
+                pop_fn.restype = ctypes.c_ulonglong
+                pop_fn.argtypes = [
+                    ctypes.POINTER(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                ]
             self._pose_cache_lib = lib
             self._pose_cache_fn = fn
-            print(f"[{ts()}] [POSE] cache hook ready: {lib_path}")
+            self._pose_cache_pop_fn = pop_fn
+            if pop_fn is not None:
+                print(f"[{ts()}] [POSE] cache hook ready (queued): {lib_path}")
+            else:
+                print(f"[{ts()}] [POSE] cache hook ready (latest-only): {lib_path}")
         except Exception as exc:
             print(f"[{ts()}] [POSE] cache hook failed: {exc}")
 
-    def _decode_pose_tensor(self, frame_meta) -> list[dict] | None:
+    def _decode_pose_tensor(self, frame_meta, *, consume: bool = True) -> list[dict] | None:
         if not self.pose_mode:
             return None
         fn = getattr(self, "_pose_cache_fn", None)
-        if fn is None:
+        pop_fn = getattr(self, "_pose_cache_pop_fn", None)
+        if fn is None and pop_fn is None:
             return []
 
         data_ptr = ctypes.POINTER(ctypes.c_float)()
         total = ctypes.c_int()
         kpts = ctypes.c_int()
-        seq = fn(ctypes.byref(data_ptr), ctypes.byref(total), ctypes.byref(kpts))
+        used_pop = False
+        if consume and pop_fn is not None:
+            seq = pop_fn(ctypes.byref(data_ptr), ctypes.byref(total), ctypes.byref(kpts))
+            used_pop = True
+        else:
+            seq = fn(ctypes.byref(data_ptr), ctypes.byref(total), ctypes.byref(kpts))
         total_val = int(total.value)
 
         if seq == 0 or total_val <= 0 or not data_ptr:
-            self._pose_cache_seq = seq
-            self._pose_cache_last = []
+            if not used_pop:
+                self._pose_cache_seq = seq
+                self._pose_cache_last = []
             return []
 
-        if seq == self._pose_cache_seq and self._pose_cache_last is not None:
+        if (not used_pop) and seq == self._pose_cache_seq and self._pose_cache_last is not None:
             return self._pose_cache_last
 
         kpt_count = max(0, int(kpts.value))
@@ -748,6 +1155,7 @@ class App:
         msg_type = msg.type
         if msg_type == Gst.MessageType.EOS:
             print(f"[{ts()}] [BUS] EOS")
+            self._disable_zed_svo_recording(context="eos")
             self.stop()
         elif msg_type == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
@@ -766,9 +1174,61 @@ class App:
                     print(f"[{ts()}] [WARN] could not bind preview window: {exc}")
         return True
 
+    def _disable_zed_svo_recording(self, *, context: str) -> None:
+        if self.capture_backend != "zed":
+            return
+        try:
+            zedsrc = self.pipeline.get_by_name("zedsrc")
+        except Exception:
+            zedsrc = None
+        if zedsrc is None:
+            return
+        try:
+            pre = bool(zedsrc.get_property("svo-recording-enable"))
+        except Exception:
+            pre = False
+        print(f"[{ts()}] [INFO] ZED SVO stop ({context}): pre-disable active={pre}", flush=True)
+        try:
+            zedsrc.set_property("svo-recording-enable", False)
+        except Exception:
+            return
+        for _ in range(40):
+            try:
+                active = bool(zedsrc.get_property("svo-recording-enable"))
+            except Exception:
+                active = False
+            if not active:
+                break
+            time.sleep(0.05)
+        try:
+            post = bool(zedsrc.get_property("svo-recording-enable"))
+        except Exception:
+            post = False
+        print(f"[{ts()}] [INFO] ZED SVO stop ({context}): post-disable active={post}", flush=True)
+        # Small grace window for encoder/container finalization.
+        time.sleep(0.35)
+
     def on_probe(self, pad, info):
         if not self.enable_infer:
             return Gst.PadProbeReturn.OK
+        parent_name = ""
+        pad_name = ""
+        try:
+            parent = pad.get_parent_element()
+            if parent is not None:
+                parent_name = parent.get_name() or ""
+        except Exception:
+            parent_name = ""
+        try:
+            pad_name = pad.get_name() or ""
+        except Exception:
+            pad_name = ""
+        is_pretiler_probe = parent_name == "pgie" and pad_name == "src"
+        if self._csv_probe_pre_tiler and not is_pretiler_probe:
+            return Gst.PadProbeReturn.OK
+        write_csv = is_pretiler_probe or (not self._csv_probe_pre_tiler)
+        draw_pose = is_pretiler_probe or (not self._csv_probe_pre_tiler)
+        consume_pose = is_pretiler_probe or (not self._csv_probe_pre_tiler)
         buf = info.get_buffer()
         if not buf:
             return Gst.PadProbeReturn.OK
@@ -783,30 +1243,32 @@ class App:
                 except StopIteration:
                     break
 
-                frame_num = int(getattr(fmeta, "frame_num", -1))
-                pts_value = getattr(fmeta, "buf_pts", 0)
-                ts_us = int(pts_value / 1_000) if pts_value else -1
-                stream_id = int(getattr(fmeta, "pad_index", 0))
+                source_id = int(getattr(fmeta, "source_id", -1))
+                pad_index = int(getattr(fmeta, "pad_index", -1))
+                stream_id = source_id if source_id >= 0 else (pad_index if pad_index >= 0 else 0)
+                source = f"cam{stream_id}"
 
-                pose_detections = self._decode_pose_tensor(fmeta) if self.pose_mode else None
-                # If pose count was unknown at init, rebuild CSV header before first row
-                if (
-                    self.pose_mode
-                    and self.csv
-                    and getattr(self.csv, "_row_count", 0) == 0
-                    and (not self.csv.pose_enabled or self.csv.kpt_count != self.pose_kpt_count or self.csv.kp_names != self.kp_names)
-                ):
-                    try:
-                        self.csv.close()
-                    except Exception:
-                        pass
-                    self.csv = CSVWriter(
-                        self.run_dir,
-                        pose=self.pose_mode,
-                        kpt_count=self.pose_kpt_count,
-                        kpt_dims=self.pose_kpt_dims,
-                        kp_names=self.kp_names if self.pose_mode else None,
-                    )
+                frame_num_raw = int(getattr(fmeta, "frame_num", -1))
+                last_frame_num = self._stream_frame_seq.get(stream_id, -1)
+                if frame_num_raw >= 0 and frame_num_raw > last_frame_num:
+                    frame_num = frame_num_raw
+                elif last_frame_num >= 0:
+                    frame_num = last_frame_num + 1
+                else:
+                    frame_num = frame_num_raw if frame_num_raw >= 0 else 0
+                self._stream_frame_seq[stream_id] = frame_num
+
+                pts_value = int(getattr(fmeta, "buf_pts", 0) or 0)
+                if pts_value > 0:
+                    ts_us = int(pts_value / 1_000)
+                else:
+                    ntp_value = int(getattr(fmeta, "ntp_timestamp", 0) or 0)
+                    if ntp_value > 0:
+                        ts_us = int(ntp_value / 1_000)
+                    else:
+                        ts_us = int(time.time() * 1_000_000)
+
+                pose_detections = self._decode_pose_tensor(fmeta, consume=consume_pose) if self.pose_mode else None
                 used_pose: set[int] = set()
                 frame_pose_draw: list[dict] = []
 
@@ -829,6 +1291,7 @@ class App:
                             frame_num,
                             ts_us,
                             stream_id,
+                            source,
                             obj_id,
                             class_id,
                             label,
@@ -841,27 +1304,53 @@ class App:
                         if self.pose_mode:
                             bbox = (x, y, x + w, y + h)
                             pose_entry = self._match_pose_to_bbox(bbox, conf, pose_detections or [], used_pose)
-                            expected = self.pose_kpt_count * self.pose_kpt_dims
+                            pose_schema = ""
+                            pose_names_json = ""
+                            pose_values_json = ""
+                            pose_count = 0
                             if pose_entry:
                                 pose_vals = pose_entry.get("kpts", [])
                             else:
                                 pose_vals = None
-                            if pose_vals and len(pose_vals) >= expected:
-                                for idx in range(self.pose_kpt_count):
-                                    base = idx * self.pose_kpt_dims
-                                    row_values.append(f"{pose_vals[base + 0]:.3f}")
-                                    row_values.append(f"{pose_vals[base + 1]:.3f}")
-                                    row_values.append(f"{pose_vals[base + 2]:.3f}")
+                            if pose_vals:
+                                schema = self._pose_schema_for_detection(class_id, label)
+                                if schema:
+                                    pose_offset = int(schema.offset)
+                                    names = list(schema.names)
+                                else:
+                                    pose_offset = 0
+                                    names = (
+                                        list(self.kp_names[: self.pose_kpt_count])
+                                        if self.kp_names and len(self.kp_names) >= self.pose_kpt_count
+                                        else [f"kp{idx}" for idx in range(self.pose_kpt_count)]
+                                    )
+                                pose_count = len(names)
+                                expected = (pose_offset + pose_count) * self.pose_kpt_dims
+                            else:
+                                pose_count = 0
+                                expected = 0
+                            if pose_vals and pose_count > 0 and len(pose_vals) >= expected:
+                                pose_schema = f"{(label or f'class_{class_id}').strip() or f'class_{class_id}'}_v1"
+                                pose_triplets: list[list[float]] = []
+                                for idx in range(pose_count):
+                                    base = (pose_offset + idx) * self.pose_kpt_dims
+                                    pose_triplets.append(
+                                        [
+                                            round(float(pose_vals[base + 0]), 3),
+                                            round(float(pose_vals[base + 1]), 3),
+                                            round(float(pose_vals[base + 2]), 3),
+                                        ]
+                                    )
+                                pose_names_json = json.dumps(names, separators=(",", ":"))
+                                pose_values_json = json.dumps(pose_triplets, separators=(",", ":"))
                                 frame_pose_draw.append({
                                     "rect": (x, y, w, h),
                                     "pose_bbox": pose_entry.get("bbox", bbox) if pose_entry else bbox,
                                     "kpts": pose_vals,
                                 })
-                            else:
-                                for _ in range(self.pose_kpt_count):
-                                    row_values.extend(["", "", ""])
+                            row_values.extend([pose_schema, pose_count, pose_names_json, pose_values_json])
 
-                        if self.csv:
+                        if write_csv and self.csv:
                             self.csv.row(row_values)
                         obj_count += 1
                     except Exception as exc:
@@ -877,7 +1366,7 @@ class App:
                 except StopIteration:
                     break
 
-                if self.pose_mode and frame_pose_draw:
+                if draw_pose and self.pose_mode and frame_pose_draw:
                     display_meta = None
                     try:
                         display_meta = pyds.nvds_acquire_display_meta_from_pool(batch)
@@ -982,6 +1471,8 @@ class App:
             print(f"[{ts()}] [FATAL] cannot set pipeline to PLAYING")
             self.stop()
             return
+        if self.capture_backend == "zed" and self._zed_svo_file is not None:
+            GLib.timeout_add(250, self._enable_zed_svo_runtime)
         print(f"[{ts()}] [INFO] streaming (Ctrl-C to stop)…")
         try:
             self.loop.run()
@@ -995,6 +1486,9 @@ class App:
         self._stopping = True
         print(f"[{ts()}] [INFO] stopping pipeline…")
         try:
+            if self.capture_backend == "zed":
+                # Fallback disable for stop paths that do not go through EOS (e.g., error path).
+                self._disable_zed_svo_recording(context="stop")
             self.pipeline.set_state(Gst.State.NULL)
         except Exception:
             pass
@@ -1014,6 +1508,18 @@ class App:
             pass
         print(f"[{ts()}] [INFO] done. Files in: {self.run_dir}")
         print(f"[{ts()}] [INFO]   raw:        {self.artifacts.raw_video}")
+        for path in self._extra_raw_videos:
+            print(f"[{ts()}] [INFO]   raw extra:  {path}")
+        if self._depth_video is not None:
+            print(f"[{ts()}] [INFO]   depth:      {self._depth_video}")
+        if self._zed_svo_file is not None:
+            print(f"[{ts()}] [INFO]   svo:        {self._zed_svo_file}")
+            if self._zed_svo_file.exists():
+                try:
+                    print(f"[{ts()}] [INFO]   svo size:   {self._zed_svo_file.stat().st_size} bytes")
+                except Exception:
+                    pass
+            print(f"[{ts()}] [INFO]   svo active: {self._zed_svo_enabled_runtime}")
         if self.enable_infer:
             print(f"[{ts()}] [INFO]   detections: {self.artifacts.detections_csv}")
         print(f"[{ts()}] [INFO]   (marker):   {run_context.RUN_MARKER}")

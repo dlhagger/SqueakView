@@ -23,6 +23,7 @@ def _now() -> str:
 @dataclass(slots=True)
 class RunState:
     capture: Optional[process.ProcessHandle] = None
+    capture_2: Optional[process.ProcessHandle] = None
     inference: Optional[process.ProcessHandle] = None
     serial: Optional[serial_util.SerialHandle] = None
     run_dir: Optional[Path] = None
@@ -30,6 +31,7 @@ class RunState:
     def any_running(self) -> bool:
         return bool(
             (self.capture and self.capture.is_running())
+            or (self.capture_2 and self.capture_2.is_running())
             or (self.inference and self.inference.is_running())
         )
 
@@ -130,6 +132,8 @@ class OperatorBackend:
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "run_directory": str(run_dir),
             "capture": {
+                "backend": str(getattr(cfg, "capture_backend", "flir")),
+                "num_cameras": int(getattr(cfg, "num_cameras", 1)),
                 "width": cfg.width,
                 "height": cfg.height,
                 "fps": cfg.fps,
@@ -137,11 +141,22 @@ class OperatorBackend:
                 "trigger_on": cfg.trigger_on,
                 "trigger_activation": cfg.trigger_activation,
                 "arduino_fps": cfg.arduino_fps,
+                "zed_depth_enabled": bool(getattr(cfg, "zed_depth_enabled", False)),
+                "zed_depth_mode": str(getattr(cfg, "zed_depth_mode", "NEURAL")),
+                "zed_depth_socket": str(getattr(cfg, "zed_depth_socket", "/tmp/cam_depth.sock")),
+                "zed_depth_record": bool(getattr(cfg, "zed_depth_record", False)),
+                "zed_confidence_threshold": int(getattr(cfg, "zed_confidence_threshold", 100) or 100),
+                "zed_texture_confidence_threshold": int(getattr(cfg, "zed_texture_confidence_threshold", 100) or 100),
+                "zed_depth_minimum_distance_mm": int(getattr(cfg, "zed_depth_minimum_distance_mm", 300) or 300),
+                "zed_depth_maximum_distance_mm": int(getattr(cfg, "zed_depth_maximum_distance_mm", 20000) or 20000),
+                "zed_fill_mode": bool(getattr(cfg, "zed_fill_mode", False)),
+                "zed_depth_stabilization": int(getattr(cfg, "zed_depth_stabilization", 30) or 30),
             },
             "inference": {
                 "enabled": cfg.inference_enabled,
                 "socket_path": cfg.socket_path,
-                "deepstream_config": str(cfg.ds_cfg),
+                "socket_path_2": cfg.socket_path_2 if int(getattr(cfg, "num_cameras", 1)) > 1 else None,
+                "deepstream_config": (str(cfg.ds_cfg) if cfg.ds_cfg else None),
                 "bitrate_kbps": cfg.bitrate,
                 "preview_window_id": cfg.preview_window_id,
             },
@@ -201,6 +216,12 @@ class OperatorBackend:
         cfg.capture_ready_path = run_dir / "capture_ready.txt"
         cfg.capture_stats_path = run_dir / "capture_stats.csv"
         cfg.capture_frame_log_path = run_dir / "capture_frames.csv"
+        cfg.capture_depth_ready_path = run_dir / "capture_depth_ready.txt"
+        cfg.capture_depth_stats_path = run_dir / "capture_depth_stats.csv"
+        cfg.capture_depth_frame_log_path = run_dir / "capture_depth_frames.csv"
+        capture_ready_path_2 = run_dir / "capture_ready_cam1.txt"
+        capture_stats_path_2 = run_dir / "capture_stats_cam1.csv"
+        capture_frame_log_path_2 = run_dir / "capture_frames_cam1.csv"
         self.state.run_dir = run_dir
 
         if serial_handle:
@@ -209,15 +230,70 @@ class OperatorBackend:
 
         self._ensure_metadata(run_dir)
 
-        self.state.capture = process.spawn_capture(cfg, self._capture_emit)
-        self._log("[CAP] capture launched")
+        num_cameras = max(1, int(getattr(cfg, "num_cameras", 1)))
+        capture_backend = str(getattr(cfg, "capture_backend", "flir") or "flir").lower().strip()
+
+        if capture_backend != "zed":
+            self.state.capture = process.spawn_capture_for_camera(
+                cfg,
+                self._capture_emit,
+                camera_index=0,
+                socket_path=cfg.socket_path,
+                socket_path_2=cfg.socket_path_2,
+                ready_path=cfg.capture_ready_path,
+                ready_path_2=capture_ready_path_2 if num_cameras > 1 else None,
+                stats_path=cfg.capture_stats_path,
+                stats_path_2=capture_stats_path_2 if num_cameras > 1 else None,
+                frame_log_path=cfg.capture_frame_log_path,
+                frame_log_path_2=capture_frame_log_path_2 if num_cameras > 1 else None,
+                trigger_on=None,
+            )
+            self._log("[CAP] capture launched")
+
+            if num_cameras > 1:
+                self.state.capture_2 = process.spawn_capture_for_camera(
+                    cfg,
+                    self._capture_emit,
+                    camera_index=1,
+                    socket_path=cfg.socket_path_2,
+                    ready_path=capture_ready_path_2,
+                    stats_path=capture_stats_path_2,
+                    frame_log_path=capture_frame_log_path_2,
+                    trigger_on=None,
+                )
+                self._log("[CAP] second capture launched")
+
+            ready = self._wait_for_capture_ready(cfg.capture_ready_path, timeout_s=8.0)
+            ready2 = True
+            if num_cameras > 1:
+                ready2 = self._wait_for_capture_ready(capture_ready_path_2, timeout_s=8.0)
+            ready = ready and ready2
+            if not ready:
+                self._log("[CAP] capture did not become ready in time; aborting run startup")
+                try:
+                    if self.state.capture and self.state.capture.is_running():
+                        self.state.capture.terminate_group_graceful(signal.SIGINT, 4.0, True)
+                        self.state.capture.wait(timeout=2)
+                    if self.state.capture_2 and self.state.capture_2.is_running():
+                        self.state.capture_2.terminate_group_graceful(signal.SIGINT, 4.0, True)
+                        self.state.capture_2.wait(timeout=2)
+                except Exception:
+                    pass
+                self.state.capture = None
+                self.state.capture_2 = None
+                if self.state.serial:
+                    try:
+                        self.state.serial.close()
+                    except Exception:
+                        pass
+                    self.state.serial = None
+                return False
+        else:
+            self._log("[CAP] ZED capture will be sourced directly inside DeepStream (zedsrc)")
 
         self.state.inference = process.spawn_inference(cfg, self._inference_emit)
         self._log("[DS] inference launched")
         if serial_handle and cfg.trigger_on:
-            ready = self._wait_for_capture_ready(cfg.capture_ready_path, timeout_s=6.0)
-            if not ready:
-                self._log("[SER] capture not ready; starting TTL anyway")
             try:
                 serial_handle.log_marker("START_SENT")
                 serial_handle.send_line(f"START,{int(cfg.arduino_fps)}")
@@ -246,10 +322,14 @@ class OperatorBackend:
         if self.state.capture and self.state.capture.is_running():
             self.state.capture.terminate_group_graceful(signal.SIGINT, 6.0, True)
             self.state.capture.wait(timeout=2)
+        if self.state.capture_2 and self.state.capture_2.is_running():
+            self.state.capture_2.terminate_group_graceful(signal.SIGINT, 6.0, True)
+            self.state.capture_2.wait(timeout=2)
         if self.state.serial:
             self.state.serial.close()
             self.state.serial = None
         self.state.capture = None
+        self.state.capture_2 = None
         self.state.inference = None
 
     def shutdown(self) -> None:

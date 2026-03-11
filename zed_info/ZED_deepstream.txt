@@ -1,0 +1,98 @@
+Accessing Raw NV12 Buffers
+This guide explains how to access raw NV12 image buffers directly from the ZED SDK using the RawBuffer API. This is an advanced, zero-copy interface designed for performance-critical applications.
+
+Warning: This is an advanced low-level API. Improper use can crash the Argus stack responsible for camera operations or destabilize the system. Use this API only if you understand NVIDIA® multimedia buffer handling.
+
+Note: This API is only available starting from ZED SDK version 5.2. It is supported on NVIDIA® Jetson™ platforms with GMSL2 cameras. It is not available on x86 platforms, with USB cameras, or using SVO and Network streaming as input sources.
+
+Overview #
+The RawBuffer API provides direct access to native NvBufSurface buffers from the ZED X One camera capture pipeline. Instead of copying image data, this API gives you a pointer to the underlying buffer, enabling zero-copy integration with NVIDIA multimedia frameworks.
+
+Use Cases #
+This API is particularly useful for:
+
+GStreamer pipelines – Feed camera frames directly into GStreamer without memory copies
+NVIDIA DeepStream – Low-latency inference pipelines for real-time object detection
+Custom CUDA processing – Direct GPU access to camera buffers
+Hardware video encoding – Direct integration with NVENC
+Enabling the API #
+The RawBuffer API is disabled by default. To enable it, define SL_ENABLE_ADVANCED_CAPTURE_API before including the ZED SDK header:
+
+#define SL_ENABLE_ADVANCED_CAPTURE_API
+#include <sl/CameraOne.hpp>
+Code Example #
+#define SL_ENABLE_ADVANCED_CAPTURE_API
+#include <sl/CameraOne.hpp>
+#include <nvbufsurface.h>  // NVIDIA buffer surface API
+
+using namespace sl;
+
+int main() {
+    CameraOne zed;
+    InitParametersOne init_params;
+    init_params.camera_resolution = RESOLUTION::HD1080;
+    init_params.camera_fps = 30;
+
+    if (zed.open(init_params) != ERROR_CODE::SUCCESS) {
+        return -1;
+    }
+
+    while (true) {
+        if (zed.grab() == ERROR_CODE::SUCCESS) {
+            RawBuffer raw;
+            if (zed.retrieveImage(raw) == ERROR_CODE::SUCCESS) {
+                if (raw.isValid()) {
+                    // Get NvBufSurface pointers (zero-copy)
+                    void* nvbuf = raw.getRawBuffer();
+
+                    // Cast to NvBufSurface* for use with NVIDIA APIs
+                    NvBufSurface* surf = static_cast<NvBufSurface*>(nvbuf);
+
+                    // Access buffer properties
+                    uint64_t timestamp = raw.getTimestamp();
+                    unsigned int width = raw.getWidth();
+                    unsigned int height = raw.getHeight();
+
+                    // Process the NV12 buffer with your pipeline...
+                    // Example: feed to GStreamer, DeepStream, or custom CUDA kernel
+
+                    // Buffer is automatically released when 'raw' goes out of scope
+                }
+            }
+        }
+    }
+
+    zed.close();
+    return 0;
+}
+Integration with DeepStream #
+For NVIDIA® DeepStream integration, you can pass the NvBufSurface object directly to your inference pipeline:
+
+#define SL_ENABLE_ADVANCED_CAPTURE_API
+#include <sl/Camera.hpp>
+#include <nvbufsurface.h>
+#include <nvds_meta.h>
+
+// In your DeepStream pipeline loop:
+RawBuffer raw;
+if (zed.retrieveImage(raw) == ERROR_CODE::SUCCESS && raw.isValid()) {
+    NvBufSurface* surface = static_cast<NvBufSurface*>(raw.getRawBuffer());
+    
+    // Feed surface to DeepStream batch
+    // surface->surfaceList[0] contains the NV12 frame data
+    
+    // Process with nvinfer, nvtracker, etc.
+}
+Important Warnings #
+⚠️ DO NOT manually destroy the NvBufSurface (e.g., do not call NvBufSurfaceDestroy, NvBufSurfaceUnMap, etc.). The buffers are owned and managed by the SDK. Manual destruction will cause crashes or undefined behavior.
+
+The SDK manages the buffer memory – you only have read access
+Hold the RawBuffer for as short a time as possible to avoid blocking the capture pipeline
+Currently, only RAW_BUFFER_TYPE::NVBUFSURFACE (NVIDIA® Argus native buffers) is supported
+This API is available only on NVIDIA Jetson platforms with GMSL2 cameras
+Buffer Format #
+The raw buffers contain NV12 formatted image data:
+
+Y plane: Full-resolution luminance data
+UV plane: Half-resolution (2x2 subsampled) chrominance data
+This is the native capture format from the ZED X One sensor, providing maximum performance for pipelines that work with NV12 directly.
