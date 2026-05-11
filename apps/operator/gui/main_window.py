@@ -12,8 +12,10 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from squeakview.apps.operator.backend import process
 from squeakview.apps.operator.backend.manager import OperatorBackend
-from squeakview.apps.operator.gui.config_dialog import ConfigDialog
+from squeakview.apps.operator.gui.config_dialog import ConfigDialog, SessionLauncherDialog
 from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile
+from squeakview import config as squeakview_config
 
 
 class PreviewWidget(QtWidgets.QWidget):
@@ -346,6 +348,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._upload_thread: threading.Thread | None = None
         self._upload_in_progress = False
         self._depth_preview_enabled = False
+        self._profile_store = ProfileStore()
+        self._experiments: list[ExperimentProfile] = []
+        self._subjects: list[SubjectProfile] = []
+        self._profile_selection_updating = False
         self.stop_done.connect(self._on_stop_complete)
         self.stop_failed.connect(self._on_stop_failed)
 
@@ -354,8 +360,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._apply_brand_theme()
         QtCore.QTimer.singleShot(0, self._capture_preview_window_id)
-
-        if not self._show_config_dialog(initial=True):
+        self._config_data = self._default_config_data()
+        if not self._show_launch_dialog():
             QtCore.QTimer.singleShot(0, self.close)
         else:
             self.statusBar().showMessage("Ready to record.")
@@ -391,6 +397,34 @@ class MainWindow(QtWidgets.QMainWindow):
         meters_layout = QtWidgets.QVBoxLayout(meters_group)
         meters_layout.setContentsMargins(12, 12, 12, 12)
         meters_layout.addWidget(meters_only)
+
+        profile_group = QtWidgets.QGroupBox("Profiles", self)
+        self._profile_group = profile_group
+        profile_form = QtWidgets.QFormLayout(profile_group)
+        profile_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        profile_form.setHorizontalSpacing(10)
+        profile_form.setVerticalSpacing(8)
+
+        exp_row = QtWidgets.QHBoxLayout()
+        self.experiment_combo = QtWidgets.QComboBox(self)
+        self.experiment_combo.currentIndexChanged.connect(self._on_experiment_selected)
+        exp_row.addWidget(self.experiment_combo, 1)
+        self.new_experiment_btn = QtWidgets.QPushButton("New…", self)
+        self.new_experiment_btn.clicked.connect(self._on_new_experiment)
+        exp_row.addWidget(self.new_experiment_btn, 0)
+        profile_form.addRow("Experiment:", exp_row)
+
+        subj_row = QtWidgets.QHBoxLayout()
+        self.subject_combo = QtWidgets.QComboBox(self)
+        self.subject_combo.currentIndexChanged.connect(self._on_subject_selected)
+        subj_row.addWidget(self.subject_combo, 1)
+        self.new_subject_btn = QtWidgets.QPushButton("New…", self)
+        self.new_subject_btn.clicked.connect(self._on_new_subject)
+        subj_row.addWidget(self.new_subject_btn, 0)
+        profile_form.addRow("Subject:", subj_row)
+        meters_layout.addSpacing(6)
+        meters_layout.addWidget(profile_group)
+        profile_group.hide()
 
         self.summary_label = QtWidgets.QLabel("No configuration loaded.")
         self.summary_label.setObjectName("summaryBanner")
@@ -576,14 +610,196 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         """)
 
+    def _default_config_data(self) -> dict:
+        defaults = process.LaunchConfig()
+        default_task = squeakview_config.TASKS_DIR / "default.yaml"
+        task_cfg = default_task if default_task.exists() else squeakview_config.TASKS_DIR / "gonogo_auto.yaml"
+        ds_cfg = defaults.ds_cfg if defaults.ds_cfg else None
+        return {
+            "width": int(defaults.width or 1440),
+            "height": int(defaults.height or 1080),
+            "fps": int(defaults.fps or 30),
+            "pixel_format": defaults.pixel_format or "Mono8",
+            "capture_backend": defaults.capture_backend,
+            "zed_depth_enabled": defaults.zed_depth_enabled,
+            "zed_depth_mode": defaults.zed_depth_mode,
+            "zed_depth_socket": defaults.zed_depth_socket,
+            "zed_depth_record": defaults.zed_depth_record,
+            "zed_confidence_threshold": defaults.zed_confidence_threshold,
+            "zed_texture_confidence_threshold": defaults.zed_texture_confidence_threshold,
+            "zed_depth_minimum_distance_mm": defaults.zed_depth_minimum_distance_mm,
+            "zed_depth_maximum_distance_mm": defaults.zed_depth_maximum_distance_mm,
+            "zed_fill_mode": defaults.zed_fill_mode,
+            "zed_depth_stabilization": defaults.zed_depth_stabilization,
+            "trigger_on": defaults.trigger_on,
+            "exposure_us": int(defaults.exposure_us or 10000),
+            "arduino_fps": defaults.arduino_fps,
+            "serial_enabled": defaults.serial_enabled,
+            "serial_port": defaults.serial_port,
+            "serial_baud": defaults.serial_baud,
+            "ds_cfg": str(ds_cfg) if ds_cfg else "",
+            "inference_enabled": defaults.inference_enabled,
+            "draw_skeleton": defaults.draw_skeleton,
+            "task_cfg": str(task_cfg),
+            "socket_path": defaults.socket_path,
+            "socket_path_2": defaults.socket_path_2,
+            "num_cameras": max(1, defaults.num_cameras),
+            "bitrate": defaults.bitrate,
+            "mouse_id": "",
+            "experiment_name": "",
+            "experiment_mode": "sandbox",
+        }
+
+    def _reload_profiles(self) -> None:
+        self._experiments = self._profile_store.list_experiments()
+        self._subjects = self._profile_store.list_subjects()
+        self._refresh_profile_selectors()
+
+    def _refresh_profile_selectors(self) -> None:
+        selected_exp = self.current_experiment_slug()
+        selected_subject = self.current_subject_id()
+        self._profile_selection_updating = True
+        try:
+            self.experiment_combo.clear()
+            self.experiment_combo.addItem("No experiment", "")
+            for profile in self._experiments:
+                self.experiment_combo.addItem(profile.name, profile.slug)
+            exp_index = max(0, self.experiment_combo.findData(selected_exp))
+            self.experiment_combo.setCurrentIndex(exp_index)
+
+            self.subject_combo.clear()
+            self.subject_combo.addItem("No subject", "")
+            for profile in self._subjects:
+                self.subject_combo.addItem(profile.name, profile.subject_id)
+            subj_index = max(0, self.subject_combo.findData(selected_subject))
+            self.subject_combo.setCurrentIndex(subj_index)
+        finally:
+            self._profile_selection_updating = False
+
+    def _apply_profile_defaults(self) -> None:
+        if self._subjects and not self.current_subject_id():
+            first_subject = self._subjects[0]
+            idx = self.subject_combo.findData(first_subject.subject_id)
+            if idx >= 0:
+                self.subject_combo.setCurrentIndex(idx)
+        if self._experiments and not self.current_experiment_slug():
+            first_experiment = self._experiments[0]
+            idx = self.experiment_combo.findData(first_experiment.slug)
+            if idx >= 0:
+                self.experiment_combo.setCurrentIndex(idx)
+        self._apply_profile_selection()
+
+    def current_experiment_slug(self) -> str:
+        return str(self.experiment_combo.currentData() or "")
+
+    def current_subject_id(self) -> str:
+        return str(self.subject_combo.currentData() or "")
+
+    def _find_experiment(self, slug: str) -> ExperimentProfile | None:
+        for profile in self._experiments:
+            if profile.slug == slug:
+                return profile
+        return None
+
+    def _find_subject(self, subject_id: str) -> SubjectProfile | None:
+        for profile in self._subjects:
+            if profile.subject_id == subject_id:
+                return profile
+        return None
+
+    def _apply_profile_selection(self) -> None:
+        data = dict(self._config_data or self._default_config_data())
+        experiment = self._find_experiment(self.current_experiment_slug())
+        subject = self._find_subject(self.current_subject_id())
+        if experiment:
+            data["experiment_name"] = experiment.slug
+            data.update(dict(experiment.config or {}))
+        else:
+            data["experiment_name"] = ""
+        if subject:
+            data["mouse_id"] = subject.subject_id
+        else:
+            data["mouse_id"] = ""
+        self._config_data = data
+        self._apply_config(data)
+
+    @QtCore.Slot()
+    def _on_experiment_selected(self) -> None:
+        if self._profile_selection_updating:
+            return
+        self._apply_profile_selection()
+
+    @QtCore.Slot()
+    def _on_subject_selected(self) -> None:
+        if self._profile_selection_updating:
+            return
+        subject = self._find_subject(self.current_subject_id())
+        if subject and subject.default_experiment:
+            idx = self.experiment_combo.findData(subject.default_experiment)
+            if idx >= 0 and idx != self.experiment_combo.currentIndex():
+                self._profile_selection_updating = True
+                try:
+                    self.experiment_combo.setCurrentIndex(idx)
+                finally:
+                    self._profile_selection_updating = False
+        self._apply_profile_selection()
+
+    @QtCore.Slot()
+    def _on_new_experiment(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "New Experiment", "Experiment name:")
+        if not ok or not name.strip():
+            return
+        data = self._config_data or self._default_config_data()
+        profile = ExperimentProfile(
+            name=name.strip(),
+            slug=name.strip(),
+            config={key: (str(value) if isinstance(value, Path) else value) for key, value in data.items()},
+        )
+        path = self._profile_store.save_experiment(profile)
+        self._emit_log(f"[GUI] experiment profile saved → {path}")
+        self._reload_profiles()
+        idx = self.experiment_combo.findData(path.stem)
+        if idx >= 0:
+            self.experiment_combo.setCurrentIndex(idx)
+
+    @QtCore.Slot()
+    def _on_new_subject(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "New Subject", "Subject / Mouse ID:")
+        if not ok or not name.strip():
+            return
+        profile = SubjectProfile(
+            name=name.strip(),
+            subject_id=name.strip(),
+            default_experiment=(self.current_experiment_slug() or None),
+        )
+        path = self._profile_store.save_subject(profile)
+        self._emit_log(f"[GUI] subject profile saved → {path}")
+        self._reload_profiles()
+        idx = self.subject_combo.findData(profile.subject_id)
+        if idx >= 0:
+            self.subject_combo.setCurrentIndex(idx)
+
     # ---- Configuration --------------------------------------------------
-    def _show_config_dialog(self, *, initial: bool = False) -> bool:
-        dialog = ConfigDialog(self, config=self._config_data)
+    def _show_launch_dialog(self) -> bool:
+        dialog = SessionLauncherDialog(self, base_config=self._config_data)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return False
         result = dialog.result_config
         if not result:
             return False
+        self._config_data = result
+        self._apply_config(result)
+        return True
+
+    def _show_config_dialog(self, *, initial: bool = False) -> bool:
+        dialog = ConfigDialog(self, config=self._config_data, show_session_setup=False)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return False
+        result = dialog.result_config
+        if not result:
+            return False
+        if self._config_data and "experiment_name" not in result:
+            result["experiment_name"] = self._config_data.get("experiment_name", "")
         self._config_data = result
         self._apply_config(result)
         return True
@@ -598,6 +814,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Config: {Path(data['ds_cfg']).name if data.get('ds_cfg') else 'N/A (inference off)'}",
             f"Task: {Path(data['task_cfg']).name}",
         ]
+        if data.get("experiment_name"):
+            summary_parts.append(f"Experiment: {data['experiment_name']}")
         if data.get("mouse_id"):
             summary_parts.append(f"Mouse: {data['mouse_id']}")
         inference_on = data.get("inference_enabled", True)
@@ -652,6 +870,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.serial_baud = data["serial_baud"]
         cfg.arduino_fps = data["arduino_fps"]
         cfg.mouse_id = data.get("mouse_id", "")
+        cfg.experiment_name = data.get("experiment_name", "")
         cfg.task_cfg = Path(data["task_cfg"])
         self._depth_preview_enabled = bool(
             str(data.get("capture_backend", "flir")).lower() == "zed" and data.get("zed_depth_enabled", False)
@@ -695,6 +914,7 @@ class MainWindow(QtWidgets.QMainWindow):
             serial_baud=data["serial_baud"],
             arduino_fps=data["arduino_fps"],
             mouse_id=data.get("mouse_id", ""),
+            experiment_name=data.get("experiment_name", ""),
             draw_skeleton=data.get("draw_skeleton", False),
             task_cfg=Path(data["task_cfg"]),
         )
@@ -837,6 +1057,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.backend.start_run(config):
             self._emit_log("[GUI] Failed to start run")
             return
+        self.dashboard.clear_jam_alert()
         self.preview.show_hint(False)
         self.preview.set_status("Live", color="#5c6df5")
         self.preview.set_preview_enabled(True)

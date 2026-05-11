@@ -13,6 +13,7 @@ dependencies = [
   "psutil==7.1.0",
   "spinnaker-python",
   "pyds",
+  "ipywidgets>=8.1.8",
 ]
 
 [project.optional-dependencies]

@@ -38,12 +38,19 @@ WORKSPACE = _resolve_workspace()
 DEEPSTREAM_ROOT = _resolve_deepstream(WORKSPACE)
 RUNS_DIR = _resolve_path("SQUEAKVIEW_RUNS_DIR", "PRODUCT_RUNS_DIR", WORKSPACE / "runs")
 TASKS_DIR = WORKSPACE / "tasks"
+PROFILES_DIR = WORKSPACE / "profiles"
 
 
 def ensure_runs_dir() -> Path:
     """Create the runs directory if it doesn't exist."""
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     return RUNS_DIR
+
+
+def ensure_profiles_dir() -> Path:
+    """Create the profiles directory if it doesn't exist."""
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    return PROFILES_DIR
 
 
 def workspace_path(*parts: str) -> Path:

@@ -44,6 +44,7 @@ class OperatorBackend:
         self.launch_cfg = process.LaunchConfig()
         self._metadata_written = False
         self._run_dir_watch_thread: threading.Thread | None = None
+        self._inference_ready = threading.Event()
 
     def _log(self, message: str) -> None:
         self.emit(f"[{_now()}] {message}")
@@ -60,6 +61,8 @@ class OperatorBackend:
     def _inference_emit(self, message: str) -> None:
         self.emit(message)
         lower = message.lower()
+        if "[ready] inference playing" in lower:
+            self._inference_ready.set()
         if "run dir:" in lower:
             path = lower.split("run dir:", 1)[1].strip()
             if os.path.isdir(path):
@@ -190,6 +193,7 @@ class OperatorBackend:
         self.launch_cfg = cfg
         self.state.run_dir = None
         self._metadata_written = False
+        self._inference_ready.clear()
 
         self._set_fan_max()
 
@@ -206,12 +210,17 @@ class OperatorBackend:
                 serial_handle = handle
 
         mouse_id = (cfg.mouse_id or "").strip()
+        experiment_name = (cfg.experiment_name or "").strip()
+        run_parent = None
+        if experiment_name:
+            safe_experiment = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in experiment_name)
+            run_parent = run_context.RUNS_DIR / safe_experiment
         if mouse_id:
             safe_id = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in mouse_id)
             prefix = safe_id
-            run_dir = run_context.timestamped_run_dir(prefix, random_suffix=False)
+            run_dir = run_context.timestamped_run_dir(prefix, random_suffix=False, parent=run_parent)
         else:
-            run_dir = run_context.timestamped_run_dir("ds")
+            run_dir = run_context.timestamped_run_dir("ds", parent=run_parent)
         cfg.run_dir = run_dir
         cfg.capture_ready_path = run_dir / "capture_ready.txt"
         cfg.capture_stats_path = run_dir / "capture_stats.csv"
@@ -295,6 +304,12 @@ class OperatorBackend:
         self._log("[DS] inference launched")
         if serial_handle and cfg.trigger_on:
             try:
+                self._log("[BACKEND] waiting for inference ready before START")
+                ready = self._inference_ready.wait(timeout=8.0)
+                if ready:
+                    self._log("[BACKEND] inference ready; sending START")
+                else:
+                    self._log("[BACKEND] inference ready timeout; sending START anyway")
                 serial_handle.log_marker("START_SENT")
                 serial_handle.send_line(f"START,{int(cfg.arduino_fps)}")
                 serial_handle.wait_for_ttl(timeout_s=3.0)

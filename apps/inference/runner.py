@@ -98,6 +98,7 @@ class CSVWriter:
         self._row_count = 0
         headers = [
             "frame",
+            "raw_frame_num",
             "ts_us",
             "stream_id",
             "source",
@@ -304,6 +305,8 @@ class App:
         self._stream_history: deque[float] = deque()
         self._stream_fps: float = float("nan")
         self._stream_frame_seq: dict[int, int] = {}
+        self._raw_frame_offsets = self._load_raw_frame_offsets()
+        self._single_cam_aligned_raw = False
         self._csv_probe_pre_tiler: bool = False
         self._pose_cache_seq: int = 0
         self._pose_cache_last: list[dict] | None = None
@@ -333,9 +336,35 @@ class App:
         GLib.timeout_add_seconds(1, self._poll_skeleton_toggle)
         if self.pose_mode:
             self._init_pose_cache_helper()
+        print(f"[{ts()}] [INFO] raw frame offsets: {self._raw_frame_offsets}", flush=True)
         print(f"[{ts()}] [INFO] run dir:      {self.run_dir}", flush=True)
         print(f"[{ts()}] [INFO] run marker:   {run_context.RUN_MARKER}", flush=True)
         atexit.register(self._atexit_cleanup)
+
+    @staticmethod
+    def _load_raw_frame_offsets() -> list[int]:
+        """Return per-stream offsets mapping DeepStream frame numbers to raw video frames."""
+        raw = (os.environ.get("SQUEAKVIEW_RAW_FRAME_OFFSET") or "16").strip()
+        if not raw:
+            return [16]
+        parts = [part.strip() for part in raw.split(",")]
+        offsets: list[int] = []
+        for part in parts:
+            if not part:
+                continue
+            try:
+                offsets.append(int(part))
+            except ValueError:
+                print(f"[{ts()}] [WARN] invalid raw frame offset '{part}', using 16", flush=True)
+                offsets.append(16)
+        return offsets or [16]
+
+    def _raw_frame_num_for_stream(self, ds_frame_num: int, stream_id: int) -> int:
+        if self._single_cam_aligned_raw:
+            return int(ds_frame_num)
+        offsets = self._raw_frame_offsets
+        index = max(0, min(int(stream_id), len(offsets) - 1))
+        return int(ds_frame_num) + int(offsets[index])
 
     @staticmethod
     def _detect_pose_mode(config: InferenceConfig) -> tuple[bool, int, tuple[float, float]]:
@@ -525,13 +554,25 @@ class App:
     def _build_shm_source_launch(self, cfg: InferenceConfig, cam_count: int) -> str:
         source_blocks: list[str] = []
         self._extra_raw_videos = []
+        aligned_single_cam = bool(self.enable_infer and cam_count == 1)
         for idx, sock in enumerate(self.socks):
             tee_name = f"T{idx}"
             raw_out = self.artifacts.raw_video if idx == 0 else (self.run_dir / f"raw_cam{idx}.mp4")
             if idx > 0:
                 self._extra_raw_videos.append(raw_out)
-            source_blocks.append(
-                f"""
+            if aligned_single_cam and idx == 0:
+                source_blocks.append(
+                    f"""
+            shmsrc socket-path={sock} is-live=true do-timestamp=true !
+              video/x-raw,format=GRAY8,width={cfg.width},height={cfg.height},framerate={cfg.fps}/1 !
+              nvvideoconvert compute-hw=1 copy-hw=2 !
+              video/x-raw(memory:NVMM),format=NV12,width={cfg.width},height={cfg.height} !
+              queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! m.sink_{idx}
+                    """.rstrip()
+                )
+            else:
+                source_blocks.append(
+                    f"""
             shmsrc socket-path={sock} is-live=true do-timestamp=true !
               video/x-raw,format=GRAY8,width={cfg.width},height={cfg.height},framerate={cfg.fps}/1 !
               nvvideoconvert compute-hw=1 copy-hw=2 !
@@ -546,8 +587,8 @@ class App:
                    filesink location=\"{raw_out}\" sync=false
 
               {tee_name}. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! m.sink_{idx}
-                """.rstrip()
-            )
+                    """.rstrip()
+                )
         return "\n\n".join(source_blocks)
 
     def _build_zed_source_launch(self, cfg: InferenceConfig, cam_count: int) -> str:
@@ -707,6 +748,9 @@ class App:
                 f"Update {cfg.cfg_path} and rebuild/use a matching engine."
             )
         mux_timeout_us = max(10_000, int(1_000_000 / max(1, int(cfg.fps or 30))))
+        self._single_cam_aligned_raw = bool(self.enable_infer and cam_count == 1)
+        if self._single_cam_aligned_raw:
+            print(f"[{ts()}] [INFO] single-camera raw.mp4 aligned to detection branch", flush=True)
         tile_rows = 1 if cam_count <= 2 else int(math.ceil(math.sqrt(cam_count)))
         tile_cols = int(math.ceil(cam_count / max(1, tile_rows)))
         tiler_block = ""
@@ -717,7 +761,31 @@ class App:
             )
 
         if self.enable_infer:
-            if self.osd_cpu:
+            if self._single_cam_aligned_raw:
+                infer_block = f"""
+                  nvinfer name=pgie config-file-path=\"{cfg.cfg_path}\" batch-size={cam_count} !
+                  nvvideoconvert compute-hw=1 copy-hw=2 !
+                  video/x-raw(memory:NVMM),format=RGBA,width={cfg.width},height={cfg.height} !
+                  tee name=raw_align_tee
+                  raw_align_tee. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream !
+                    nvvideoconvert compute-hw=1 copy-hw=2 !
+                    video/x-raw,format=I420,width={cfg.width},height={cfg.height} !
+                    x264enc tune=zerolatency speed-preset=ultrafast bitrate={cfg.bitrate} key-int-max={cfg.fps} !
+                    h264parse ! mp4mux ! filesink location=\"{self.artifacts.raw_video}\" sync=false
+                  raw_align_tee. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream !
+                    tee name=vis_tee
+                  vis_tee. ! queue max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream ! vis_select.sink_0
+                  videotestsrc pattern=black is-live=true !
+                    video/x-raw,format=RGBA,width={cfg.width},height={cfg.height},framerate={cfg.fps}/1 !
+                    nvvideoconvert compute-hw=1 copy-hw=2 !
+                    video/x-raw(memory:NVMM),format=RGBA,width={cfg.width},height={cfg.height} !
+                    queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! vis_select.sink_1
+                  input-selector name=vis_select sync-streams=true !
+                  nvdsosd name=osd process-mode=0 display-bbox=1 display-text=1 !
+                  nvvideoconvert compute-hw=1 copy-hw=2 !
+                  video/x-raw(memory:NVMM),format=RGBA,width={cfg.width},height={cfg.height} !
+                """
+            elif self.osd_cpu:
                 infer_block = f"""
                   nvinfer name=pgie config-file-path=\"{cfg.cfg_path}\" batch-size={cam_count} !
                   {tiler_block}
@@ -1287,8 +1355,10 @@ class App:
                         label = ometa.obj_label if getattr(ometa, "obj_label", None) else ""
                         obj_id = _safe_object_id(ometa)
 
+                        raw_frame_num = self._raw_frame_num_for_stream(frame_num, stream_id)
                         row_values: list[object] = [
                             frame_num,
+                            raw_frame_num,
                             ts_us,
                             stream_id,
                             source,
@@ -1471,6 +1541,7 @@ class App:
             print(f"[{ts()}] [FATAL] cannot set pipeline to PLAYING")
             self.stop()
             return
+        print(f"[{ts()}] [READY] inference playing", flush=True)
         if self.capture_backend == "zed" and self._zed_svo_file is not None:
             GLib.timeout_add(250, self._enable_zed_svo_runtime)
         print(f"[{ts()}] [INFO] streaming (Ctrl-C to stop)…")

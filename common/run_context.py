@@ -26,12 +26,19 @@ def latest_run_dir() -> Path | None:
     return path if path.exists() else None
 
 
-def timestamped_run_dir(prefix: str | None = None, *, random_suffix: bool = True) -> Path:
+def timestamped_run_dir(
+    prefix: str | None = None,
+    *,
+    random_suffix: bool = True,
+    parent: Path | None = None,
+) -> Path:
     ts = time.strftime("%Y-%m-%d_%H-%M-%S")
     name = f"{prefix}_{ts}" if prefix else ts
     if random_suffix:
         name = f"{name}_{os.urandom(4).hex()}"
-    root = RUNS_DIR / name
+    base = Path(parent) if parent is not None else RUNS_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    root = base / name
     root.mkdir(parents=True, exist_ok=True)
     RUN_MARKER.write_text(str(root))
     return root

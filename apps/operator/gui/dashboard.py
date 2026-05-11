@@ -284,6 +284,9 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self._rules: list[dict] = []
         self._plots: list[dict] = []
         self._task_cfg_path: Path | None = None
+        self._jam_active = False
+        self._jam_reason = ""
+        self._jam_detected_at = ""
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -294,6 +297,8 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self.counts_label = QtWidgets.QLabel("Counts: --")
         self.counts_label.setStyleSheet("color: #cfd4ea; font-size: 12px; padding: 2px 4px;")
         layout.addWidget(self.counts_label)
+        self._jam_banner = self._build_jam_banner()
+        layout.addWidget(self._jam_banner)
         self._settings_widget = self._build_settings_panel()
 
         pg.setConfigOptions(antialias=False, useOpenGL=False)
@@ -328,6 +333,20 @@ class BehaviorDashboard(QtWidgets.QWidget):
         cfg = self._load_task_config(path)
         self._task_cfg_path = path
         self._build_from_task_config(cfg)
+
+    def clear_jam_alert(self) -> None:
+        self._jam_active = False
+        self._jam_reason = ""
+        self._jam_detected_at = ""
+        self._jam_banner.hide()
+
+    def _set_jam_alert(self, reason: str) -> None:
+        self._jam_active = True
+        self._jam_reason = reason or "Feeder Jammed"
+        self._jam_detected_at = time.strftime("%H:%M:%S")
+        self._jam_title.setText("FEEDER JAM DETECTED")
+        self._jam_detail.setText(f"{self._jam_detected_at} · {self._jam_reason}")
+        self._jam_banner.show()
 
     def _load_task_config(self, path: Path) -> dict:
         raw = path.read_text()
@@ -542,6 +561,9 @@ class BehaviorDashboard(QtWidgets.QWidget):
         if not data:
             return
         event = str(data.get("event_uc", ""))
+        reason_text = str(data.get("reason", "")).strip()
+        if event == "FEED_STOP" and "FEEDER JAM" in reason_text.upper():
+            self._set_jam_alert(reason_text)
         if event == "TASK_INFO":
             self._update_settings_from_task_info(data)
         elif event == "NOGO_STAGE_INFO":
@@ -749,6 +771,40 @@ class BehaviorDashboard(QtWidgets.QWidget):
             grid.addWidget(label, r, 0)
             grid.addWidget(value, r, 1)
             self._settings_labels[key] = value
+        return panel
+
+    def _build_jam_banner(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QFrame(self)
+        panel.setObjectName("jamBanner")
+        panel.setStyleSheet(
+            "#jamBanner { background-color: #3a1014; border: 1px solid #b33a44; border-radius: 6px; }"
+            "#jamBanner QLabel { background: transparent; }"
+            "#jamBanner QPushButton {"
+            " background-color: #c64b55; color: #ffffff; border: none; border-radius: 4px; padding: 5px 10px;"
+            " font-weight: 600; }"
+            "#jamBanner QPushButton:hover { background-color: #d85d67; }"
+        )
+        layout = QtWidgets.QHBoxLayout(panel)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(10)
+
+        text_wrap = QtWidgets.QVBoxLayout()
+        text_wrap.setContentsMargins(0, 0, 0, 0)
+        text_wrap.setSpacing(2)
+        self._jam_title = QtWidgets.QLabel("FEEDER JAM DETECTED")
+        self._jam_title.setStyleSheet("color: #ffd8dc; font-size: 12px; font-weight: 700;")
+        self._jam_detail = QtWidgets.QLabel("--")
+        self._jam_detail.setStyleSheet("color: #ffb6be; font-size: 11px;")
+        self._jam_detail.setWordWrap(True)
+        text_wrap.addWidget(self._jam_title)
+        text_wrap.addWidget(self._jam_detail)
+
+        clear_btn = QtWidgets.QPushButton("Clear")
+        clear_btn.clicked.connect(self.clear_jam_alert)
+
+        layout.addLayout(text_wrap, 1)
+        layout.addWidget(clear_btn, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        panel.hide()
         return panel
 
     def _update_settings_from_task_info(self, data: dict) -> None:

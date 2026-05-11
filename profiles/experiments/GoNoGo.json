@@ -1,0 +1,41 @@
+{
+  "config": {
+    "arduino_fps": 30,
+    "bitrate": 4000,
+    "capture_backend": "flir",
+    "draw_skeleton": false,
+    "ds_cfg": "/home/jetson/Desktop/SqueakView/DeepStream-Yolo/configs/yolo26s_dino_10kpts_fp16.txt",
+    "experiment_mode": "existing",
+    "experiment_name": "GoNoGo",
+    "exposure_us": 10000,
+    "fps": 30,
+    "height": 1080,
+    "inference_enabled": true,
+    "mouse_id": "",
+    "num_cameras": 1,
+    "pixel_format": "Mono8",
+    "serial_baud": 115200,
+    "serial_enabled": true,
+    "serial_port": "/dev/ttyACM0",
+    "socket_path": "/tmp/cam.sock",
+    "socket_path_2": "/tmp/cam1.sock",
+    "task_cfg": "/home/jetson/Desktop/SqueakView/tasks/gonogo_auto.yaml",
+    "trigger_on": true,
+    "width": 1440,
+    "zed_confidence_threshold": 100,
+    "zed_depth_enabled": false,
+    "zed_depth_maximum_distance_mm": 20000,
+    "zed_depth_minimum_distance_mm": 300,
+    "zed_depth_mode": "NEURAL",
+    "zed_depth_record": false,
+    "zed_depth_socket": "/tmp/cam_depth.sock",
+    "zed_depth_stabilization": 30,
+    "zed_fill_mode": false,
+    "zed_texture_confidence_threshold": 100
+  },
+  "name": "GoNoGo",
+  "slug": "GoNoGo",
+  "subject_ids": [
+    "test"
+  ]
+}

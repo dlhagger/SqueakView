@@ -126,7 +126,7 @@ Capture backends:
 - ZED basically works, but depends on substantial local system setup and plugin/toolchain state. Treat it as a configured-system feature, not a clean-room install path yet.
 
 ## Outputs and toggles
-- `runs/<timestamp>/raw.mp4` – encoded capture.
+- `runs/<timestamp>/raw.mp4` – encoded video. For single-camera runs with inference enabled, this is recorded on the detection-aligned branch so `detections.csv` frame numbers match the saved video.
 - `runs/<timestamp>/detections.csv` – bbox/pose metadata.
 - `runs/<timestamp>/perf_stats.csv` – FPS/latency.
 - `runs/<timestamp>/serial.csv` – raw behavior / Arduino event stream.

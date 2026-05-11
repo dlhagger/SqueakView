@@ -13,8 +13,8 @@ batch-size=1
 output-tensor-meta=1
 
 num-detected-classes=2
-labelfile-path=/home/jetson/Desktop/SqueakView/DeepStream-Yolo/artifacts/labels/classes.txt
-pose-kpt-labels-path=/home/jetson/Desktop/SqueakView/DeepStream-Yolo/artifacts/labels/labels.txt
+labelfile-path=/home/jetson/Desktop/SqueakView/DeepStream-Yolo/artifacts/labels/mouse_class.txt
+pose-kpt-labels-path=/home/jetson/Desktop/SqueakView/DeepStream-Yolo/artifacts/labels/mouse_labels.txt
 parse-bbox-func-name=NvDsInferParseYolo26Pose
 custom-lib-path=/home/jetson/Desktop/SqueakView/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 engine-create-func-name=NvDsInferYoloCudaEngineGet
