@@ -1,29 +1,54 @@
 [project]
 name = "squeakview"
 version = "0.1.0"
-description = "Jetson capture + DeepStream inference + operator GUI stack."
+description = "Direct FLIR Spinnaker/GStreamer source into NVIDIA DeepStream for SqueakView."
 readme = "README.md"
 requires-python = ">=3.10,<3.11"
 dependencies = [
-  "numpy==1.26.4",
-  "PySide6==6.8.0.2",
-  "pyqtgraph==0.13.7",
-  "PyYAML==6.0.3",
-  "pyserial==3.5",
-  "psutil==7.1.0",
-  "spinnaker-python",
-  "pyds",
-  "ipywidgets>=8.1.8",
+    "pyserial>=3.5",
+    "PySide6==6.8.0.2",
+    "pyds",
+    "numpy>=2.2.6",
+    "pyqtgraph>=0.14.0",
+    "pandas>=2.3.3",
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "seaborn>=0.13.2",
+    "scipy>=1.15.3",
+    "ultralytics>=8.4.60",
+    "onnx>=1.21.0",
+    "onnxruntime>=1.23.2",
+    "onnxslim>=0.1.94",
+    "torch>=2.12.0",
+    "torchvision>=0.27.0",
 ]
 
-[project.optional-dependencies]
-build-engine = [
-  "ipykernel>=7.1.0",
-  "onnxruntime>=1.23.2",
-  "onnxslim==0.1.78",
-  "ultralytics>=8.3.235",
+[tool.uv]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
 [tool.uv.sources]
-spinnaker-python = { path = "wheel_files/spinnaker_python-4.3.0.189-cp310-cp310-linux_aarch64.whl" }
 pyds = { path = "wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl" }
+
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu126", marker = "sys_platform == 'win32'" },
+]
+
+torchvision = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu126", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

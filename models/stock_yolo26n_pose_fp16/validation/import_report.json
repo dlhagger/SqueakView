@@ -1,0 +1,209 @@
+{
+  "created_at_utc": "2026-06-02T19:55:26.440284+00:00",
+  "workspace": "/home/jetson/Desktop/SqueakView",
+  "model_name": "stock_yolo26n_pose_fp16",
+  "source_model": "/home/jetson/Desktop/SqueakView/build_me/stock_yolo26_pose/yolo26n-pose.pt",
+  "checks": [
+    {
+      "name": "class_names_present",
+      "ok": true,
+      "detail": "1 classes"
+    },
+    {
+      "name": "kpt_shape_present",
+      "ok": true,
+      "detail": "kpt_shape=[17, 3]"
+    },
+    {
+      "name": "keypoint_dims_are_xy_conf",
+      "ok": true,
+      "detail": "kpt_shape=[17, 3]"
+    },
+    {
+      "name": "keypoint_label_count_matches_shape",
+      "ok": true,
+      "detail": "labels=17 kpt_shape[0]=17"
+    },
+    {
+      "name": "onnx_exists",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/onnx/yolo26n-pose_fp16_b1.onnx"
+    },
+    {
+      "name": "onnx_output_stride_matches_yolo26_pose",
+      "ok": true,
+      "detail": "expected stride 57; outputs=[{'name': 'output0', 'shape': [1, 300, 57]}]"
+    },
+    {
+      "name": "engine_exists",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/engines/yolo26n-pose_fp16_b1.engine"
+    },
+    {
+      "name": "exists:configs/stock_yolo26n_pose_fp16.txt",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/configs/stock_yolo26n_pose_fp16.txt"
+    },
+    {
+      "name": "exists:configs/stock_yolo26n_pose_fp16.pose.json",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/configs/stock_yolo26n_pose_fp16.pose.json"
+    },
+    {
+      "name": "exists:model.yaml",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/model.yaml"
+    },
+    {
+      "name": "exists:onnx/yolo26n-pose_fp16_b1.onnx",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/onnx/yolo26n-pose_fp16_b1.onnx"
+    },
+    {
+      "name": "exists:engines/yolo26n-pose_fp16_b1.engine",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/engines/yolo26n-pose_fp16_b1.engine"
+    },
+    {
+      "name": "exists:labels/classes.txt",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/labels/classes.txt"
+    },
+    {
+      "name": "exists:labels/labels.txt",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/labels/labels.txt"
+    },
+    {
+      "name": "exists:validation/import_report.json",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/validation/import_report.json"
+    },
+    {
+      "name": "exists:weights/yolo26n-pose.pt",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/weights/yolo26n-pose.pt"
+    },
+    {
+      "name": "config_uses_yolo26_pose_parser",
+      "ok": true,
+      "detail": "NvDsInferParseYolo26Pose"
+    },
+    {
+      "name": "config_batch_matches_manifest",
+      "ok": true,
+      "detail": "batch-size=1"
+    },
+    {
+      "name": "config_has_no_legacy_pose_keys",
+      "ok": true,
+      "detail": "pose metadata lives in .pose.json"
+    },
+    {
+      "name": "config_onnx-file_is_absolute",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/onnx/yolo26n-pose_fp16_b1.onnx"
+    },
+    {
+      "name": "config_onnx-file_exists",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/onnx/yolo26n-pose_fp16_b1.onnx"
+    },
+    {
+      "name": "config_model-engine-file_is_absolute",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/engines/yolo26n-pose_fp16_b1.engine"
+    },
+    {
+      "name": "config_model-engine-file_exists",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/engines/yolo26n-pose_fp16_b1.engine"
+    },
+    {
+      "name": "config_custom-lib-path_is_absolute",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
+    },
+    {
+      "name": "config_custom-lib-path_exists",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
+    },
+    {
+      "name": "config_labelfile-path_is_absolute",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/labels/classes.txt"
+    },
+    {
+      "name": "config_labelfile-path_exists",
+      "ok": true,
+      "detail": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/labels/classes.txt"
+    },
+    {
+      "name": "pose_sidecar_keypoint_count_matches_yaml",
+      "ok": true,
+      "detail": "pose=17 yaml=17"
+    },
+    {
+      "name": "pose_sidecar_keypoint_dims_matches_yaml",
+      "ok": true,
+      "detail": "pose=3 yaml=3"
+    }
+  ],
+  "model_dir": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16",
+  "config": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/configs/stock_yolo26n_pose_fp16.txt",
+  "pose_sidecar": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/configs/stock_yolo26n_pose_fp16.pose.json",
+  "manifest": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/model.yaml",
+  "onnx": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/onnx/yolo26n-pose_fp16_b1.onnx",
+  "engine": "/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/engines/yolo26n-pose_fp16_b1.engine",
+  "classes": [
+    "person"
+  ],
+  "keypoints": [
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle"
+  ],
+  "input_shape": [
+    1,
+    3,
+    640,
+    640
+  ],
+  "engine_builder": "trtexec",
+  "dynamic_engine": false,
+  "expected_output_stride": 57,
+  "onnx_input": {
+    "name": "images",
+    "shape": [
+      1,
+      3,
+      640,
+      640
+    ]
+  },
+  "onnx_outputs": [
+    {
+      "name": "output0",
+      "shape": [
+        1,
+        300,
+        57
+      ]
+    }
+  ]
+}

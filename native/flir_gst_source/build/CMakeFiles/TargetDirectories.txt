@@ -1,0 +1,3 @@
+/home/jetson/Desktop/SqueakView_New/native/flir_gst_source/build/CMakeFiles/gstflirspinsrc.dir
+/home/jetson/Desktop/SqueakView_New/native/flir_gst_source/build/CMakeFiles/edit_cache.dir
+/home/jetson/Desktop/SqueakView_New/native/flir_gst_source/build/CMakeFiles/rebuild_cache.dir

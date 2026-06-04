@@ -1,0 +1,57 @@
+schema_version: 1
+name: mousehouse_best_yolo26_pose_fp16
+framework: yolo26
+task: pose
+precision: fp16
+batch_size: 1
+engine_builder: trtexec
+dynamic_engine: false
+input_shape:
+- 3
+- 640
+- 640
+classes:
+- mouse
+- landmarks
+keypoints:
+- nose
+- head
+- left_ear
+- right_ear
+- back
+- tail_base
+- poke_left
+- well
+- poke_right
+- sipper_left
+- sipper_right
+- top_left_corner
+- top_right_corner
+- bottom_left_corner
+- bottom_right_corner
+- upper_back
+- lower_back
+- left_haunch
+- right_haunch
+parser_contract:
+  parse_bbox_func: NvDsInferParseYolo26Pose
+  expected_output_stride: 63
+  custom_lib: native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so
+  engine_create_func: NvDsInferYoloCudaEngineGet
+files:
+  config: models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.txt
+  pose_sidecar: models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.pose.json
+  weights: models/mousehouse_best_yolo26_pose_fp16/weights/mousehouse_best.pt
+  onnx: models/mousehouse_best_yolo26_pose_fp16/onnx/mousehouse_best_fp16_b1.onnx
+  engine: models/mousehouse_best_yolo26_pose_fp16/engines/mousehouse_best_fp16_b1.engine
+  classes: models/mousehouse_best_yolo26_pose_fp16/labels/classes.txt
+  keypoint_labels: models/mousehouse_best_yolo26_pose_fp16/labels/labels.txt
+  import_report: models/mousehouse_best_yolo26_pose_fp16/validation/import_report.json
+source:
+  model: /home/jetson/Desktop/SqueakView/build_me/mousehouse_model/mousehouse_best.pt
+  data_yaml: /home/jetson/Desktop/SqueakView/build_me/mousehouse_model/mousehouse_best.yaml
+thresholds:
+  confidence: 0.9
+  nms_iou: 0.15
+  topk: 20
+  pose_draw: 0.5
