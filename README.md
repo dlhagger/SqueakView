@@ -172,10 +172,9 @@ labels, ONNX, TensorRT engine, DeepStream config, pose sidecar JSON, and a
 `build_me/` and `models/` are local artifact directories and are ignored by Git.
 Experiment profiles should use repo-relative paths such as
 `models/<model_name>/configs/<model_name>.txt` and `tasks/default.yaml`.
-Generated DeepStream `nvinfer` configs may contain absolute paths; the GUI
-localizes those configs into each run directory before launching inference so
-stale paths from a moved clone can be repaired when the matching files exist in
-the current repo.
+Generated DeepStream `nvinfer` configs use paths relative to the config file.
+The GUI still localizes those configs into each run directory before launching
+inference so DeepStream receives concrete paths for the active clone.
 
 Before running acquisition, make sure the selected model package contains:
 
@@ -230,14 +229,36 @@ The operator GUI launches only one camera path:
 
 ```text
 flirspinsrc -> source frame tap -> tee
-  record branch: non-leaky queue -> compressed segmented MP4
+  record branch: non-leaky queue -> compressed MP4
   inference branch: leaky queue -> nvvideoconvert -> nvstreammux -> nvinfer -> nvdsosd -> preview
 ```
 
-Runs write `frames.csv` for source-frame timing, `drop_events.csv` for frame
-gaps/acquisition faults, segmented `raw_%06d.mp4` files for recording, and
-`detections.csv` when inference is enabled. Recording segment length defaults
-to 600 seconds and can be changed with `SQUEAKVIEW_RECORD_SEGMENT_SECONDS`.
+Runs are local-only and are created under:
+
+```text
+runs/<experiment>/<subject>/<subject>_<YYYY-MM-DD_HH-MM-SS>_<shortid>/
+```
+
+Each run writes `run_status.json`, `run_manifest.json`, `camera_settings.json`,
+`frames.csv`, `drop_events.csv`, `raw.mp4`, `serial.csv` when the Arduino is
+enabled, and `detections.csv` when inference is enabled. Single-file recording
+is the default because it gives unambiguous frame provenance.
+The GUI verifies that `SQUEAKVIEW_RUNS_DIR` is writable and has at least 1 GB
+free before starting; override that threshold with
+`SQUEAKVIEW_MIN_RUN_FREE_BYTES` for long recordings.
+
+Use `frames.csv` as the source of truth for global frame identity. In default
+single-file mode, `record_segment_file=raw.mp4`,
+`segment_local_frame_index=raw_frame_index`, and
+`segment_mapping_source=single_file`.
+
+On stop, the backend builds `analysis/` transactionally from `analysis.tmp`.
+Chunked MP4 recording is disabled unless `SQUEAKVIEW_ENABLE_CHUNKED_RECORDING=1`
+is set. Chunked runs must include writer-owned `video_segments.csv`, emitted
+from `splitmuxsink` boundary signals. Analysis fails hard if chunked `raw_*.mp4`
+files exist without that ledger; runtime PTS estimates are not accepted as
+authoritative chunk provenance. The aligned CSVs include Arduino TTL timing and
+detection rows.
 
 The old external capture worker, shared-memory camera sockets, and ZED path are intentionally not part of this repo.
 

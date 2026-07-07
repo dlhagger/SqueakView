@@ -1,8 +1,8 @@
 {
   "created_at_utc": "2026-06-02T19:34:55.262029+00:00",
-  "workspace": "/home/jetson/Desktop/SqueakView",
+  "workspace": ".",
   "model_name": "mousehouse_best_yolo26_pose_fp16",
-  "source_model": "/home/jetson/Desktop/SqueakView/build_me/mousehouse_model/mousehouse_best.pt",
+  "source_model": "build_me/mousehouse_model/mousehouse_best.pt",
   "checks": [
     {
       "name": "class_names_present",
@@ -27,7 +27,7 @@
     {
       "name": "onnx_exists",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/onnx/mousehouse_best_fp16_b1.onnx"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/onnx/mousehouse_best_fp16_b1.onnx"
     },
     {
       "name": "onnx_output_stride_matches_yolo26_pose",
@@ -37,52 +37,52 @@
     {
       "name": "engine_exists",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/engines/mousehouse_best_fp16_b1.engine"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/engines/mousehouse_best_fp16_b1.engine"
     },
     {
       "name": "exists:configs/mousehouse_best_yolo26_pose_fp16.txt",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.txt"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.txt"
     },
     {
       "name": "exists:configs/mousehouse_best_yolo26_pose_fp16.pose.json",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.pose.json"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.pose.json"
     },
     {
       "name": "exists:model.yaml",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/model.yaml"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/model.yaml"
     },
     {
       "name": "exists:onnx/mousehouse_best_fp16_b1.onnx",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/onnx/mousehouse_best_fp16_b1.onnx"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/onnx/mousehouse_best_fp16_b1.onnx"
     },
     {
       "name": "exists:engines/mousehouse_best_fp16_b1.engine",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/engines/mousehouse_best_fp16_b1.engine"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/engines/mousehouse_best_fp16_b1.engine"
     },
     {
       "name": "exists:labels/classes.txt",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/labels/classes.txt"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/labels/classes.txt"
     },
     {
       "name": "exists:labels/labels.txt",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/labels/labels.txt"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/labels/labels.txt"
     },
     {
       "name": "exists:validation/import_report.json",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/validation/import_report.json"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/validation/import_report.json"
     },
     {
       "name": "exists:weights/mousehouse_best.pt",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/weights/mousehouse_best.pt"
+      "detail": "models/mousehouse_best_yolo26_pose_fp16/weights/mousehouse_best.pt"
     },
     {
       "name": "config_uses_yolo26_pose_parser",
@@ -100,44 +100,44 @@
       "detail": "pose metadata lives in .pose.json"
     },
     {
-      "name": "config_onnx-file_is_absolute",
+      "name": "config_onnx-file_is_relative",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/onnx/mousehouse_best_fp16_b1.onnx"
+      "detail": "../onnx/mousehouse_best_fp16_b1.onnx"
     },
     {
-      "name": "config_onnx-file_exists",
+      "name": "config_onnx-file_resolves",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/onnx/mousehouse_best_fp16_b1.onnx"
+      "detail": "../onnx/mousehouse_best_fp16_b1.onnx -> models/mousehouse_best_yolo26_pose_fp16/onnx/mousehouse_best_fp16_b1.onnx"
     },
     {
-      "name": "config_model-engine-file_is_absolute",
+      "name": "config_model-engine-file_is_relative",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/engines/mousehouse_best_fp16_b1.engine"
+      "detail": "../engines/mousehouse_best_fp16_b1.engine"
     },
     {
-      "name": "config_model-engine-file_exists",
+      "name": "config_model-engine-file_resolves",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/engines/mousehouse_best_fp16_b1.engine"
+      "detail": "../engines/mousehouse_best_fp16_b1.engine -> models/mousehouse_best_yolo26_pose_fp16/engines/mousehouse_best_fp16_b1.engine"
     },
     {
-      "name": "config_custom-lib-path_is_absolute",
+      "name": "config_custom-lib-path_is_relative",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
+      "detail": "../../../native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
     },
     {
-      "name": "config_custom-lib-path_exists",
+      "name": "config_custom-lib-path_resolves",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
+      "detail": "../../../native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so -> native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
     },
     {
-      "name": "config_labelfile-path_is_absolute",
+      "name": "config_labelfile-path_is_relative",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/labels/classes.txt"
+      "detail": "../labels/classes.txt"
     },
     {
-      "name": "config_labelfile-path_exists",
+      "name": "config_labelfile-path_resolves",
       "ok": true,
-      "detail": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/labels/classes.txt"
+      "detail": "../labels/classes.txt -> models/mousehouse_best_yolo26_pose_fp16/labels/classes.txt"
     },
     {
       "name": "pose_sidecar_keypoint_count_matches_yaml",
@@ -150,12 +150,12 @@
       "detail": "pose=3 yaml=3"
     }
   ],
-  "model_dir": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16",
-  "config": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.txt",
-  "pose_sidecar": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.pose.json",
-  "manifest": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/model.yaml",
-  "onnx": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/onnx/mousehouse_best_fp16_b1.onnx",
-  "engine": "/home/jetson/Desktop/SqueakView/models/mousehouse_best_yolo26_pose_fp16/engines/mousehouse_best_fp16_b1.engine",
+  "model_dir": "models/mousehouse_best_yolo26_pose_fp16",
+  "config": "models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.txt",
+  "pose_sidecar": "models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.pose.json",
+  "manifest": "models/mousehouse_best_yolo26_pose_fp16/model.yaml",
+  "onnx": "models/mousehouse_best_yolo26_pose_fp16/onnx/mousehouse_best_fp16_b1.onnx",
+  "engine": "models/mousehouse_best_yolo26_pose_fp16/engines/mousehouse_best_fp16_b1.engine",
   "classes": [
     "mouse",
     "landmarks"

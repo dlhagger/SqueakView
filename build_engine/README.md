@@ -55,9 +55,9 @@ Ultralytics, PyTorch, ONNX, PyYAML, and TensorRT available.
 - DeepStream is installed on the Jetson.
 - `trtexec` is available at `/usr/src/tensorrt/bin/trtexec`, on `PATH`, or via
   `TRTEXEC=/path/to/trtexec`.
-- The generated DeepStream config uses absolute paths for the ONNX, engine,
-  labels, and custom parser library. `nvinfer` resolves these keys relative to
-  the config file, so absolute paths are safer than repo-relative paths.
+- The generated DeepStream config uses paths relative to the config file for the
+  ONNX, engine, labels, and custom parser library, keeping model packages
+  portable across clone locations.
 - The generated config is for YOLO26 pose only:
   `parse-bbox-func-name=NvDsInferParseYolo26Pose`.
 - Engine builds and notebooks can fragment Jetson GPU/NvMap memory. Before long

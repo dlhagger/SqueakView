@@ -1,28 +1,20 @@
-SqueakView Google Drive Upload Setup
-====================================
+SqueakView Manual Google Drive Copy Setup
+=========================================
 
 Purpose
 -------
-This guide explains how to configure Google Drive uploads for SqueakView using `rclone`.
+This guide explains how to manually copy completed local SqueakView runs to Google Drive using `rclone`.
 
 Current SqueakView behavior
 ---------------------------
-At the end of a run, SqueakView can prompt:
+The SqueakView GUI saves runs locally and does not start cloud uploads. A run is complete when the local run directory contains its `run_status.json`, `run_manifest.json`, CSV outputs, video segments, and optional `analysis/` outputs.
 
-  Upload to Google Drive now?
-
-If the user clicks `Yes`, SqueakView runs:
-
-  rclone copy <run_dir> gdrive:SqueakViewUploads/<run_name> \
-    --exclude "*.mp4" \
-    --exclude "*.svo" \
-    --exclude "*.svo2" \
-    --progress
+If you want an off-machine copy, run `rclone` manually after the run finalizes.
 
 Important:
-- uploads are a copy, not a move
+- manual copies are a copy, not a move
 - local run data remains on the Jetson
-- video files are excluded by default
+- include or exclude video files intentionally for your storage budget
 
 
 Prerequisites
@@ -68,9 +60,9 @@ List the top level of the drive:
 If this works, authentication is valid.
 
 
-Step 3: Create the SqueakView upload folder
--------------------------------------------
-Create the folder SqueakView expects:
+Step 3: Create an upload folder
+-------------------------------
+Create a folder for copied SqueakView runs:
 
   rclone mkdir "gdrive:SqueakViewUploads"
 
@@ -81,7 +73,7 @@ Step 4: Manual smoke test
 -------------------------
 Test with an existing run directory:
 
-  rclone copy "/home/jetson/Desktop/SqueakView/runs/<run_dir_name>" \
+  rclone copy "<repo>/runs/<run_dir_name>" \
     "gdrive:SqueakViewUploads/<run_dir_name>" \
     --exclude "*.mp4" \
     --exclude "*.svo" \
@@ -93,14 +85,14 @@ Then verify:
   rclone ls "gdrive:SqueakViewUploads/<run_dir_name>"
 
 
-How SqueakView uses the remote
-------------------------------
-The current GUI assumes:
+Manual copy assumptions
+-----------------------
+The examples in this file assume:
 
 - remote name: `gdrive`
 - destination folder: `SqueakViewUploads`
 
-So if uploads are failing, first verify these:
+If manual copies fail, first verify these:
 
   rclone lsd gdrive:
   rclone lsd "gdrive:SqueakViewUploads"
@@ -116,7 +108,7 @@ Then either:
 - edit remote `gdrive`, or
 - delete and recreate remote `gdrive`
 
-SqueakView currently expects the remote to still be named `gdrive`.
+The manual commands in this file assume the remote is still named `gdrive`.
 
 
 Common failure modes
@@ -134,8 +126,8 @@ Common failure modes
 - rerun `rclone config`
 - reauthenticate the `gdrive` remote
 
-5. SqueakView upload prompt appears but upload fails
-- test the same `rclone copy` command manually in terminal
+5. Manual copy fails
+- confirm the source run directory exists and has finalized
 - confirm the remote name is still `gdrive`
 
 
@@ -155,7 +147,7 @@ Inspect upload folder:
 
 Manually upload a run:
 
-  rclone copy "/home/jetson/Desktop/SqueakView/runs/<run_dir_name>" \
+  rclone copy "<repo>/runs/<run_dir_name>" \
     "gdrive:SqueakViewUploads/<run_dir_name>" \
     --exclude "*.mp4" \
     --exclude "*.svo" \
@@ -166,5 +158,5 @@ Manually upload a run:
 Notes
 -----
 - This setup is independent of FLIR vs ZED capture.
-- Excluding `.mp4`, `.svo`, and `.svo2` is hardcoded in the current GUI upload path.
-- If the destination folder or remote name changes in code later, update this document too.
+- The GUI is local-only; this document is optional manual offload guidance.
+- If the destination folder or remote name changes in your manual commands, update this document too.

@@ -10,7 +10,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -50,6 +50,7 @@ class LaunchConfig:
     experiment_name: str | None = None
     draw_skeleton: bool = False
     task_cfg: Path | None = None
+    bottles: dict[str, object] = field(default_factory=dict)
 
 
 def _prepend_env_path(env: dict[str, str], key: str, paths: list[Path]) -> None:
@@ -78,13 +79,7 @@ def _resolve_infer_config_path(raw: str, config_dir: Path) -> Path:
 
 
 def _localize_deepstream_config(config_path: Path, run_dir: Path | None, emit: Callable[[str], None]) -> Path:
-    """Write a run-local nvinfer config with paths resolved for this clone.
-
-    DeepStream accepts relative paths in config files, but resolves them from the
-    config location in ways that are easy to break after moving a repo. The model
-    builder writes absolutes for reliability; this launch-time copy keeps that
-    reliability while repairing stale absolutes from another clone path.
-    """
+    """Write a run-local nvinfer config with paths resolved for this clone."""
     config_path = Path(config_path).expanduser().resolve()
     if run_dir is None:
         return config_path
@@ -253,6 +248,7 @@ def spawn_inference(config: LaunchConfig, emit: Callable[[str], None]) -> Proces
         ds_cfg = squeakview_config.resolve_workspace_path(config.ds_cfg)
         if ds_cfg is not None:
             ds_cfg = _localize_deepstream_config(ds_cfg, config.run_dir, emit)
+            config.ds_cfg = ds_cfg
         args += ["--cfg", str(ds_cfg)]
     args += ["--capture-backend", backend]
     args += ["--num-cameras", str(max(1, int(getattr(config, "num_cameras", 1))))]

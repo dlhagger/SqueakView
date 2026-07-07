@@ -3,8 +3,8 @@ gpu-id=0
 net-scale-factor=0.0039215697906911373
 model-color-format=0
 
-onnx-file=/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/onnx/yolo26n-pose_fp16_b1.onnx
-model-engine-file=/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/engines/yolo26n-pose_fp16_b1.engine
+onnx-file=../onnx/yolo26n-pose_fp16_b1.onnx
+model-engine-file=../engines/yolo26n-pose_fp16_b1.engine
 
 network-mode=2
 network-type=0
@@ -13,9 +13,9 @@ batch-size=1
 output-tensor-meta=1
 
 num-detected-classes=1
-labelfile-path=/home/jetson/Desktop/SqueakView/models/stock_yolo26n_pose_fp16/labels/classes.txt
+labelfile-path=../labels/classes.txt
 parse-bbox-func-name=NvDsInferParseYolo26Pose
-custom-lib-path=/home/jetson/Desktop/SqueakView/native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so
+custom-lib-path=../../../native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so
 engine-create-func-name=NvDsInferYoloCudaEngineGet
 
 cluster-mode=2

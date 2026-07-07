@@ -152,6 +152,7 @@ def _ffprobe_raw_segments(run_dir: Path) -> dict[str, Any]:
 
     total_frames = 0
     missing_frame_counts = False
+    segments: list[dict[str, Any]] = []
     sample_segments: list[dict[str, Any]] = []
     for index, path in enumerate(paths):
         info = _ffprobe_video(path)
@@ -161,23 +162,137 @@ def _ffprobe_raw_segments(run_dir: Path) -> dict[str, Any]:
         else:
             total_frames += nb_frames
 
+        segment = {
+            "index": index,
+            "file": str(path),
+            "file_name": path.name,
+            "nb_frames": nb_frames,
+            "duration": info.get("duration"),
+            "codec_name": info.get("codec_name"),
+            "error": info.get("error"),
+        }
+        segments.append(segment)
         if index < 5 or index >= max(5, len(paths) - 5):
-            sample_segments.append(
-                {
-                    "file": str(path),
-                    "nb_frames": nb_frames,
-                    "duration": info.get("duration"),
-                    "codec_name": info.get("codec_name"),
-                    "error": info.get("error"),
-                }
-            )
+            sample_segments.append(segment)
 
     return {
         "segment_count": len(paths),
         "total_nb_frames": None if missing_frame_counts else total_frames,
         "all_segments_have_nb_frames": bool(paths) and not missing_frame_counts,
+        "segments": segments,
         "sample_segments": sample_segments,
     }
+
+
+def _video_segment_frame_map(frame_rows: list[dict[str, str]], run_dir: Path) -> dict[int, dict[str, Any]]:
+    """Map frames.csv row indexes to authoritative video files.
+
+    Single-file runs are unambiguous. Chunked runs require video_segments.csv,
+    written by splitmuxsink's format-location-full signal. Runtime PTS estimates
+    are intentionally not accepted as segment provenance.
+    """
+    ordered_rows: list[tuple[int, int, dict[str, str]]] = []
+    for row_index, row in enumerate(frame_rows):
+        stream_id = _to_int(row.get("stream_id"))
+        if stream_id not in (None, 0):
+            continue
+        sort_key = _to_int(row.get("raw_frame_index"))
+        if sort_key is None:
+            sort_key = _to_int(row.get("camera_frame_id"))
+        if sort_key is None:
+            continue
+        ordered_rows.append((sort_key, row_index, row))
+    ordered_rows.sort(key=lambda item: (item[0], item[1]))
+
+    chunked_paths = sorted(run_dir.glob("raw_*.mp4"))
+    if not chunked_paths:
+        raw_path = run_dir / "raw.mp4"
+        if not raw_path.exists():
+            return {}
+        mapping: dict[int, dict[str, Any]] = {}
+        if not ordered_rows:
+            return mapping
+        first_raw_frame_index = _to_int(ordered_rows[0][2].get("raw_frame_index"))
+        if first_raw_frame_index is None:
+            first_raw_frame_index = _to_int(ordered_rows[0][2].get("camera_frame_id")) or 0
+        for _sort_key, row_index, row in ordered_rows:
+            raw_frame_index = _to_int(row.get("raw_frame_index"))
+            if raw_frame_index is None:
+                raw_frame_index = _to_int(row.get("camera_frame_id"))
+            mapping[row_index] = {
+                "record_segment_index": 0,
+                "record_segment_file": raw_path.name,
+                "segment_local_frame_index": (
+                    int(raw_frame_index) - int(first_raw_frame_index) if raw_frame_index is not None else ""
+                ),
+                "segment_start_raw_frame_index": first_raw_frame_index,
+                "segment_mapping_source": "single_file",
+            }
+        return mapping
+
+    ledger_path = run_dir / "video_segments.csv"
+    if not ledger_path.exists():
+        raise RuntimeError(
+            "chunked MP4 files exist without writer-owned video_segments.csv; "
+            "segment provenance is not authoritative"
+        )
+    ledger_rows = _read_csv(ledger_path)
+    if not ledger_rows:
+        raise RuntimeError("video_segments.csv is empty; segment provenance is not authoritative")
+
+    segments_by_stream: dict[int, list[dict[str, Any]]] = {}
+    for row in ledger_rows:
+        stream_id = _to_int(row.get("stream_id"))
+        if stream_id is None:
+            stream_id = 0
+        start_raw = _to_int(row.get("first_raw_frame_index"))
+        if start_raw is None:
+            raise RuntimeError("video_segments.csv has a segment without first_raw_frame_index")
+        mapping_source = (row.get("mapping_source") or "").strip()
+        if mapping_source != "splitmux_format_location_full_pts":
+            raise RuntimeError(
+                f"video_segments.csv segment {row.get('segment_index', '')} has non-authoritative "
+                f"mapping_source={mapping_source!r}"
+            )
+        segments_by_stream.setdefault(stream_id, []).append(
+            {
+                "record_segment_index": _to_int(row.get("segment_index")),
+                "record_segment_file": Path(row.get("file") or "").name,
+                "segment_start_raw_frame_index": start_raw,
+            }
+        )
+
+    for segments in segments_by_stream.values():
+        segments.sort(key=lambda item: int(item["segment_start_raw_frame_index"]))
+
+    mapping: dict[int, dict[str, Any]] = {}
+    cursors: dict[int, int] = {}
+    for _sort_key, row_index, row in ordered_rows:
+        stream_id = _to_int(row.get("stream_id"))
+        if stream_id is None:
+            stream_id = 0
+        segments = segments_by_stream.get(stream_id)
+        if not segments:
+            raise RuntimeError(f"video_segments.csv has no segment ledger for stream {stream_id}")
+        raw_frame_index = _to_int(row.get("raw_frame_index"))
+        if raw_frame_index is None:
+            raw_frame_index = _to_int(row.get("camera_frame_id"))
+        if raw_frame_index is None:
+            continue
+        cursor = cursors.get(stream_id, 0)
+        while cursor + 1 < len(segments) and int(segments[cursor + 1]["segment_start_raw_frame_index"]) <= int(raw_frame_index):
+            cursor += 1
+        cursors[stream_id] = cursor
+        segment = segments[cursor]
+        start = int(segment["segment_start_raw_frame_index"])
+        mapping[row_index] = {
+            "record_segment_index": segment["record_segment_index"],
+            "record_segment_file": segment["record_segment_file"],
+            "segment_local_frame_index": int(raw_frame_index) - start,
+            "segment_start_raw_frame_index": start,
+            "segment_mapping_source": "video_segments_csv",
+        }
+    return mapping
 
 
 class CameraHighIndex:
@@ -236,11 +351,14 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
     detections_path = run_dir / "detections.csv"
     drop_events_path = run_dir / "drop_events.csv"
 
-    missing = [path.name for path in [frames_path, serial_path] if not path.exists()]
-    if missing:
-        raise FileNotFoundError(f"missing required run outputs in {run_dir}: {', '.join(missing)}")
-
+    if not frames_path.exists():
+        raise FileNotFoundError(f"missing required run outputs in {run_dir}: {frames_path.name}")
     frame_rows = _read_csv(frames_path)
+    raw_video_segments = _ffprobe_raw_segments(run_dir)
+    video_segment_by_row = _video_segment_frame_map(frame_rows, run_dir)
+    if not serial_path.exists():
+        raise FileNotFoundError(f"missing required run outputs in {run_dir}: {serial_path.name}")
+
     serial_rows = _normalize_serial_rows(_read_csv(serial_path))
     detection_rows = _read_csv(detections_path) if detections_path.exists() else []
     drop_rows = _read_csv(drop_events_path) if drop_events_path.exists() else []
@@ -267,10 +385,22 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
     aligned_frames: list[dict[str, Any]] = []
     frame_by_id: dict[int, dict[str, Any]] = {}
     frame_ids: list[int] = []
-    for row in frame_rows:
+    for row_index, row in enumerate(frame_rows):
         camera_frame_id = _to_int(row.get("camera_frame_id"))
         if camera_frame_id is None:
             continue
+        video_segment = video_segment_by_row.get(row_index)
+        segment_mapping_source = "runtime_pts"
+        record_segment_index = row.get("record_segment_index", "")
+        record_segment_file = row.get("record_segment_file", "")
+        segment_local_frame_index = row.get("segment_local_frame_index", "")
+        segment_start_raw_frame_index = row.get("segment_start_raw_frame_index", "")
+        if video_segment:
+            segment_mapping_source = str(video_segment.get("segment_mapping_source") or "authoritative_video")
+            record_segment_index = video_segment.get("record_segment_index", "")
+            record_segment_file = video_segment.get("record_segment_file", "")
+            segment_local_frame_index = video_segment.get("segment_local_frame_index", "")
+            segment_start_raw_frame_index = video_segment.get("segment_start_raw_frame_index", "")
         frame_ids.append(camera_frame_id)
         ttl_count = camera_frame_id + 1
         high = camera_high.by_count.get(ttl_count)
@@ -280,6 +410,7 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
         duration_ns = _to_int(row.get("duration_ns"))
         detection_count = detection_count_by_frame.get(camera_frame_id, 0)
         out = {
+            "raw_frame_index": row.get("raw_frame_index", ""),
             "camera_frame_id": camera_frame_id,
             "ttl_count": ttl_count,
             "frame_rp2040_us": _fmt(frame_rp2040_us),
@@ -292,8 +423,11 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
             "frame_host_monotonic_ns": row.get("host_monotonic_ns", ""),
             "ttl_host_unix_ns": high.get("hostUnixNs", "") if high else "",
             "ttl_host_monotonic_ns": high.get("hostMonotonicNs", "") if high else "",
-            "record_segment_index": row.get("record_segment_index", ""),
-            "record_segment_file": row.get("record_segment_file", ""),
+            "record_segment_index": record_segment_index,
+            "record_segment_file": record_segment_file,
+            "segment_local_frame_index": segment_local_frame_index,
+            "segment_start_raw_frame_index": segment_start_raw_frame_index,
+            "segment_mapping_source": segment_mapping_source,
             "status": row.get("status", ""),
             "has_ttl": "1" if high else "0",
             "has_detection": "1" if detection_count else "0",
@@ -380,12 +514,18 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
         aligned_detections.append(
             {
                 "detection_index": det_index,
+                "raw_frame_index": frame.get("raw_frame_index", "") if frame else "",
                 "camera_frame_id": _fmt(camera_frame_id),
                 "ttl_count": frame.get("ttl_count", "") if frame else "",
                 "detection_rp2040_us": frame.get("frame_rp2040_us", "") if frame else "",
                 "detection_time_s": frame.get("frame_time_s", "") if frame else "",
                 "frame_pts_ns": frame.get("frame_pts_ns", "") if frame else "",
                 "frame_pts_s": frame.get("frame_pts_s", "") if frame else "",
+                "record_segment_index": frame.get("record_segment_index", "") if frame else "",
+                "record_segment_file": frame.get("record_segment_file", "") if frame else "",
+                "segment_local_frame_index": frame.get("segment_local_frame_index", "") if frame else "",
+                "segment_start_raw_frame_index": frame.get("segment_start_raw_frame_index", "") if frame else "",
+                "segment_mapping_source": frame.get("segment_mapping_source", "") if frame else "",
                 "raw_frame_mapping_method": mapping_method,
                 "raw_frame_mapping_ok": mapping_ok,
                 "raw_frame_mapping_pts_ns": mapping_pts_ns,
@@ -432,6 +572,7 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
                 "frame_trigger_rp2040_us": frame["frame_rp2040_us"],
                 "frame_trigger_time_s": frame["frame_time_s"],
                 "offset_from_frame_trigger_ms": "0.000000",
+                "raw_frame_index": frame["raw_frame_index"],
                 "camera_frame_id": frame["camera_frame_id"],
                 "ttl_count": frame["ttl_count"],
                 "source": "cam0",
@@ -440,6 +581,9 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
                 "duration_ns": frame["duration_ns"],
                 "record_segment_index": frame["record_segment_index"],
                 "record_segment_file": frame["record_segment_file"],
+                "segment_local_frame_index": frame["segment_local_frame_index"],
+                "segment_start_raw_frame_index": frame["segment_start_raw_frame_index"],
+                "segment_mapping_source": frame["segment_mapping_source"],
                 "frame_status": frame["status"],
                 "has_detection": frame["has_detection"],
                 "detection_count": frame["detection_count"],
@@ -511,11 +655,17 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
                 "frame_trigger_rp2040_us": det["detection_rp2040_us"],
                 "frame_trigger_time_s": det["detection_time_s"],
                 "offset_from_frame_trigger_ms": "0.000000",
+                "raw_frame_index": det["raw_frame_index"],
                 "camera_frame_id": det["camera_frame_id"],
                 "ttl_count": det["ttl_count"],
                 "source": det["source"],
                 "frame_pts_ns": det["frame_pts_ns"],
                 "frame_pts_s": det["frame_pts_s"],
+                "record_segment_index": det["record_segment_index"],
+                "record_segment_file": det["record_segment_file"],
+                "segment_local_frame_index": det["segment_local_frame_index"],
+                "segment_start_raw_frame_index": det["segment_start_raw_frame_index"],
+                "segment_mapping_source": det["segment_mapping_source"],
                 "raw_frame_mapping_method": det["raw_frame_mapping_method"],
                 "raw_frame_mapping_ok": det["raw_frame_mapping_ok"],
                 "raw_frame_mapping_pts_ns": det["raw_frame_mapping_pts_ns"],
@@ -546,6 +696,7 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
                 "time_rp2040_us": frame["frame_rp2040_us"],
                 "time_s": frame["frame_time_s"],
                 "time_source": "camera_high",
+                "raw_frame_index": frame["raw_frame_index"],
                 "camera_frame_id": frame["camera_frame_id"],
                 "ttl_count": frame["ttl_count"],
                 "event_type": "FRAME",
@@ -573,6 +724,7 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
                 "time_rp2040_us": event_time,
                 "time_s": _fmt_float(camera_high.frame_time_s(_to_int(event_time))),
                 "time_source": time_source,
+                "raw_frame_index": "",
                 "camera_frame_id": event["previous_frame_id"],
                 "ttl_count": event["previous_ttl_count"],
                 "event_type": event["eventType"],
@@ -595,6 +747,7 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
                 "time_rp2040_us": det["detection_rp2040_us"],
                 "time_s": det["detection_time_s"],
                 "time_source": "detection_frame",
+                "raw_frame_index": det["raw_frame_index"],
                 "camera_frame_id": det["camera_frame_id"],
                 "ttl_count": det["ttl_count"],
                 "event_type": "DETECTION",
@@ -619,6 +772,7 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
 
     frame_fields = [
         "camera_frame_id",
+        "raw_frame_index",
         "ttl_count",
         "frame_rp2040_us",
         "frame_time_s",
@@ -632,6 +786,9 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
         "ttl_host_monotonic_ns",
         "record_segment_index",
         "record_segment_file",
+        "segment_local_frame_index",
+        "segment_start_raw_frame_index",
+        "segment_mapping_source",
         "status",
         "has_ttl",
         "has_detection",
@@ -666,12 +823,18 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
     ]
     detection_fields = [
         "detection_index",
+        "raw_frame_index",
         "camera_frame_id",
         "ttl_count",
         "detection_rp2040_us",
         "detection_time_s",
         "frame_pts_ns",
         "frame_pts_s",
+        "record_segment_index",
+        "record_segment_file",
+        "segment_local_frame_index",
+        "segment_start_raw_frame_index",
+        "segment_mapping_source",
         "raw_frame_mapping_method",
         "raw_frame_mapping_ok",
         "raw_frame_mapping_pts_ns",
@@ -696,6 +859,7 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
         "time_s",
         "time_source",
         "camera_frame_id",
+        "raw_frame_index",
         "ttl_count",
         "event_type",
         "event_name",
@@ -723,6 +887,7 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
         "frame_trigger_time_s",
         "offset_from_frame_trigger_ms",
         "camera_frame_id",
+        "raw_frame_index",
         "ttl_count",
         "source",
         "frame_pts_ns",
@@ -730,6 +895,9 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
         "duration_ns",
         "record_segment_index",
         "record_segment_file",
+        "segment_local_frame_index",
+        "segment_start_raw_frame_index",
+        "segment_mapping_source",
         "frame_status",
         "has_detection",
         "detection_count",
@@ -785,9 +953,14 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
     _write_csv(out_dir / "aligned_timeline.csv", timeline, timeline_fields)
 
     frame_gaps = _detect_frame_gaps(sorted(frame_ids))
+    segment_mapping_source_counts: dict[str, int] = {}
+    for row in aligned_frames:
+        source = str(row.get("segment_mapping_source") or "")
+        segment_mapping_source_counts[source] = segment_mapping_source_counts.get(source, 0) + 1
     raw_video = run_dir / "raw_000000.mp4"
+    if not raw_video.exists():
+        raw_video = run_dir / "raw.mp4"
     video_info = _ffprobe_video(raw_video)
-    raw_video_segments = _ffprobe_raw_segments(run_dir)
     video_nb_frames = _to_int(raw_video_segments.get("total_nb_frames"))
     if video_nb_frames is None:
         video_nb_frames = _to_int(video_info.get("nb_frames"))
@@ -904,6 +1077,7 @@ def build_alignment(run_dir: Path, out_dir: Path) -> dict[str, Any]:
             "detection_ts_mismatch_count": detection_ts_mismatch_count,
             "detection_pts_mismatch_count": detection_pts_mismatch_count,
             "detection_mapping_method_counts": detection_mapping_method_counts,
+            "segment_mapping_source_counts": segment_mapping_source_counts,
             "detection_mapping_failed_rows": detection_mapping_failed_rows,
             "detection_mapping_fallback_rows": detection_mapping_fallback_rows,
             "detection_mapping_legacy_rows": detection_mapping_legacy_rows,

@@ -5,10 +5,19 @@ runs/
 __pycache__/
 *.py[cod]
 
+# Native/CMake build outputs
+native/flir_gst_source/build/
+native/**/*.o
+native/**/*.so
+
 # Virtual environments
 .venv/
 
 # DS/engine artifacts (large binaries) can live outside git; keep local outputs clean
+build_me/**/*.pt
+models/*/engines/
+models/*/onnx/
+models/*/weights/
 DeepStream-Yolo/artifacts/onnx/
 DeepStream-Yolo/artifacts/weights/*.pt
 !DeepStream-Yolo/artifacts/weights/yolo26s_dino_10kpts.pt

@@ -5,7 +5,7 @@ HEADER;
 
 FILE_DESCRIPTION(('HOOPS Exchange Step'),'2;1');
 
-FILE_NAME('/Users/haggertydl/Library/Containers/com.shapr3d.shapr/Data/tmp/export/temp_export',
+FILE_NAME('FLIR_Camera_Top_Mount.step',
 '2025-12-08T16:09:26-05:00',
 ('haggertydl'),
 ('Shapr3D Limited'),
@@ -1948,7 +1948,7 @@ DATA;
 #23=PRODUCT_DEFINITION_SHAPE('','',#25);
 #1923=SHAPE_DEFINITION_REPRESENTATION(#23,#16);
 #11=DRAUGHTING_MODEL('',(#1916),#10);
-#1924=DESCRIPTIVE_REPRESENTATION_ITEM('KEY','/Users/haggertydl/Library/Containers/com.shapr3d.shapr/Data/tmp/6F7FFF89-FA0C-4053-9345-33462A1ACF5E.tmp');
+#1924=DESCRIPTIVE_REPRESENTATION_ITEM('KEY','FLIR_Camera_Top_Mount.step');
 #1925=PROPERTY_DEFINITION('KEY','',#25);
 #1926=REPRESENTATION('',(#1924),#10);
 #1927=PROPERTY_DEFINITION_REPRESENTATION(#1925,#1926);

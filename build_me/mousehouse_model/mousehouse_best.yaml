@@ -1,4 +1,5 @@
-path: /home/dlh/Documents/DLH/MouseHouse_Model/datasets/pose
+# Edit this to the local dataset root before retraining/importing.
+path: datasets/pose
 train: images/train
 val: images/val
 names:

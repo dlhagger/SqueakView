@@ -22,6 +22,8 @@ from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
 from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile
 from squeakview import config as squeakview_config
 
+BOTTLE_FLUID_PRESETS = ["", "water", "sucrose", "quinine", "ethanol", "saline", "custom"]
+
 
 class PreviewWidget(QtWidgets.QWidget):
     def __init__(self, parent=None) -> None:
@@ -197,8 +199,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_window_id: int | None = None
         self._stop_in_progress = False
         self._stop_thread: threading.Thread | None = None
-        self._upload_thread: threading.Thread | None = None
-        self._upload_in_progress = False
         self._profile_store = ProfileStore()
         self._experiments: list[ExperimentProfile] = []
         self._subjects: list[SubjectProfile] = []
@@ -293,6 +293,47 @@ class MainWindow(QtWidgets.QMainWindow):
         meters_layout.addSpacing(6)
         meters_layout.addWidget(self.summary_label)
 
+        bottle_group = QtWidgets.QGroupBox("Bottles", self)
+        bottle_layout = QtWidgets.QGridLayout(bottle_group)
+        bottle_layout.setHorizontalSpacing(8)
+        bottle_layout.setVerticalSpacing(8)
+        bottle_layout.addWidget(QtWidgets.QLabel("Side", self), 0, 0)
+        bottle_layout.addWidget(QtWidgets.QLabel("Fluid", self), 0, 1)
+        bottle_layout.addWidget(QtWidgets.QLabel("Initial g", self), 0, 2)
+        bottle_layout.addWidget(QtWidgets.QLabel("Final g", self), 0, 3)
+
+        self.left_fluid_combo = self._make_fluid_combo()
+        self.left_initial_weight_edit = self._make_weight_edit("initial")
+        self.left_final_weight_edit = self._make_weight_edit("final")
+        self.right_fluid_combo = self._make_fluid_combo()
+        self.right_initial_weight_edit = self._make_weight_edit("initial")
+        self.right_final_weight_edit = self._make_weight_edit("final")
+
+        bottle_layout.addWidget(QtWidgets.QLabel("Left", self), 1, 0)
+        bottle_layout.addWidget(self.left_fluid_combo, 1, 1)
+        bottle_layout.addWidget(self.left_initial_weight_edit, 1, 2)
+        bottle_layout.addWidget(self.left_final_weight_edit, 1, 3)
+        bottle_layout.addWidget(QtWidgets.QLabel("Right", self), 2, 0)
+        bottle_layout.addWidget(self.right_fluid_combo, 2, 1)
+        bottle_layout.addWidget(self.right_initial_weight_edit, 2, 2)
+        bottle_layout.addWidget(self.right_final_weight_edit, 2, 3)
+
+        self.bottle_status_label = QtWidgets.QLabel("Bottle info pending for next run.", self)
+        self.bottle_status_label.setObjectName("bottleStatus")
+        self.bottle_status_label.setWordWrap(True)
+        self.save_bottles_btn = QtWidgets.QPushButton("Save Bottle Info", self)
+        self.save_bottles_btn.setObjectName("secondaryButton")
+        self.save_bottles_btn.clicked.connect(self._on_save_bottles)
+        bottle_action_row = QtWidgets.QHBoxLayout()
+        bottle_action_row.addWidget(self.bottle_status_label, 1)
+        bottle_action_row.addWidget(self.save_bottles_btn, 0)
+        bottle_layout.addLayout(bottle_action_row, 3, 0, 1, 4)
+        bottle_layout.setColumnStretch(1, 1)
+        bottle_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+
         # Move run controls into the system load panel
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.setSpacing(8)
@@ -316,11 +357,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         grid.addWidget(meters_group, 0, 1, 1, 1)
 
+        right_column = QtWidgets.QWidget(self)
+        right_column_layout = QtWidgets.QVBoxLayout(right_column)
+        right_column_layout.setContentsMargins(0, 0, 0, 0)
+        right_column_layout.setSpacing(14)
+
         self.task_state_group = QtWidgets.QGroupBox("Live Task State")
         task_state_layout = QtWidgets.QVBoxLayout(self.task_state_group)
         task_state_layout.setContentsMargins(12, 12, 12, 12)
         task_state_layout.addWidget(task_state_panel, 1)
-        grid.addWidget(self.task_state_group, 0, 2, 1, 1)
+        self.task_state_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        right_column_layout.addWidget(self.task_state_group, 1)
+        right_column_layout.addWidget(bottle_group, 0)
+        grid.addWidget(right_column, 0, 2, 1, 1)
 
         dashboard_group = QtWidgets.QGroupBox("Behavior Dashboard")
         dash_layout = QtWidgets.QVBoxLayout(dashboard_group)
@@ -510,6 +562,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 padding: 10px;
                 color: #e0e5ff;
             }
+            QLabel#bottleStatus {
+                color: #9aa7cc;
+                font-size: 11px;
+            }
             QLabel#taskTitle {
                 color: #eef1ff;
                 font-size: 14px;
@@ -614,6 +670,104 @@ class MainWindow(QtWidgets.QMainWindow):
             "experiment_name": "",
             "experiment_mode": "sandbox",
         }
+
+    def _make_fluid_combo(self) -> QtWidgets.QComboBox:
+        combo = QtWidgets.QComboBox(self)
+        combo.setEditable(True)
+        combo.addItems(BOTTLE_FLUID_PRESETS)
+        combo.setMinimumWidth(96)
+        return combo
+
+    def _make_weight_edit(self, phase: str) -> QtWidgets.QLineEdit:
+        edit = QtWidgets.QLineEdit(self)
+        edit.setPlaceholderText(phase)
+        edit.setMaximumWidth(82)
+        validator = QtGui.QDoubleValidator(0.0, 100000.0, 4, edit)
+        validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
+        edit.setValidator(validator)
+        return edit
+
+    @staticmethod
+    def _parse_weight(text: str, label: str, *, strict: bool) -> float | None:
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+        try:
+            value = float(cleaned)
+        except ValueError:
+            if strict:
+                raise ValueError(f"{label} must be a number.")
+            return None
+        if value < 0:
+            if strict:
+                raise ValueError(f"{label} cannot be negative.")
+            return None
+        return round(value, 6)
+
+    def _collect_bottle_payload(self, *, include_final: bool, strict: bool) -> dict[str, object]:
+        sides = {
+            "left": {
+                "fluid": self.left_fluid_combo.currentText().strip(),
+                "initial_edit": self.left_initial_weight_edit,
+                "final_edit": self.left_final_weight_edit,
+            },
+            "right": {
+                "fluid": self.right_fluid_combo.currentText().strip(),
+                "initial_edit": self.right_initial_weight_edit,
+                "final_edit": self.right_final_weight_edit,
+            },
+        }
+        payload: dict[str, object] = {}
+        for side, widgets in sides.items():
+            label = side.title()
+            fluid = widgets["fluid"]
+            initial = self._parse_weight(widgets["initial_edit"].text(), f"{label} initial weight", strict=strict)
+            final = (
+                self._parse_weight(widgets["final_edit"].text(), f"{label} final weight", strict=strict)
+                if include_final
+                else None
+            )
+            if strict and (initial is not None or final is not None) and not fluid:
+                raise ValueError(f"{label} fluid is required when saving bottle weights.")
+            payload[side] = {
+                "fluid": fluid,
+                "initial_weight_g": initial,
+                "final_weight_g": final,
+            }
+        return payload
+
+    def _clear_bottle_final_fields(self) -> None:
+        self.left_final_weight_edit.clear()
+        self.right_final_weight_edit.clear()
+
+    def _set_bottle_status(self, text: str) -> None:
+        self.bottle_status_label.setText(text)
+
+    @QtCore.Slot()
+    def _on_save_bottles(self) -> None:
+        try:
+            payload = self._collect_bottle_payload(include_final=True, strict=True)
+        except ValueError as exc:
+            message = str(exc)
+            self._set_bottle_status(message)
+            QtWidgets.QMessageBox.warning(self, "Bottle Weight", message)
+            return
+
+        run_dir = self.backend.state.run_dir
+        if run_dir is None:
+            self._set_bottle_status("Bottle info pending for next run.")
+            self._emit_log("[BOTTLES] no active run; values will be saved when the next run starts")
+            return
+
+        try:
+            summary = self.backend.save_bottle_measurements(payload, run_dir=run_dir)
+        except Exception as exc:
+            self._set_bottle_status("Bottle save failed.")
+            self._emit_log(f"[BOTTLES] save failed: {exc}")
+            return
+
+        state = "complete" if summary.get("complete") else "saved; missing one or more weights"
+        self._set_bottle_status(f"Bottle info {state}.")
 
     def _reload_profiles(self) -> None:
         self._experiments = self._profile_store.list_experiments()
@@ -864,6 +1018,7 @@ class MainWindow(QtWidgets.QMainWindow):
             draw_skeleton=data.get("draw_skeleton", False),
             task_cfg=task_cfg,
         )
+        cfg.bottles = self._collect_bottle_payload(include_final=False, strict=False)
         cfg.preview_window_id = self._preview_window_id
         return cfg
 
@@ -1005,6 +1160,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.backend.start_run(config):
             self._emit_log("[GUI] Failed to start run")
             return
+        self._clear_bottle_final_fields()
+        if self.backend.state.run_dir is not None:
+            self._set_bottle_status("Initial bottle info saved with current run.")
         self.dashboard.clear_jam_alert()
         self.preview.show_hint(False)
         self.preview.set_status("Live", color="#5c6df5")
@@ -1047,99 +1205,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.configure_btn.setEnabled(True)
-        self._prompt_upload_latest_run()
-
-    def _prompt_upload_latest_run(self) -> None:
         run_dir = self.backend.state.run_dir
-        if run_dir is None or not Path(run_dir).exists():
-            self._emit_log("[UPLOAD] no run directory found; skipping upload prompt")
-            return
-        if self._upload_in_progress:
-            self._emit_log("[UPLOAD] upload already in progress; skipping prompt")
-            return
-
-        msg_box = QtWidgets.QMessageBox(self)
-        msg_box.setWindowTitle("Upload to Google Drive?")
-        msg_box.setIcon(QtWidgets.QMessageBox.Icon.Question)
-        msg_box.setText(
-            "Run completed.\n\n"
-            "Upload a copy of this run to Google Drive now?\n"
-            "(Video files .mp4/.svo/.svo2 will be excluded.)"
-        )
-        msg_box.setStandardButtons(
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
-        )
-        msg_box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
-        msg_box.setStyleSheet(
-            """
-            QMessageBox {
-                background-color: #171821;
-                color: #e8ebf4;
-            }
-            QMessageBox QLabel {
-                color: #e8ebf4;
-            }
-            QMessageBox QPushButton {
-                background-color: #4a70d6;
-                color: #ffffff;
-                padding: 6px 14px;
-                border-radius: 4px;
-                font-weight: 600;
-            }
-            QMessageBox QPushButton:hover {
-                background-color: #3e64c4;
-            }
-            """
-        )
-        answer = msg_box.exec()
-        if answer != int(QtWidgets.QMessageBox.StandardButton.Yes):
-            self._emit_log("[UPLOAD] skipped by user")
-            return
-        self._start_drive_upload(Path(run_dir))
-
-    def _start_drive_upload(self, run_dir: Path) -> None:
-        if self._upload_in_progress:
-            return
-        self._upload_in_progress = True
-
-        dest = f"gdrive:SqueakViewUploads/{run_dir.name}"
-        cmd = [
-            "rclone",
-            "copy",
-            str(run_dir),
-            dest,
-            "--exclude",
-            "*.mp4",
-            "--exclude",
-            "*.svo",
-            "--exclude",
-            "*.svo2",
-            "--progress",
-        ]
-        self._emit_log(f"[UPLOAD] starting: {run_dir} -> {dest}")
-
-        def _worker() -> None:
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if result.returncode == 0:
-                    self._emit_log(f"[UPLOAD] complete: {dest}")
-                else:
-                    err = (result.stderr or result.stdout or "").strip()
-                    if len(err) > 500:
-                        err = err[-500:]
-                    self._emit_log(f"[UPLOAD] failed (rc={result.returncode}): {err}")
-            except Exception as exc:
-                self._emit_log(f"[UPLOAD] error: {exc}")
-            finally:
-                self._upload_in_progress = False
-
-        self._upload_thread = threading.Thread(target=_worker, daemon=True)
-        self._upload_thread.start()
+        if run_dir is not None:
+            self._emit_log(f"[SAVE] local run finalized: {run_dir}")
+            self._set_bottle_status("Run finalized; final weights can be saved.")
 
     @QtCore.Slot(str)
     def _on_stop_failed(self, err: str) -> None:

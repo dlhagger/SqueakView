@@ -5,7 +5,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-_WORKSPACE_PATH_ANCHORS = ("models", "tasks", "profiles", "native", "scripts", "build_engine", "data_viz")
+_WORKSPACE_PATH_ANCHORS = (
+    "models",
+    "tasks",
+    "profiles",
+    "native",
+    "scripts",
+    "build_engine",
+    "data_viz",
+    "build_me",
+    "runs",
+)
 
 
 def _resolve_workspace() -> Path:
@@ -83,9 +93,10 @@ def workspace_path(*parts: str) -> Path:
 def resolve_workspace_path(value: str | os.PathLike[str] | None, *, base: Path | None = None) -> Path | None:
     """Resolve app-owned paths independent of launch cwd or clone location.
 
-    Relative paths are interpreted from the repo root. Absolute paths are kept
-    unless they no longer exist and contain a known repo-owned anchor such as
-    ``models`` or ``tasks``; that lets old profile JSON survive a repo move.
+    Relative paths are interpreted from the repo root. Absolute paths that
+    contain a known repo-owned anchor such as ``models`` or ``tasks`` are
+    remapped to the current clone when the same anchored path exists here; that
+    lets old profile JSON survive a repo move even if the old clone still exists.
     """
     if value is None:
         return None
@@ -95,15 +106,19 @@ def resolve_workspace_path(value: str | os.PathLike[str] | None, *, base: Path |
     path = Path(text).expanduser()
     if not path.is_absolute():
         return ((base or WORKSPACE) / path).resolve()
-    if path.exists():
-        return path.resolve()
     parts = path.parts
     for anchor in _WORKSPACE_PATH_ANCHORS:
         if anchor not in parts:
             continue
         idx = parts.index(anchor)
         candidate = WORKSPACE.joinpath(*parts[idx:])
+        if candidate.exists():
+            return candidate.resolve()
+        if path.exists():
+            return path.resolve()
         return candidate.resolve()
+    if path.exists():
+        return path.resolve()
     return path
 
 

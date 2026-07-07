@@ -4,9 +4,9 @@
     "bitrate": 4000,
     "capture_backend": "flir_direct",
     "draw_skeleton": false,
-    "ds_cfg": "models/stock_yolo26n_pose_fp16/configs/stock_yolo26n_pose_fp16.txt",
+    "ds_cfg": "models/mousehouse_best_yolo26_pose_fp16/configs/mousehouse_best_yolo26_pose_fp16.txt",
     "experiment_mode": "existing",
-    "experiment_name": "test",
+    "experiment_name": "test_new",
     "exposure_us": 10000,
     "fps": 30,
     "height": 1080,
@@ -21,9 +21,7 @@
     "trigger_on": false,
     "width": 1440
   },
-  "name": "test",
-  "slug": "test",
-  "subject_ids": [
-    "test"
-  ]
+  "name": "test_new",
+  "slug": "test_new",
+  "subject_ids": []
 }

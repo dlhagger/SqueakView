@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from squeakview import config as squeakview_config
+
 from . import runner
 
 
@@ -30,8 +32,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    cfg_path = squeakview_config.resolve_workspace_path(args.cfg) if args.cfg else None
     config = runner.InferenceConfig(
-        cfg_path=args.cfg,
+        cfg_path=cfg_path,
         capture_backend=args.capture_backend,
         num_cameras=max(1, int(args.num_cameras)),
         pixel_format=str(args.pixel_format),

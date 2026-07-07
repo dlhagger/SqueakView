@@ -128,7 +128,13 @@ export LD_LIBRARY_PATH="$DEEPSTREAM_SDK/lib:${LD_LIBRARY_PATH:-}"
 export GST_PLUGIN_PATH="$FLIR_PLUGIN_DIR:$DEEPSTREAM_SDK/lib/gst-plugins:${GST_PLUGIN_PATH:-}"
 
 check command -v gst-inspect-1.0
-for element in nvstreammux nvinfer nvvideoconvert nveglglessink videoconvert x264enc splitmuxsink h264parse; do
+required_elements="nvstreammux nvinfer nvvideoconvert nveglglessink videoconvert x264enc h264parse mp4mux filesink"
+case "${SQUEAKVIEW_ENABLE_CHUNKED_RECORDING:-0}" in
+  1|true|TRUE|yes|YES|on|ON)
+    required_elements="$required_elements splitmuxsink"
+    ;;
+esac
+for element in $required_elements; do
   if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
     pass "GStreamer element '$element' is available"
   else

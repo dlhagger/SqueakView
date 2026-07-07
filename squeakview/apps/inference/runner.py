@@ -9,6 +9,7 @@ import json
 import math
 import os
 import signal
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -55,6 +56,13 @@ def _maybe_enable_debug_logging() -> None:
 
 def ts() -> str:
     return time.strftime("%H:%M:%S")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _read_rss_kb() -> int:
@@ -166,6 +174,9 @@ class FrameManifestWriter:
                 "host_unix_ns",
                 "record_segment_index",
                 "record_segment_file",
+                "segment_local_frame_index",
+                "segment_start_raw_frame_index",
+                "segment_mapping_source",
                 "status",
             ]
         )
@@ -300,7 +311,9 @@ class App:
         self.artifacts = run_context.run_artifacts(self.run_dir)
         self.capture_backend = str(getattr(config, "capture_backend", "flir_direct") or "flir_direct").lower().strip()
         self.requested_cam_count = max(1, int(getattr(config, "num_cameras", 1)))
+        self._chunked_recording = _env_flag("SQUEAKVIEW_ENABLE_CHUNKED_RECORDING", False)
         self._extra_raw_videos: list[Path] = []
+        self._raw_record_files: dict[int, Path] = {0: self.artifacts.raw_video}
         self._raw_segment_patterns: dict[int, Path] = {0: self.artifacts.raw_video_pattern}
         try:
             segment_seconds = int(os.environ.get("SQUEAKVIEW_RECORD_SEGMENT_SECONDS", "600"))
@@ -341,13 +354,15 @@ class App:
                             kp_label_path = None
                 # keypoint labels: prefer explicit pose-kpt-labels-path, fallback to labelfile-path
                 if label_path:
-                    lp = Path(label_path)
+                    lp = self._resolve_config_relative_path(label_path, config.cfg_path)
                     if lp.exists():
                         self.class_names = [ln.strip() for ln in lp.read_text().splitlines() if ln.strip()]
                 kp_label_path = pose_cfg.get("keypoint_labels_path") or kp_label_path
                 kp_label_path = kp_label_path or label_path
                 if kp_label_path:
-                    self.kp_names = self._load_pose_labels(Path(kp_label_path))
+                    self.kp_names = self._load_pose_labels(
+                        self._resolve_config_relative_path(kp_label_path, config.cfg_path)
+                    )
             except Exception as exc:
                 print(f"[{ts()}] [POSE] unable to load keypoint labels: {exc}")
         # Skeleton toggle via file
@@ -384,8 +399,33 @@ class App:
         self._stream_fps: float = float("nan")
         self._stream_frame_seq: dict[int, int] = {}
         self._source_frame_seq: dict[int, int] = {}
+        self._segment_frame_seq: dict[tuple[int, int], int] = {}
+        self._segment_start_raw_frame: dict[tuple[int, int], int] = {}
         self._frame_id_by_pts: dict[tuple[int, int], int] = {}
+        self._raw_frame_index_by_pts: dict[tuple[int, int], int] = {}
         self._frame_pts_order: deque[tuple[int, int]] = deque()
+        self.video_segments_path = self.run_dir / "video_segments.csv"
+        self._video_segments_file = None
+        self._video_segments_writer: csv.writer | None = None
+        self._video_segments_lock = threading.Lock()
+        if self._chunked_recording:
+            self._video_segments_file = self.video_segments_path.open("w", newline="", buffering=1)
+            self._video_segments_writer = csv.writer(self._video_segments_file)
+            self._video_segments_writer.writerow(
+                [
+                    "segment_index",
+                    "stream_id",
+                    "source",
+                    "file",
+                    "first_pts_ns",
+                    "first_raw_frame_index",
+                    "first_camera_frame_id",
+                    "host_unix_ns",
+                    "host_monotonic_ns",
+                    "mapping_source",
+                ]
+            )
+            self._video_segments_file.flush()
         self._detection_mapping_warnings: set[tuple[int, int]] = set()
         self._raw_frame_offsets = self._load_raw_frame_offsets()
         self._single_cam_aligned_raw = False
@@ -495,6 +535,12 @@ class App:
         if path.is_absolute():
             return path
         return (base_dir / path).resolve()
+
+    @classmethod
+    def _resolve_config_relative_path(cls, raw_path: object, cfg_path: Path | None) -> Path:
+        if cfg_path is None:
+            return Path(str(raw_path)).expanduser()
+        return cls._resolve_metadata_path(raw_path, Path(cfg_path).parent)
 
     @classmethod
     def _load_pose_sidecar(cls, cfg_path: Path | None) -> dict[str, object]:
@@ -659,10 +705,24 @@ class App:
 
         for idx in range(cam_count):
             tee_name = f"T{idx}"
+            raw_path = self.artifacts.raw_video if idx == 0 else (self.run_dir / f"raw_cam{idx}.mp4")
             raw_pattern = self.artifacts.raw_video_pattern if idx == 0 else (self.run_dir / f"raw_cam{idx}_%06d.mp4")
+            self._raw_record_files[idx] = raw_path
             self._raw_segment_patterns[idx] = raw_pattern
             if idx > 0:
-                self._extra_raw_videos.append(raw_pattern)
+                self._extra_raw_videos.append(raw_pattern if self._chunked_recording else raw_path)
+
+            if self._chunked_recording:
+                record_sink = f"""
+                   splitmuxsink name=raw_split{idx} location=\"{raw_pattern}\"
+                     muxer-factory=mp4mux max-size-time={self._record_segment_ns}
+                     send-keyframe-requests=true async-finalize=true
+                """.rstrip()
+            else:
+                record_sink = f"""
+                   mp4mux !
+                   filesink name=raw_file{idx} location=\"{raw_path}\"
+                """.rstrip()
 
             source_head = f"""
             flirspinsrc name=flirsrc{idx} camera-index={idx} width={cfg.width} height={cfg.height}
@@ -683,9 +743,7 @@ class App:
                    video/x-raw,format=I420,width={cfg.width},height={cfg.height} !
                    x264enc tune=zerolatency speed-preset=ultrafast bitrate={cfg.bitrate} key-int-max={cfg.fps} !
                    h264parse !
-                   splitmuxsink name=raw_split{idx} location=\"{raw_pattern}\"
-                     muxer-factory=mp4mux max-size-time={self._record_segment_ns}
-                     send-keyframe-requests=true async-finalize=true
+{record_sink}
 
               {tee_name}. ! queue name=q_infer{idx} max-size-buffers=5 max-size-bytes=0 max-size-time=0 leaky=downstream !
                    nvvideoconvert compute-hw=1 copy-hw=2 !
@@ -697,7 +755,8 @@ class App:
         print(
             f"[{ts()}] [INFO] FLIR direct source: cams={cam_count} "
             f"{cfg.width}x{cfg.height}@{cfg.fps} pixel-format={plugin_pix} "
-            f"trigger={'on' if cfg.trigger_on else 'off'}",
+            f"trigger={'on' if cfg.trigger_on else 'off'} "
+            f"recording={'chunked' if self._chunked_recording else 'single-file'}",
             flush=True,
         )
         return "\n\n".join(source_blocks)
@@ -774,6 +833,16 @@ class App:
         """
         print(f"[{ts()}] [INFO] building pipeline…")
         self.pipeline = Gst.parse_launch(launch)
+        if self._chunked_recording:
+            for idx in range(cam_count):
+                split = self.pipeline.get_by_name(f"raw_split{idx}")
+                if split is None:
+                    print(f"[{ts()}] [WARN] raw_split{idx} missing; video_segments.csv will be incomplete")
+                    continue
+                try:
+                    split.connect("format-location-full", self._on_splitmux_format_location_full, idx)
+                except Exception as exc:
+                    print(f"[{ts()}] [WARN] splitmux segment logging unavailable for cam{idx}: {exc}")
         for idx in range(cam_count):
             tap = self.pipeline.get_by_name(f"frame_tap{idx}")
             if tap:
@@ -933,15 +1002,93 @@ class App:
         except Exception:
             return segment_index, pattern_text
 
-    def _remember_frame_pts(self, stream_id: int, pts_ns: int, frame_id: int) -> None:
+    def _recording_segment_for_frame(
+        self,
+        stream_id: int,
+        raw_frame_index: int,
+        pts_ns: int | str,
+    ) -> tuple[int | str, str, int | str, int | str, str]:
+        if not self._chunked_recording:
+            path = self._raw_record_files.get(stream_id, self.artifacts.raw_video)
+            return 0, str(path), raw_frame_index, 0, "single_file"
+
+        segment_index, segment_file = self._segment_file_for_pts(stream_id, int(pts_ns) if pts_ns != "" else -1)
+        segment_local_frame_index: int | str = ""
+        segment_start_raw_frame_index: int | str = ""
+        if isinstance(segment_index, int):
+            segment_key = (stream_id, segment_index)
+            segment_local_frame_index = self._segment_frame_seq.get(segment_key, 0)
+            self._segment_frame_seq[segment_key] = int(segment_local_frame_index) + 1
+            segment_start_raw_frame_index = self._segment_start_raw_frame.setdefault(segment_key, raw_frame_index)
+        return (
+            segment_index,
+            segment_file,
+            segment_local_frame_index,
+            segment_start_raw_frame_index,
+            "estimated_runtime_pts",
+        )
+
+    def _remember_frame_pts(self, stream_id: int, pts_ns: int, raw_frame_index: int, frame_id: int) -> None:
         if not self._valid_clock_time(pts_ns):
             return
         key = (int(stream_id), int(pts_ns))
         self._frame_id_by_pts[key] = int(frame_id)
+        self._raw_frame_index_by_pts[key] = int(raw_frame_index)
         self._frame_pts_order.append(key)
         while len(self._frame_pts_order) > 20000:
             old = self._frame_pts_order.popleft()
             self._frame_id_by_pts.pop(old, None)
+            self._raw_frame_index_by_pts.pop(old, None)
+
+    def _on_splitmux_format_location_full(self, _splitmux, fragment_id: int, sample, stream_id: int) -> str:
+        stream_id = int(stream_id)
+        segment_index = int(fragment_id)
+        pattern = self._raw_segment_patterns.get(stream_id, self.artifacts.raw_video_pattern)
+        try:
+            segment_file = str(pattern) % segment_index
+        except Exception:
+            segment_file = str(pattern)
+
+        pts_ns: int | str = ""
+        raw_frame_index: int | str = ""
+        camera_frame_id: int | str = ""
+        mapping_source = "splitmux_format_location_full_unmapped"
+        try:
+            buf = sample.get_buffer() if sample is not None else None
+            if buf is not None and self._valid_clock_time(buf.pts):
+                pts_ns = int(buf.pts)
+                key = (stream_id, int(pts_ns))
+                raw = self._raw_frame_index_by_pts.get(key)
+                camera = self._frame_id_by_pts.get(key)
+                if raw is not None and camera is not None:
+                    raw_frame_index = raw
+                    camera_frame_id = camera
+                    mapping_source = "splitmux_format_location_full_pts"
+        except Exception:
+            pass
+
+        if self._video_segments_writer is not None:
+            with self._video_segments_lock:
+                try:
+                    self._video_segments_writer.writerow(
+                        [
+                            segment_index,
+                            stream_id,
+                            f"cam{stream_id}",
+                            segment_file,
+                            pts_ns,
+                            raw_frame_index,
+                            camera_frame_id,
+                            time.time_ns(),
+                            time.monotonic_ns(),
+                            mapping_source,
+                        ]
+                    )
+                    if self._video_segments_file is not None:
+                        self._video_segments_file.flush()
+                except Exception as exc:
+                    print(f"[{ts()}] [WARN] video segment ledger write failed: {exc}", flush=True)
+        return segment_file
 
     def _on_source_frame_tap(self, _pad, info, stream_id: int) -> Gst.PadProbeReturn:
         buf = info.get_buffer()
@@ -956,7 +1103,13 @@ class App:
         dts_ns = int(buf.dts) if self._valid_clock_time(buf.dts) else ""
         duration_ns = int(buf.duration) if self._valid_clock_time(buf.duration) else ""
         camera_frame_id = int(buf.offset) if self._valid_offset(buf.offset) else raw_frame_index
-        segment_index, segment_file = self._segment_file_for_pts(stream_id, int(pts_ns) if pts_ns != "" else -1)
+        (
+            segment_index,
+            segment_file,
+            segment_local_frame_index,
+            segment_start_raw_frame_index,
+            segment_mapping_source,
+        ) = self._recording_segment_for_frame(stream_id, raw_frame_index, pts_ns)
 
         status = "ok"
         last_frame_id = self.frame_manifest.last_frame_id(stream_id)
@@ -976,7 +1129,7 @@ class App:
             )
         self.frame_manifest.set_last_frame_id(stream_id, camera_frame_id)
         if pts_ns != "":
-            self._remember_frame_pts(stream_id, int(pts_ns), camera_frame_id)
+            self._remember_frame_pts(stream_id, int(pts_ns), raw_frame_index, camera_frame_id)
 
         self.frame_manifest.row(
             [
@@ -991,6 +1144,9 @@ class App:
                 time.time_ns(),
                 segment_index,
                 segment_file,
+                segment_local_frame_index,
+                segment_start_raw_frame_index,
+                segment_mapping_source,
                 status,
             ]
         )
@@ -1055,7 +1211,7 @@ class App:
                     continue
                 if line.startswith("custom-lib-path"):
                     value = line.split("=", 1)[1].strip().strip('"')
-                    lib_path = Path(value)
+                    lib_path = self._resolve_config_relative_path(value, cfg_path)
                     break
         except Exception as exc:
             print(f"[{ts()}] [POSE] unable to read {cfg_path}: {exc}")
@@ -1594,6 +1750,25 @@ class App:
         if self.csv:
             print(f"[{ts()}] [INFO] closing CSV: {self.csv.path}")
             self.csv.close()
+        if getattr(self, "frame_manifest", None):
+            try:
+                print(f"[{ts()}] [INFO] closing CSV: {self.frame_manifest.path}")
+                self.frame_manifest.close()
+            except Exception:
+                pass
+        if getattr(self, "drop_events", None):
+            try:
+                print(f"[{ts()}] [INFO] closing CSV: {self.drop_events.path}")
+                self.drop_events.close()
+            except Exception:
+                pass
+        if getattr(self, "_video_segments_file", None):
+            try:
+                self._video_segments_file.flush()
+                self._video_segments_file.close()
+                print(f"[{ts()}] [INFO] video segments: {self.video_segments_path}")
+            except Exception:
+                pass
         if getattr(self, '_perf_file', None):
             try:
                 self._perf_file.flush()
@@ -1606,7 +1781,10 @@ class App:
         except Exception:
             pass
         print(f"[{ts()}] [INFO] done. Files in: {self.run_dir}")
-        print(f"[{ts()}] [INFO]   raw:        {self.artifacts.raw_video_pattern}")
+        print(
+            f"[{ts()}] [INFO]   raw:        "
+            f"{self.artifacts.raw_video_pattern if self._chunked_recording else self.artifacts.raw_video}"
+        )
         for path in self._extra_raw_videos:
             print(f"[{ts()}] [INFO]   raw extra:  {path}")
         print(f"[{ts()}] [INFO]   frames:     {self.artifacts.frames_csv}")

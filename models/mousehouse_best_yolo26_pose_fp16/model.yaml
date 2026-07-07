@@ -48,8 +48,8 @@ files:
   keypoint_labels: models/mousehouse_best_yolo26_pose_fp16/labels/labels.txt
   import_report: models/mousehouse_best_yolo26_pose_fp16/validation/import_report.json
 source:
-  model: /home/jetson/Desktop/SqueakView/build_me/mousehouse_model/mousehouse_best.pt
-  data_yaml: /home/jetson/Desktop/SqueakView/build_me/mousehouse_model/mousehouse_best.yaml
+  model: build_me/mousehouse_model/mousehouse_best.pt
+  data_yaml: build_me/mousehouse_model/mousehouse_best.yaml
 thresholds:
   confidence: 0.9
   nms_iou: 0.15
