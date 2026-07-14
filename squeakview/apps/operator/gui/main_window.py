@@ -21,8 +21,37 @@ from squeakview.apps.operator.gui.config_dialog import (
 from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
 from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile
 from squeakview import config as squeakview_config
+from squeakview import model_package
 
 BOTTLE_FLUID_PRESETS = ["", "water", "sucrose", "quinine", "ethanol", "saline", "custom"]
+RUN_FAILURE_DIALOG_STYLESHEET = """
+    QMessageBox {
+        background-color: #171821;
+    }
+    QMessageBox QLabel {
+        color: #eef1ff;
+        background-color: transparent;
+        font-size: 13px;
+    }
+    QMessageBox QLabel#qt_msgbox_label,
+    QMessageBox QLabel#qt_msgbox_informativelabel {
+        min-width: 520px;
+        max-width: 560px;
+    }
+    QMessageBox QPushButton {
+        min-width: 84px;
+        min-height: 30px;
+        padding: 4px 14px;
+        color: #ffffff;
+        background-color: #4f5ed7;
+        border: 1px solid #7180ff;
+        border-radius: 5px;
+        font-weight: 700;
+    }
+    QMessageBox QPushButton:hover {
+        background-color: #5c6df5;
+    }
+"""
 
 
 class PreviewWidget(QtWidgets.QWidget):
@@ -187,6 +216,8 @@ class MainWindow(QtWidgets.QMainWindow):
     log_msg = QtCore.Signal(str)
     stop_done = QtCore.Signal()
     stop_failed = QtCore.Signal(str)
+    run_started = QtCore.Signal()
+    run_failed = QtCore.Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -206,8 +237,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._centered_once = False
         self.stop_done.connect(self._on_stop_complete)
         self.stop_failed.connect(self._on_stop_failed)
+        self.run_started.connect(self._on_backend_run_started)
+        self.run_failed.connect(self._on_backend_run_failed)
 
-        self.backend = OperatorBackend(self._emit_log, self._forward_dashboard)
+        self.backend = OperatorBackend(
+            self._emit_log,
+            self._forward_dashboard,
+            on_run_started=self.run_started.emit,
+            on_run_failed=self.run_failed.emit,
+        )
 
         self._build_ui()
         self._apply_brand_theme()
@@ -941,10 +979,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if data.get("mouse_id"):
             session_bits.append(f"Subject {data['mouse_id']}")
         session_text = " / ".join(session_bits) if session_bits else "No session profile"
+        model_name = "Inference off"
+        if ds_cfg is not None:
+            try:
+                model_name = model_package.validate_model_package(ds_cfg).name
+            except model_package.ModelPackageError:
+                model_name = f"Invalid: {ds_cfg.name}"
         rows = [
             ("Camera", f"{data['width']}×{data['height']} @ {data['fps']} FPS · {data['pixel_format']} · {data.get('num_cameras', 1)} cam"),
             ("Run", f"Trigger {'On' if data['trigger_on'] else 'Off'} · Inference {'On' if inference_on else 'Off'}"),
-            ("Model", ds_cfg.name if ds_cfg else "Inference off"),
+            ("Model", model_name),
             ("Task", task_cfg.name if task_cfg else "N/A"),
             ("Serial", serial_text),
             ("Session", session_text),
@@ -1065,6 +1109,8 @@ class MainWindow(QtWidgets.QMainWindow):
             else "flir_direct"
         )
         env["CAPTURE_BACKEND"] = backend
+        inference_enabled = bool(self._config_data.get("inference_enabled", True)) if self._config_data else True
+        env["INFERENCE_ENABLED"] = "1" if inference_enabled else "0"
         if self._config_data and self._config_data.get("ds_cfg"):
             ds_cfg = squeakview_config.resolve_workspace_path(self._config_data["ds_cfg"])
             if ds_cfg is not None:
@@ -1165,12 +1211,44 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_bottle_status("Initial bottle info saved with current run.")
         self.dashboard.clear_jam_alert()
         self.preview.show_hint(False)
-        self.preview.set_status("Live", color="#5c6df5")
+        self.preview.set_status("Starting")
         self.preview.set_preview_enabled(True)
-        self._emit_log("[GUI] Run started")
+        self._emit_log("[GUI] Run is waiting for inference readiness")
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.configure_btn.setEnabled(False)
+
+    @QtCore.Slot()
+    def _on_backend_run_started(self) -> None:
+        self.preview.show_hint(False)
+        self.preview.set_status("Live", color="#5c6df5")
+        self._emit_log("[GUI] Run started")
+
+    @QtCore.Slot(str)
+    def _on_backend_run_failed(self, error: str) -> None:
+        self._stop_in_progress = False
+        self._hide_stop_overlay()
+        self.preview.show_hint(True)
+        self.preview.set_status("Failed")
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.configure_btn.setEnabled(True)
+        self._emit_log(f"[GUI] Run failed: {error}")
+        self._set_bottle_status("Run failed; inspect the log and run status before retrying.")
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Icon.Critical)
+        dialog.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        dialog.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        dialog.setStyleSheet(RUN_FAILURE_DIALOG_STYLESHEET)
+        if error.startswith("Could not open serial port"):
+            dialog.setWindowTitle("Serial Port Unavailable")
+            dialog.setText("SqueakView could not connect to the experiment controller.")
+        else:
+            dialog.setWindowTitle("Run Failed")
+            dialog.setText("SqueakView could not start or continue the run.")
+        dialog.setInformativeText(error)
+        dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+        dialog.exec()
 
     def _on_stop(self) -> None:
         if self._stop_in_progress:

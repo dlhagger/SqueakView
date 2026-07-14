@@ -6,8 +6,11 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 CAPTURE_BACKEND="${CAPTURE_BACKEND:-flir_direct}"
 DEEPSTREAM_SDK="${SQUEAKVIEW_DEEPSTREAM_SDK:-/opt/nvidia/deepstream/deepstream}"
 FLIR_PLUGIN_DIR="$ROOT/native/flir_gst_source/build"
-DEFAULT_MODEL_DIR="$ROOT/models/yolo26s_dino_10kpts_fp16"
-CFG="${DS_CFG:-${SQUEAKVIEW_DS_CFG:-$DEFAULT_MODEL_DIR/configs/yolo26s_dino_10kpts_fp16.txt}}"
+INFERENCE_ENABLED="${INFERENCE_ENABLED:-1}"
+CFG="${DS_CFG:-${SQUEAKVIEW_DS_CFG:-}}"
+if [ -z "$CFG" ] && [ -n "${SQUEAKVIEW_MODEL_NAME:-}" ]; then
+  CFG="models/${SQUEAKVIEW_MODEL_NAME}/configs/${SQUEAKVIEW_MODEL_NAME}.txt"
+fi
 
 resolve_repo_path() {
   local raw="$1"
@@ -34,17 +37,33 @@ resolve_repo_path() {
   esac
 }
 
-CFG="$(resolve_repo_path "$CFG")"
-if [ ! -f "$CFG" ] && [ -d "$ROOT/models" ]; then
-  FIRST_CFG="$(find "$ROOT/models" -path '*/configs/*.txt' -type f | sort | head -n 1 || true)"
-  if [ -n "$FIRST_CFG" ]; then
-    CFG="$FIRST_CFG"
-  fi
+case "$INFERENCE_ENABLED" in
+  0|false|FALSE|no|NO|off|OFF) INFERENCE_ENABLED=0 ;;
+  *) INFERENCE_ENABLED=1 ;;
+esac
+
+if [ "$INFERENCE_ENABLED" -eq 1 ] && [ -z "$CFG" ]; then
+  printf '[FAIL] Inference is enabled but no model was selected.\n'
+  printf '       Set DS_CFG=models/<model_name>/configs/<model_name>.txt\n'
+  printf '       or set SQUEAKVIEW_MODEL_NAME=<model_name>.\n'
+  exit 1
 fi
-CFG_DIR="$(cd "$(dirname "$CFG")" 2>/dev/null && pwd)"
-CFG_STEM="$(basename "$CFG" .txt)"
-MODEL_DIR="$(cd "$CFG_DIR/.." 2>/dev/null && pwd)"
-POSE_META="$CFG_DIR/$CFG_STEM.pose.json"
+
+CFG="$(resolve_repo_path "$CFG")"
+CFG_DIR=""
+CFG_STEM=""
+MODEL_DIR=""
+POSE_META=""
+ENGINE=""
+PARSER=""
+CLASS_LABELS=""
+KEYPOINT_LABELS=""
+if [ "$INFERENCE_ENABLED" -eq 1 ]; then
+  CFG_DIR="$(cd "$(dirname "$CFG")" 2>/dev/null && pwd)"
+  CFG_STEM="$(basename "$CFG" .txt)"
+  MODEL_DIR="$(cd "$CFG_DIR/.." 2>/dev/null && pwd)"
+  POSE_META="$CFG_DIR/$CFG_STEM.pose.json"
+fi
 
 cfg_value() {
   local key="$1"
@@ -69,10 +88,12 @@ resolve_infer_path() {
   esac
 }
 
-ENGINE="$(resolve_infer_path "$(cfg_value model-engine-file)")"
-PARSER="$(resolve_infer_path "$(cfg_value custom-lib-path)")"
-CLASS_LABELS="$(resolve_infer_path "$(cfg_value labelfile-path)")"
-KEYPOINT_LABELS="$MODEL_DIR/labels/labels.txt"
+if [ "$INFERENCE_ENABLED" -eq 1 ]; then
+  ENGINE="$(resolve_infer_path "$(cfg_value model-engine-file)")"
+  PARSER="$(resolve_infer_path "$(cfg_value custom-lib-path)")"
+  CLASS_LABELS="$(resolve_infer_path "$(cfg_value labelfile-path)")"
+  KEYPOINT_LABELS="$MODEL_DIR/labels/labels.txt"
+fi
 
 fail=0
 
@@ -114,7 +135,8 @@ printf '=== SqueakView Preflight ===\n'
 printf 'Python: %s\n' "$PYTHON_BIN"
 printf 'Capture backend: %s\n' "$CAPTURE_BACKEND"
 printf 'DeepStream SDK: %s\n' "$DEEPSTREAM_SDK"
-printf 'DeepStream config: %s\n' "$CFG"
+printf 'Inference enabled: %s\n' "$INFERENCE_ENABLED"
+printf 'DeepStream config: %s\n' "${CFG:-N/A}"
 printf '\n'
 
 if [ -d "$DEEPSTREAM_SDK" ]; then
@@ -153,14 +175,13 @@ if [ "$CAPTURE_BACKEND" = "flir_direct" ]; then
   fi
 fi
 
-for path in "$CFG" "$POSE_META" "$ENGINE" "$PARSER" "$CLASS_LABELS" "$KEYPOINT_LABELS"; do
-  if [ -e "$path" ]; then
-    pass "Found $path"
+if [ "$INFERENCE_ENABLED" -eq 1 ]; then
+  if "$PYTHON_BIN" -m squeakview.model_package --config "$CFG"; then
+    pass "Selected model package validated"
   else
-    printf '[FAIL] Missing %s\n' "$path"
     fail=1
   fi
-done
+fi
 
 check_tegrastats_memory
 

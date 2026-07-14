@@ -130,10 +130,17 @@ def _localize_deepstream_config(config_path: Path, run_dir: Path | None, emit: C
 
 
 class ProcessHandle:
-    def __init__(self, name: str, popen: subprocess.Popen[str], emit_fn: Callable[[str], None]):
+    def __init__(
+        self,
+        name: str,
+        popen: subprocess.Popen[str],
+        emit_fn: Callable[[str], None],
+        on_exit: Callable[[int], None] | None = None,
+    ):
         self.name = name
         self.p = popen
         self.emit = emit_fn
+        self.on_exit = on_exit
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
 
@@ -148,6 +155,15 @@ class ProcessHandle:
                 self.emit(f"[{_now()}] {self.name} {clean}")
         except Exception as exc:
             self.emit(f"{self.name} output error: {exc}")
+        finally:
+            returncode = self.p.wait()
+            if self.p.stdout is not None:
+                self.p.stdout.close()
+            if self.on_exit is not None:
+                try:
+                    self.on_exit(int(returncode))
+                except Exception as exc:
+                    self.emit(f"{self.name} exit callback error: {exc}")
 
     def is_running(self) -> bool:
         return self.p is not None and self.p.poll() is None
@@ -213,6 +229,7 @@ def _spawn(
     emit: Callable[[str], None],
     name: str,
     extra_env: dict[str, str] | None = None,
+    on_exit: Callable[[int], None] | None = None,
 ) -> ProcessHandle:
     cmd = [sys.executable, "-m", module, *args]
     emit(f"{name} CMD: {' '.join(shlex.quote(c) for c in cmd)}")
@@ -235,10 +252,14 @@ def _spawn(
         preexec_fn=os.setsid,
         env=env,
     )
-    return ProcessHandle(name, proc, emit)
+    return ProcessHandle(name, proc, emit, on_exit=on_exit)
 
 
-def spawn_inference(config: LaunchConfig, emit: Callable[[str], None]) -> ProcessHandle:
+def spawn_inference(
+    config: LaunchConfig,
+    emit: Callable[[str], None],
+    on_exit: Callable[[int], None] | None = None,
+) -> ProcessHandle:
     backend = str(getattr(config, "capture_backend", "flir_direct") or "flir_direct").lower().strip()
     if backend != "flir_direct":
         raise RuntimeError(f"SqueakView only supports capture_backend='flir_direct' (got {backend!r})")
@@ -286,4 +307,4 @@ def spawn_inference(config: LaunchConfig, emit: Callable[[str], None]) -> Proces
             emit(f"【DS】 GST_PLUGIN_PATH includes {plugin_dir}")
         else:
             emit(f"【DS】 WARN: FLIR direct plugin build directory not found: {plugin_dir}")
-    return _spawn(INFERENCE_ENTRY, args, emit, "【DS】", extra_env=extra_env)
+    return _spawn(INFERENCE_ENTRY, args, emit, "【DS】", extra_env=extra_env, on_exit=on_exit)

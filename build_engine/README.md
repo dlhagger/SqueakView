@@ -2,6 +2,10 @@
 
 Notebook-first workflow for importing YOLO26 pose models into `SqueakView`.
 
+Source `.pt` and YAML inputs under `build_me/` are shipped with the repository.
+Generated packages under `models/` are device-local, ignored by Git, and must be
+built on each fresh Jetson before inference can be enabled.
+
 Primary file:
 
 - `build_engine.ipynb`

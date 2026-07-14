@@ -25,9 +25,11 @@ BOTTLE_SUMMARY_FILENAME = "bottle_summary.json"
 
 _STATUS_TIMESTAMP_FIELDS = {
     "created": "created_at",
+    "starting": "starting_at",
     "recording": "started_at",
     "stopping": "stopped_at",
     "finalized": "finalized_at",
+    "failed": "failed_at",
 }
 
 

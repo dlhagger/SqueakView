@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import importlib.util
+import json
 import signal
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from typing import Any, Callable, Optional
 
 from squeakview.apps.operator.backend import process
 from squeakview import config as squeakview_config
+from squeakview import model_package
 from squeakview.common import run_context
 from squeakview.common import serial as serial_util
 
@@ -30,6 +32,22 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _relocate_summary_outputs(
+    summary: dict[str, Any], source_dir: Path, final_dir: Path
+) -> dict[str, Any]:
+    """Update output paths after the temporary analysis directory is renamed."""
+    outputs = summary.get("outputs")
+    if not isinstance(outputs, dict):
+        return summary
+    for key, value in outputs.items():
+        try:
+            relative = Path(str(value)).relative_to(source_dir)
+        except (TypeError, ValueError):
+            continue
+        outputs[key] = str(final_dir / relative)
+    return summary
+
+
 @dataclass(slots=True)
 class RunState:
     inference: Optional[process.ProcessHandle] = None
@@ -41,9 +59,17 @@ class RunState:
 
 
 class OperatorBackend:
-    def __init__(self, emit_log: Callable[[str], None], ingest_dashboard: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        emit_log: Callable[[str], None],
+        ingest_dashboard: Optional[Callable[[str], None]] = None,
+        on_run_started: Callable[[], None] | None = None,
+        on_run_failed: Callable[[str], None] | None = None,
+    ):
         self.emit = emit_log
         self.ingest = ingest_dashboard
+        self.on_run_started = on_run_started
+        self.on_run_failed = on_run_failed
         self.state = RunState()
         self.launch_cfg = process.LaunchConfig()
         self._metadata_written = False
@@ -51,6 +77,11 @@ class OperatorBackend:
         self._run_started_at: str | None = None
         self._run_dir_watch_thread: threading.Thread | None = None
         self._inference_ready = threading.Event()
+        self._stop_requested = threading.Event()
+        self._finalize_lock = threading.Lock()
+        self._run_finalized = True
+        self._recording_started = False
+        self._model_snapshot: dict[str, str] | None = None
 
     def _log(self, message: str) -> None:
         self.emit(f"[{_now()}] {message}")
@@ -68,7 +99,7 @@ class OperatorBackend:
         self.emit(message)
         lower = message.lower()
         if "[ready] inference playing" in lower:
-            self._inference_ready.set()
+            self._mark_inference_ready()
         marker = "run dir:"
         if marker in lower:
             idx = lower.index(marker) + len(marker)
@@ -81,6 +112,47 @@ class OperatorBackend:
                 self._ensure_metadata(run_path)
         else:
             self._maybe_set_run_dir_from_marker()
+
+    def _mark_inference_ready(self) -> None:
+        if self._recording_started or self._run_finalized or self._stop_requested.is_set():
+            return
+        self._recording_started = True
+        run_dir = self.state.run_dir
+        if run_dir is not None:
+            try:
+                run_context.write_status(run_dir, "recording")
+                self._write_run_manifest(run_dir)
+            except Exception as exc:
+                self._log(f"[SAVE] failed to mark run recording: {exc}")
+        self._inference_ready.set()
+        self._log("[BACKEND] inference ready; run is recording")
+        if self.on_run_started is not None:
+            try:
+                self.on_run_started()
+            except Exception as exc:
+                self._log(f"[BACKEND] run-start callback failed: {exc}")
+
+    def _on_inference_exit(self, returncode: int) -> None:
+        if self._stop_requested.is_set() or self._run_finalized:
+            return
+        phase = "after readiness" if self._inference_ready.is_set() else "before readiness"
+        error = f"inference process exited unexpectedly {phase} (exit code {returncode})"
+        self._log(f"[DS] {error}")
+        self._finalize_run(final_state="failed", error=error, terminate_inference=False)
+
+    @staticmethod
+    def _serial_open_failure_message(handle: serial_util.SerialHandle, port: str, baud: int) -> str:
+        detail = str(getattr(handle, "last_error", "") or "unknown serial error").strip()
+        message = f"Could not open serial port {port} at {baud} baud.\n\nSystem error: {detail}"
+        permission_terms = ("permission denied", "access denied", "operation not permitted")
+        if any(term in detail.lower() for term in permission_terms):
+            message += (
+                "\n\nSerial access was denied. Run `sudo usermod -aG dialout $USER`, then "
+                "sign out and back in (or reboot) before retrying."
+            )
+        elif "no such file" in detail.lower() or "cannot find" in detail.lower():
+            message += "\n\nCheck that the controller is connected and that the selected serial port is correct."
+        return message
 
     def _maybe_set_run_dir_from_marker(self) -> Path | None:
         existing = self.state.run_dir
@@ -250,6 +322,7 @@ class OperatorBackend:
             "inference": {
                 "enabled": cfg.inference_enabled,
                 "deepstream_config": (str(cfg.ds_cfg) if cfg.ds_cfg else None),
+                "model_package": self._model_snapshot,
                 "bitrate_kbps": cfg.bitrate,
                 "preview_window_id": cfg.preview_window_id,
             },
@@ -349,6 +422,7 @@ class OperatorBackend:
             "inference": {
                 "enabled": cfg.inference_enabled,
                 "deepstream_config": (str(cfg.ds_cfg) if cfg.ds_cfg else None),
+                "model_package": self._model_snapshot,
                 "bitrate_kbps": cfg.bitrate,
                 "preview_window_id": cfg.preview_window_id,
             },
@@ -442,6 +516,10 @@ class OperatorBackend:
             if final_dir.exists():
                 shutil.rmtree(final_dir)
             tmp_dir.replace(final_dir)
+            summary = _relocate_summary_outputs(summary, tmp_dir, final_dir)
+            (final_dir / "alignment_summary.json").write_text(
+                json.dumps(summary, indent=2, sort_keys=True)
+            )
             counts = summary.get("counts", {})
             validation = summary.get("validation", {})
             self._log(
@@ -468,6 +546,8 @@ class OperatorBackend:
                     warnings.append(f"{key}={value}")
             if validation.get("video_frame_count_matches_frames_csv") is False:
                 warnings.append("video_frame_count_matches_frames_csv=false")
+            elif validation.get("video_frame_count_matches_frames_csv") is None:
+                warnings.append("video_frame_count_matches_frames_csv=unknown")
             if warnings:
                 self._log(f"[ANALYSIS] warnings: {', '.join(warnings)}")
             else:
@@ -488,6 +568,77 @@ class OperatorBackend:
             self._log(f"[ANALYSIS] failed: {exc}")
             return None
 
+    def _finalize_run(
+        self,
+        *,
+        final_state: str,
+        error: str | None = None,
+        terminate_inference: bool = True,
+    ) -> bool:
+        notify_failure = False
+        with self._finalize_lock:
+            if self._run_finalized:
+                return False
+            self._stop_requested.set()
+            run_dir = self.state.run_dir
+            inference = self.state.inference
+            inference_running = bool(inference and inference.is_running())
+
+            if final_state == "finalized":
+                self._log("[BACKEND] stopping run")
+                if run_dir:
+                    try:
+                        run_context.write_status(run_dir, "stopping")
+                    except Exception:
+                        pass
+
+            if terminate_inference and inference_running and inference is not None:
+                if self.state.serial:
+                    self.state.serial.log_marker("CAPTURE_STOP_REQUESTED")
+                inference.terminate_group_graceful(signal.SIGINT, 10.0, True)
+                inference.wait(timeout=2)
+                if self.state.serial:
+                    self.state.serial.log_marker("CAPTURE_STOP_DONE")
+
+            if self.state.serial:
+                try:
+                    self.state.serial.log_marker("STOP_SENT")
+                    self.state.serial.send_line("STOP")
+                except Exception:
+                    pass
+                try:
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+                self.state.serial.close()
+                self.state.serial = None
+
+            self.state.inference = None
+            analysis_summary = self._run_post_run_alignment(run_dir)
+            if run_dir:
+                try:
+                    self._write_run_manifest(run_dir)
+                    updates: dict[str, Any] = {
+                        "analysis_complete": analysis_summary is not None,
+                        "outputs": self._run_output_snapshot(run_dir),
+                    }
+                    if error:
+                        updates["error"] = error
+                    run_context.write_status(run_dir, final_state, **updates)
+                    self._write_run_manifest(run_dir)
+                except Exception as exc:
+                    self._log(f"[SAVE] finalize status failed: {exc}")
+
+            self._run_finalized = True
+            notify_failure = final_state == "failed"
+
+        if notify_failure and self.on_run_failed is not None:
+            try:
+                self.on_run_failed(error or "run failed")
+            except Exception as exc:
+                self._log(f"[BACKEND] run-failure callback failed: {exc}")
+        return True
+
 
     def start_run(self, cfg: process.LaunchConfig) -> bool:
         if self.state.any_running():
@@ -502,6 +653,18 @@ class OperatorBackend:
         if not Path(cfg.task_cfg).exists():
             self._log(f"[BACKEND] task config missing: {cfg.task_cfg}")
             return False
+        self._model_snapshot = None
+        if cfg.inference_enabled:
+            if cfg.ds_cfg is None:
+                self._log("[MODEL] inference is enabled but no model package was selected")
+                return False
+            try:
+                selected_model = model_package.validate_model_package(cfg.ds_cfg)
+            except model_package.ModelPackageError as exc:
+                self._log(f"[MODEL] selected model package is invalid: {exc}")
+                return False
+            self._model_snapshot = selected_model.manifest_snapshot()
+            self._log(f"[MODEL] selected package: {selected_model.name}")
 
         try:
             self._run_storage_info = run_context.assert_runs_dir_ready()
@@ -514,6 +677,8 @@ class OperatorBackend:
         self._metadata_written = False
         self._run_started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
         self._inference_ready.clear()
+        self._stop_requested.clear()
+        self._recording_started = False
 
         self._set_fan_max()
 
@@ -531,6 +696,7 @@ class OperatorBackend:
             return False
         cfg.run_dir = run_dir
         self.state.run_dir = run_dir
+        self._run_finalized = False
         try:
             run_context.write_status(
                 run_dir,
@@ -556,12 +722,13 @@ class OperatorBackend:
             else:
                 handle = serial_util.SerialHandle(cfg.serial_port, cfg.serial_baud, self._serial_emit)
                 if not handle.open(run_dir):
-                    self._log("[SER] failed to open port; aborting run")
-                    try:
-                        run_context.write_status(run_dir, "failed", error="serial open failed")
-                        self._write_run_manifest(run_dir)
-                    except Exception:
-                        pass
+                    error = self._serial_open_failure_message(handle, cfg.serial_port, cfg.serial_baud)
+                    self._log(f"[SER] {error.replace(chr(10), ' ')}")
+                    self._finalize_run(
+                        final_state="failed",
+                        error=error,
+                        terminate_inference=False,
+                    )
                     return False
                 serial_handle = handle
 
@@ -572,91 +739,62 @@ class OperatorBackend:
 
         capture_backend = str(getattr(cfg, "capture_backend", "flir_direct") or "flir_direct").lower().strip()
         if capture_backend != "flir_direct":
-            self._log(f"[CAP] unsupported capture backend in SqueakView: {capture_backend}")
-            if self.state.serial:
-                self.state.serial.close()
-                self.state.serial = None
-            try:
-                run_context.write_status(run_dir, "failed", error=f"unsupported capture backend: {capture_backend}")
-                self._write_run_manifest(run_dir)
-            except Exception:
-                pass
+            error = f"unsupported capture backend: {capture_backend}"
+            self._log(f"[CAP] {error}")
+            self._finalize_run(final_state="failed", error=error, terminate_inference=False)
             return False
 
         self._log("[CAP] FLIR direct capture will be sourced inside DeepStream (flirspinsrc)")
-        self.state.inference = process.spawn_inference(cfg, self._inference_emit)
-        self._log("[DS] inference launched")
         try:
-            run_context.write_status(run_dir, "recording")
+            run_context.write_status(run_dir, "starting")
             self._write_run_manifest(run_dir)
         except Exception:
             pass
+        try:
+            handle = process.spawn_inference(cfg, self._inference_emit, on_exit=self._on_inference_exit)
+            self.state.inference = handle
+        except Exception as exc:
+            error = f"failed to launch inference process: {exc}"
+            self._log(f"[DS] {error}")
+            self._finalize_run(final_state="failed", error=error, terminate_inference=False)
+            return False
+        if self._run_finalized:
+            self.state.inference = None
+            return False
+        self._log("[DS] inference launched")
         if serial_handle and cfg.trigger_on:
+            self._log("[BACKEND] waiting for inference ready before START")
             try:
-                self._log("[BACKEND] waiting for inference ready before START")
-                ready = self._inference_ready.wait(timeout=8.0)
-                if ready:
-                    self._log("[BACKEND] inference ready; sending START")
-                else:
-                    self._log("[BACKEND] inference ready timeout; sending START anyway")
+                ready_timeout = max(1.0, float(os.environ.get("SQUEAKVIEW_INFERENCE_READY_TIMEOUT", "8")))
+            except ValueError:
+                ready_timeout = 8.0
+            ready = self._inference_ready.wait(timeout=ready_timeout)
+            if not ready:
+                error = f"inference was not ready within {ready_timeout:.1f}s; controller was not started"
+                self._log(f"[BACKEND] {error}")
+                self._finalize_run(final_state="failed", error=error)
+                return False
+            if self._run_finalized or not handle.is_running():
+                error = "inference exited before the controller could be started"
+                self._log(f"[BACKEND] {error}")
+                self._finalize_run(final_state="failed", error=error, terminate_inference=False)
+                return False
+            try:
+                self._log("[BACKEND] inference ready; sending START")
                 serial_handle.log_marker("START_SENT")
                 serial_handle.send_line(f"START,{int(cfg.arduino_fps)}")
                 serial_handle.wait_for_ttl(timeout_s=3.0)
-            except Exception:
-                pass
+            except Exception as exc:
+                error = f"failed to start controller: {exc}"
+                self._log(f"[BACKEND] {error}")
+                self._finalize_run(final_state="failed", error=error)
+                return False
         self._start_run_dir_watch()
         return True
 
     def stop_run(self) -> None:
-        inference_running = bool(self.state.inference and self.state.inference.is_running())
-        if not inference_running and not self.state.serial:
-            return
-        self._log("[BACKEND] stopping run")
         self._maybe_set_run_dir_from_marker()
-        run_dir = self.state.run_dir
-        if run_dir:
-            try:
-                run_context.write_status(run_dir, "stopping")
-            except Exception:
-                pass
-        if inference_running:
-            # In triggered mode, keep TTL pulses alive while DeepStream receives EOS.
-            # Stopping the controller first can leave flirspinsrc blocked waiting
-            # for a trigger, which turns shutdown into a source ERROR and prevents
-            # mp4mux/splitmuxsink from finalizing the raw segment.
-            if self.state.serial:
-                self.state.serial.log_marker("CAPTURE_STOP_REQUESTED")
-            self.state.inference.terminate_group_graceful(signal.SIGINT, 10.0, True)
-            self.state.inference.wait(timeout=2)
-            if self.state.serial:
-                self.state.serial.log_marker("CAPTURE_STOP_DONE")
-        if self.state.serial:
-            try:
-                self.state.serial.log_marker("STOP_SENT")
-                self.state.serial.send_line("STOP")
-            except Exception:
-                pass
-            # Drain ACK_STOP and final serial rows before closing the port.
-            try:
-                time.sleep(0.5)
-            except Exception:
-                pass
-            self.state.serial.close()
-            self.state.serial = None
-        self.state.inference = None
-        analysis_summary = self._run_post_run_alignment(self.state.run_dir)
-        if run_dir:
-            try:
-                self._write_run_manifest(run_dir)
-                run_context.write_status(
-                    run_dir,
-                    "finalized",
-                    analysis_complete=analysis_summary is not None,
-                    outputs=self._run_output_snapshot(run_dir),
-                )
-                self._write_run_manifest(run_dir)
-            except Exception as exc:
-                self._log(f"[SAVE] finalize status failed: {exc}")
+        self._finalize_run(final_state="finalized")
 
     def shutdown(self) -> None:
         self.stop_run()

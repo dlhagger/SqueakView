@@ -3,15 +3,17 @@
 Trimmed direct-FLIR SqueakView stack for Jetson Orin Nano.
 
 This repo is intended to be cloned onto a Jetson that already has NVIDIA
-DeepStream and FLIR/Teledyne Spinnaker installed locally. It does not vendor
-DeepStream, Spinnaker, TensorRT engines, trained model weights, generated ONNX
-files, or run outputs.
+DeepStream and FLIR/Teledyne Spinnaker installed locally. It ships the source
+`.pt` weights and dataset/model YAML files under `build_me/`, but it does not
+vendor DeepStream, Spinnaker, generated model packages, TensorRT engines,
+generated ONNX files, profiles, or run outputs.
 
 This repo owns:
 
 - `native/flir_gst_source`: GStreamer `flirspinsrc` built against FLIR Spinnaker.
 - `native/nvdsinfer_custom_impl_yolo`: DeepStream custom parser for YOLO26 pose.
-- `models/`: local generated model packages. This directory is ignored by Git.
+- `build_me/`: tracked source `.pt` and YAML inputs used to build models on the device.
+- `models/`: device-local generated model packages. This entire directory is ignored by Git.
 - `build_engine`: notebook workflow for importing YOLO26 pose `.pt` models into the `models/` package layout.
 - `squeakview/apps/inference`: Python DeepStream pipeline runner.
 - `squeakview/apps/operator`: operator GUI/backend used to launch the direct FLIR path.
@@ -41,8 +43,9 @@ For a new Jetson clone, the normal setup order is:
 5. Run preflight.
 6. Launch the GUI.
 
-`models/`, `build_me/`, `runs/`, and `profiles/` are local machine state and are
-ignored by Git.
+`models/`, `runs/`, and `profiles/` are local machine state and are ignored by
+Git. `build_me/` is intentionally tracked so a fresh clone contains the inputs
+needed to build its own model packages.
 
 ## Install Prerequisites
 
@@ -158,8 +161,9 @@ into detections/keypoints.
 
 ## Build A YOLO26 Model Package
 
-Use the notebook workflow when bringing over a new YOLO26 pose `.pt` model and
-training/data `.yaml`:
+Fresh clones contain source `.pt` and YAML inputs under `build_me/`, but contain
+no selectable model packages. Use the notebook workflow to build the required
+ONNX, TensorRT engine, configuration, labels, and validation metadata locally:
 
 ```bash
 uv run jupyter lab build_engine/build_engine.ipynb
@@ -169,8 +173,8 @@ The notebook writes a complete package under `models/<model_name>/`, including
 labels, ONNX, TensorRT engine, DeepStream config, pose sidecar JSON, and a
 `model.yaml` manifest.
 
-`build_me/` and `models/` are local artifact directories and are ignored by Git.
-Experiment profiles should use repo-relative paths such as
+`models/` is local generated state and is ignored by Git. Source inputs under
+`build_me/` are tracked. Experiment profiles should use repo-relative paths such as
 `models/<model_name>/configs/<model_name>.txt` and `tasks/default.yaml`.
 Generated DeepStream `nvinfer` configs use paths relative to the config file.
 The GUI still localizes those configs into each run directory before launching
@@ -197,12 +201,26 @@ bash scripts/preflight.sh
 ```
 
 Preflight checks DeepStream, GStreamer elements, the FLIR source plugin, the
-YOLO parser library, the selected model package, Jetson memory state, and Python
-imports. If you are using a non-default model config, pass it with `DS_CFG`:
+YOLO parser library, the explicitly selected model package, Jetson memory state,
+and Python imports. Model selection is never inferred from directory order.
+Pass the model config with `DS_CFG`:
 
 ```bash
 DS_CFG=models/<model_name>/configs/<model_name>.txt bash scripts/preflight.sh
 ```
+
+Alternatively, select a package by name:
+
+```bash
+SQUEAKVIEW_MODEL_NAME=<model_name> bash scripts/preflight.sh
+```
+
+The operator GUI does not provide built-in model choices or select an installed
+package automatically. After building a package on the device, explicitly
+select its config when creating an experiment profile. When inference is
+enabled without a selected package, configuration and preflight fail with an
+explicit error. Each run manifest records the package name plus SHA-256 hashes
+of its DeepStream config and TensorRT engine.
 
 ## Launch GUI
 
@@ -232,6 +250,15 @@ flirspinsrc -> source frame tap -> tee
   record branch: non-leaky queue -> compressed MP4
   inference branch: leaky queue -> nvvideoconvert -> nvstreammux -> nvinfer -> nvdsosd -> preview
 ```
+
+Run status moves through `created`, `starting`, and `recording`; `recording` is
+written only after the DeepStream child reports that its pipeline is playing.
+Unexpected child exits mark the run `failed`, close the serial controller, and
+return the operator GUI to an idle state. In triggered mode, the controller is
+started only after inference readiness is confirmed. The readiness timeout
+defaults to 8 seconds and can be changed with
+`SQUEAKVIEW_INFERENCE_READY_TIMEOUT`; a timeout fails the run without sending
+`START` to the controller.
 
 Runs are local-only and are created under:
 

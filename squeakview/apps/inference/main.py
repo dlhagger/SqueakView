@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
     cfg_path = squeakview_config.resolve_workspace_path(args.cfg) if args.cfg else None
     config = runner.InferenceConfig(
@@ -51,8 +51,8 @@ def main() -> None:
         run_dir=args.run_dir,
         draw_skeleton=args.draw_skeleton,
     )
-    runner.run(config)
+    return runner.run(config)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

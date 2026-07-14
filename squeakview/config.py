@@ -43,22 +43,18 @@ WORKSPACE = _resolve_workspace()
 DEEPSTREAM_SDK_ROOT = _resolve_deepstream_sdk()
 
 MODEL_ROOT = _resolve_path("SQUEAKVIEW_MODEL_ROOT", WORKSPACE / "models")
-DEFAULT_MODEL_NAME = os.environ.get("SQUEAKVIEW_MODEL_NAME", "yolo26s_dino_10kpts_fp16")
-DEFAULT_MODEL_ROOT = MODEL_ROOT / DEFAULT_MODEL_NAME
+DEFAULT_MODEL_NAME = os.environ.get("SQUEAKVIEW_MODEL_NAME", "").strip()
+DEFAULT_MODEL_ROOT = MODEL_ROOT / DEFAULT_MODEL_NAME if DEFAULT_MODEL_NAME else MODEL_ROOT
 
 
-def _resolve_default_infer_config() -> Path:
+def _resolve_default_infer_config() -> Path | None:
     explicit = os.environ.get("SQUEAKVIEW_DS_CFG") or os.environ.get("DS_CFG")
     if explicit:
-        return Path(explicit).expanduser().resolve()
-    configured = DEFAULT_MODEL_ROOT / "configs" / f"{DEFAULT_MODEL_NAME}.txt"
-    if configured.exists():
-        return configured
-    try:
-        first = next(iter(sorted(MODEL_ROOT.glob("*/configs/*.txt"))))
-        return first.resolve()
-    except StopIteration:
-        return configured
+        path = Path(explicit).expanduser()
+        return (WORKSPACE / path).resolve() if not path.is_absolute() else path.resolve()
+    if DEFAULT_MODEL_NAME:
+        return (DEFAULT_MODEL_ROOT / "configs" / f"{DEFAULT_MODEL_NAME}.txt").resolve()
+    return None
 
 
 DEFAULT_INFER_CONFIG = _resolve_default_infer_config()

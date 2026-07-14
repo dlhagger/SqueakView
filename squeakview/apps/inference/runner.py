@@ -389,6 +389,7 @@ class App:
         self.pipeline = None
         self.loop = GLib.MainLoop()
         self._stopping = False
+        self.exit_code = 0
         self._preview_valve = None
         self.video_enabled = True
         self._window_handle = config.window_xid
@@ -1396,6 +1397,7 @@ class App:
         elif msg_type == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
             print(f"[{ts()}] [BUS] ERROR: {err}  debug:{dbg}")
+            self.exit_code = 1
             self.stop()
         elif msg_type == Gst.MessageType.ELEMENT:
             st = msg.get_structure()
@@ -1724,12 +1726,13 @@ class App:
 
         return Gst.PadProbeReturn.OK
 
-    def run(self) -> None:
+    def run(self) -> int:
         print(f"[{ts()}] [INFO] set PLAYING…")
         if self.pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             print(f"[{ts()}] [FATAL] cannot set pipeline to PLAYING")
+            self.exit_code = 1
             self.stop()
-            return
+            return self.exit_code
         print(f"[{ts()}] [READY] inference playing", flush=True)
         print(f"[{ts()}] [INFO] streaming (Ctrl-C to stop)…")
         try:
@@ -1737,6 +1740,7 @@ class App:
         except KeyboardInterrupt:
             print(f"[{ts()}] [INFO] Ctrl-C → EOS")
             self.pipeline.send_event(Gst.Event.new_eos())
+        return self.exit_code
 
     def stop(self) -> None:
         if self._stopping:
@@ -1917,7 +1921,7 @@ class App:
         return
 
 
-def run(config: InferenceConfig) -> None:
+def run(config: InferenceConfig) -> int:
     Gst.init(None)
     GObject.threads_init()
 
@@ -1932,4 +1936,4 @@ def run(config: InferenceConfig) -> None:
     signal.signal(signal.SIGTERM, _sig)
 
     app.build()
-    app.run()
+    return app.run()

@@ -53,6 +53,7 @@ class SerialHandle:
         self.port = port
         self.baud = baud
         self.ser = None
+        self.last_error: str | None = None
         self._thread = None
         self._stop = threading.Event()
         self._ttl_seen = threading.Event()
@@ -145,7 +146,9 @@ class SerialHandle:
             self.emit(f"[{timestamp()}] [SER] Could not adopt CSV into run dir: {exc}")
 
     def open(self, run_dir: Path | None = None) -> bool:
+        self.last_error = None
         if serial is None:
+            self.last_error = "pyserial is not installed"
             self.emit(f"[{timestamp()}] [SER] pyserial not installed.")
             return False
         try:
@@ -162,6 +165,7 @@ class SerialHandle:
                 self._open_temp_csv()
             return True
         except Exception as exc:
+            self.last_error = str(exc) or type(exc).__name__
             self.emit(f"[{timestamp()}] [SER] ERROR opening serial: {exc}")
             self.ser = None
             return False

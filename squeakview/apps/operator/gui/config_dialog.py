@@ -6,6 +6,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from squeakview import config as squeakview_config
+from squeakview import model_package
 from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile, slugify
 
 
@@ -1603,7 +1604,7 @@ class ConfigDialog(QtWidgets.QDialog):
 
     def _on_browse_cfg(self) -> None:
         cfg_path = squeakview_config.resolve_workspace_path(self.cfg_edit.text())
-        start_dir = cfg_path.parent if cfg_path else squeakview_config.DEFAULT_MODEL_ROOT
+        start_dir = cfg_path.parent if cfg_path else squeakview_config.MODEL_ROOT
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select DeepStream nvinfer config",
@@ -1683,6 +1684,12 @@ class ConfigDialog(QtWidgets.QDialog):
             if not result["ds_cfg"].exists():
                 if show_errors:
                     QtWidgets.QMessageBox.warning(self, "Config missing", f"DeepStream config not found:\n{result['ds_cfg']}")
+                return None
+            try:
+                model_package.validate_model_package(result["ds_cfg"])
+            except model_package.ModelPackageError as exc:
+                if show_errors:
+                    QtWidgets.QMessageBox.warning(self, "Invalid model package", str(exc))
                 return None
         if not result["task_cfg"]:
             if show_errors:

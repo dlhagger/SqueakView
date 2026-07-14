@@ -1,6 +1,10 @@
 # Local run outputs
 runs/
 
+# Device-local application state
+models/
+profiles/
+
 # Python cache
 __pycache__/
 *.py[cod]
@@ -13,11 +17,7 @@ native/**/*.so
 # Virtual environments
 .venv/
 
-# DS/engine artifacts (large binaries) can live outside git; keep local outputs clean
-build_me/**/*.pt
-models/*/engines/
-models/*/onnx/
-models/*/weights/
+# Legacy DeepStream artifact paths
 DeepStream-Yolo/artifacts/onnx/
 DeepStream-Yolo/artifacts/weights/*.pt
 !DeepStream-Yolo/artifacts/weights/yolo26s_dino_10kpts.pt
