@@ -1,9 +1,0 @@
-{
-  "schema_version": 1,
-  "task": "pose",
-  "parser": "NvDsInferParseYolo26Pose",
-  "keypoint_labels_path": "../labels/labels.txt",
-  "keypoint_count": 19,
-  "keypoint_dims": 3,
-  "draw_threshold": 0.5
-}
