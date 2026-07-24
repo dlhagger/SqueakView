@@ -1,13 +1,12 @@
 [project]
 name = "squeakview"
-version = "0.1.0"
+version = "1.0.0"
 description = "Direct FLIR Spinnaker/GStreamer source into NVIDIA DeepStream for SqueakView."
 readme = "README.md"
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "pyserial>=3.5",
-    "PySide6==6.8.0.2",
-    "pyds",
+    "PySide6>=6.8.0.2",
     "numpy>=2.2.6",
     "pyqtgraph>=0.14.0",
     "pandas>=2.3.3",
@@ -15,12 +14,18 @@ dependencies = [
     "jupyter>=1.1.1",
     "seaborn>=0.13.2",
     "scipy>=1.15.3",
-    "ultralytics>=8.4.60",
-    "onnx>=1.21.0",
-    "onnxruntime>=1.23.2",
-    "onnxslim>=0.1.94",
+    "ultralytics==8.4.103",
     "torch>=2.12.0",
     "torchvision>=0.27.0",
+    "onnxslim>=0.1.94",
+    "PyYAML>=6.0.2",
+    "coloredlogs>=15.0.1",
+    "flatbuffers>=25.12.19",
+    "packaging>=26.2",
+    "protobuf>=7.35.1",
+    "sympy>=1.14.0",
+    "onnxruntime-gpu>=1.27.0.dev20260511001",
+    "onnx>=1.22.0",
 ]
 
 [tool.uv]
@@ -29,26 +34,15 @@ required-environments = [
 ]
 
 [tool.uv.sources]
-pyds = { path = "wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl" }
-
-torch = [
-    { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
-    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
-    { index = "pytorch-cu126", marker = "sys_platform == 'win32'" },
-]
-
-torchvision = [
-    { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
-    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
-    { index = "pytorch-cu126", marker = "sys_platform == 'win32'" },
-]
+torch = { index = "pytorch-cu132" }
+torchvision = { index = "pytorch-cu132" }
+onnxruntime-gpu = { index = "ort" }
 
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
+name = "ort"
+url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/"
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true

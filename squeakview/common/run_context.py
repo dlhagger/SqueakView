@@ -160,11 +160,12 @@ def assert_runs_dir_ready(min_free_bytes: int | None = None) -> dict[str, Any]:
 @dataclass(slots=True)
 class RunArtifacts:
     raw_video: Path
-    raw_video_pattern: Path
     frames_csv: Path
     drop_events_csv: Path
-    annotated_video: Path
     detections_csv: Path
+    objects_csv: Path
+    keypoints_csv: Path
+    tracks_csv: Path
     metadata_json: Path
     manifest_json: Path
     status_json: Path
@@ -177,11 +178,12 @@ class RunArtifacts:
 def run_artifacts(run_dir: Path, include_serial: bool = True) -> RunArtifacts:
     return RunArtifacts(
         raw_video=run_dir / "raw.mp4",
-        raw_video_pattern=run_dir / "raw_%06d.mp4",
         frames_csv=run_dir / "frames.csv",
         drop_events_csv=run_dir / "drop_events.csv",
-        annotated_video=run_dir / "annotated.mp4",
         detections_csv=run_dir / "detections.csv",
+        objects_csv=run_dir / "objects.csv",
+        keypoints_csv=run_dir / "keypoints.csv",
+        tracks_csv=run_dir / "tracks.csv",
         metadata_json=run_dir / "camera_settings.json",
         manifest_json=run_dir / RUN_MANIFEST_FILENAME,
         status_json=run_dir / RUN_STATUS_FILENAME,

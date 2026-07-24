@@ -105,6 +105,23 @@ warn() {
   printf '[WARN] %s\n' "$1"
 }
 
+info() {
+  printf '[INFO] %s\n' "$1"
+}
+
+report_tracker_accelerator() {
+  local device_model=""
+  if [ -r /proc/device-tree/model ]; then
+    device_model="$(tr -d '\000' < /proc/device-tree/model 2>/dev/null || true)"
+  fi
+
+  case "$device_model" in
+    *"Jetson Orin Nano"*)
+      info "PVA unavailable (expected on Jetson Orin Nano); CUDA NvDCF selected"
+      ;;
+  esac
+}
+
 check_tegrastats_memory() {
   if ! command -v tegrastats >/dev/null 2>&1; then
     return 0
@@ -150,12 +167,7 @@ export LD_LIBRARY_PATH="$DEEPSTREAM_SDK/lib:${LD_LIBRARY_PATH:-}"
 export GST_PLUGIN_PATH="$FLIR_PLUGIN_DIR:$DEEPSTREAM_SDK/lib/gst-plugins:${GST_PLUGIN_PATH:-}"
 
 check command -v gst-inspect-1.0
-required_elements="nvstreammux nvinfer nvvideoconvert nveglglessink videoconvert x264enc h264parse mp4mux filesink"
-case "${SQUEAKVIEW_ENABLE_CHUNKED_RECORDING:-0}" in
-  1|true|TRUE|yes|YES|on|ON)
-    required_elements="$required_elements splitmuxsink"
-    ;;
-esac
+required_elements="nvstreammux nvstreamdemux nvurisrcbin nvunixfdsink nvunixfdsrc nvinfer nvtracker nvvideoconvert nvegltransform nveglglessink videoconvert x264enc h264parse mp4mux filesink"
 for element in $required_elements; do
   if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
     pass "GStreamer element '$element' is available"
@@ -164,6 +176,7 @@ for element in $required_elements; do
     fail=1
   fi
 done
+check command -v ffprobe
 
 if [ "$CAPTURE_BACKEND" = "flir_direct" ]; then
   if gst-inspect-1.0 flirspinsrc >/dev/null 2>&1; then
@@ -176,6 +189,25 @@ if [ "$CAPTURE_BACKEND" = "flir_direct" ]; then
 fi
 
 if [ "$INFERENCE_ENABLED" -eq 1 ]; then
+    if gst-inspect-1.0 flirspinsrc 2>/dev/null | grep -q 'capture-log-path'; then
+      pass "GStreamer element 'flirspinsrc' supports the source capture ledger"
+    else
+      printf '[FAIL] flirspinsrc is stale: capture-log-path is unavailable\n'
+      fail=1
+    fi
+  TRACKER_LIB="$DEEPSTREAM_SDK/lib/libnvds_nvmultiobjecttracker.so"
+  if [ ! -f "$TRACKER_LIB" ]; then
+    printf '[FAIL] DeepStream tracker library missing: %s\n' "$TRACKER_LIB"
+    fail=1
+  elif ldd "$TRACKER_LIB" 2>/dev/null | grep -q 'not found'; then
+    printf '[FAIL] DeepStream tracker has unresolved runtime dependencies:\n'
+    ldd "$TRACKER_LIB" 2>/dev/null | grep 'not found'
+    printf '       Install the DeepStream 9.1 prerequisites (including libmosquitto1).\n'
+    fail=1
+  else
+    pass "DeepStream tracker runtime dependencies resolved"
+  fi
+  report_tracker_accelerator
   if "$PYTHON_BIN" -m squeakview.model_package --config "$CFG"; then
     pass "Selected model package validated"
   else
@@ -188,14 +220,15 @@ check_tegrastats_memory
 if "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
 import gi
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst
-import pyds
+gi.require_version("GstVideo", "1.0")
+from gi.repository import Gst, GstVideo
+import pyservicemaker
 from PySide6 import QtWidgets
 PY
 then
-  pass "Python imports for Gst, pyds, and PySide6 resolved"
+  pass "Python imports for Gst, PyServiceMaker, and PySide6 resolved"
 else
-  warn "Python imports failed for Gst, pyds, or PySide6 in this environment"
+  warn "Python imports failed for Gst, PyServiceMaker, or PySide6 in this environment"
 fi
 
 if [ "$fail" -eq 0 ]; then

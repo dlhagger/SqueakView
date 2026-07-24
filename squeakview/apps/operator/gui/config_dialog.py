@@ -870,7 +870,6 @@ class SessionLauncherDialog(QtWidgets.QDialog):
         config["experiment_name"] = slugify(name_dialog.experiment_name)
         config["experiment_mode"] = "existing"
         config["mouse_id"] = ""
-        config["draw_skeleton"] = False
         self._profile_store.save_experiment(
             ExperimentProfile(
                 name=name_dialog.experiment_name,
@@ -915,7 +914,6 @@ class SessionLauncherDialog(QtWidgets.QDialog):
         new_config["experiment_name"] = new_slug
         new_config["experiment_mode"] = "existing"
         new_config["mouse_id"] = ""
-        new_config["draw_skeleton"] = False
         self._profile_store.save_experiment(
             ExperimentProfile(
                 name=new_name,
@@ -1103,7 +1101,6 @@ class ConfigDialog(QtWidgets.QDialog):
         self._camera_count = 1
         self._capture_backend = "flir_direct"
         self._mouse_id = str(cfg.get("mouse_id", "")).strip()
-        self._draw_skeleton = False
         self._show_experiment_profile_editor = show_experiment_profile_editor
 
         form = QtWidgets.QFormLayout()
@@ -1182,6 +1179,7 @@ class ConfigDialog(QtWidgets.QDialog):
         self.inference_enable = QtWidgets.QCheckBox("Enable YOLO inference (DeepStream)")
         self.inference_enable.setChecked(cfg.get("inference_enabled", True))
         form.addRow("", self.inference_enable)
+
 
         task_default = cfg.get("task_cfg", "")
         if not task_default:
@@ -1661,7 +1659,6 @@ class ConfigDialog(QtWidgets.QDialog):
             "serial_baud": serial_baud,
             "ds_cfg": ds_cfg,
             "inference_enabled": self.inference_enable.isChecked(),
-            "draw_skeleton": self._draw_skeleton,
             "task_cfg": task_cfg,
             "num_cameras": self._camera_count,
             "bitrate": bitrate,

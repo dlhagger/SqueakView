@@ -2,8 +2,9 @@ from __future__ import annotations
 
 """Subprocess helpers for the operator GUI."""
 
-import os
+import hashlib
 import json
+import os
 import shlex
 import signal
 import subprocess
@@ -26,6 +27,16 @@ WORKSPACE = squeakview_config.WORKSPACE
 INFERENCE_ENTRY = "squeakview.apps.inference.main"
 
 
+def preview_socket_paths(run_dir: Path, num_cameras: int) -> tuple[Path, ...]:
+    """Return short, run-unique Unix socket paths below Linux's path limit."""
+    identity = str(Path(run_dir).expanduser().resolve()).encode("utf-8")
+    token = hashlib.blake2s(identity, digest_size=6).hexdigest()
+    return tuple(
+        Path("/tmp") / f"squeakview-preview-{token}-cam{index}.sock"
+        for index in range(max(1, int(num_cameras)))
+    )
+
+
 @dataclass(slots=True)
 class LaunchConfig:
     capture_backend: str = "flir_direct"
@@ -38,6 +49,7 @@ class LaunchConfig:
     ds_cfg: Path | None = squeakview_config.DEFAULT_INFER_CONFIG
     inference_enabled: bool = True
     num_cameras: int = 1
+    camera_serials: tuple[str, ...] = ()
     bitrate: int = 4000
     exposure_us: float | None = 10000.0
     serial_enabled: bool = True
@@ -45,10 +57,10 @@ class LaunchConfig:
     serial_baud: int = 115200
     arduino_fps: int = 30
     preview_window_id: int | None = None
+    preview_socket_paths: tuple[Path, ...] = ()
     run_dir: Path | None = None
     mouse_id: str | None = None
     experiment_name: str | None = None
-    draw_skeleton: bool = False
     task_cfg: Path | None = None
     bottles: dict[str, object] = field(default_factory=dict)
 
@@ -168,11 +180,11 @@ class ProcessHandle:
     def is_running(self) -> bool:
         return self.p is not None and self.p.poll() is None
 
-    def wait(self, timeout: float | None = None) -> None:
+    def wait(self, timeout: float | None = None) -> int | None:
         try:
-            self.p.wait(timeout=timeout)
+            return int(self.p.wait(timeout=timeout))
         except Exception:
-            pass
+            return self.p.poll()
 
     def send_signal_group(self, sig: signal.Signals) -> bool:
         try:
@@ -273,6 +285,8 @@ def spawn_inference(
         args += ["--cfg", str(ds_cfg)]
     args += ["--capture-backend", backend]
     args += ["--num-cameras", str(max(1, int(getattr(config, "num_cameras", 1))))]
+    for camera_serial in getattr(config, "camera_serials", ()):
+        args += ["--camera-serial", str(camera_serial)]
     if config.pixel_format:
         args += ["--pixel-format", str(config.pixel_format)]
     args += ["--trigger", "on" if bool(getattr(config, "trigger_on", False)) else "off"]
@@ -287,14 +301,14 @@ def spawn_inference(
     if config.fps:
         args += ["--fps", str(config.fps)]
     args += ["--bitrate", str(config.bitrate)]
-    if config.preview_window_id is not None:
-        args += ["--window-xid", str(config.preview_window_id)]
     if config.run_dir is not None:
         args += ["--run-dir", str(config.run_dir)]
+        if not config.preview_socket_paths:
+            config.preview_socket_paths = preview_socket_paths(config.run_dir, config.num_cameras)
+    for socket_path in config.preview_socket_paths:
+        args += ["--preview-socket", str(socket_path)]
     if not config.inference_enabled:
         args.append("--disable-infer")
-    if config.draw_skeleton:
-        args.append("--draw-skeleton")
     extra_env = _deepstream_runtime_env()
     if backend == "flir_direct":
         plugin_dir = squeakview_config.FLIR_GST_PLUGIN_DIR

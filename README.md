@@ -1,237 +1,252 @@
 # SqueakView
 
-Trimmed direct-FLIR SqueakView stack for Jetson Orin Nano.
+SqueakView is a scientific FLIR capture, behavior logging, and YOLO26 pose
+inference application for the NVIDIA Jetson Orin Nano. The current platform is
+JetPack 7.2, CUDA 13.2, TensorRT 10.16, and DeepStream 9.1 using the
+PyServiceMaker Pipeline API.
 
-This repo is intended to be cloned onto a Jetson that already has NVIDIA
-DeepStream and FLIR/Teledyne Spinnaker installed locally. It ships the source
-`.pt` weights and dataset/model YAML files under `build_me/`, but it does not
-vendor DeepStream, Spinnaker, generated model packages, TensorRT engines,
-generated ONNX files, profiles, or run outputs.
+The primary validated configuration is one FLIR camera at 1440×1080 and 30 FPS,
+with optional RP2040 serial triggering/logging and a batch-1 TensorRT pose
+model. Generated engines are device-specific and are built locally on the
+Jetson.
 
-This repo owns:
+## Data-flow policy
 
-- `native/flir_gst_source`: GStreamer `flirspinsrc` built against FLIR Spinnaker.
-- `native/nvdsinfer_custom_impl_yolo`: DeepStream custom parser for YOLO26 pose.
-- `build_me/`: tracked source `.pt` and YAML inputs used to build models on the device.
-- `models/`: device-local generated model packages. This entire directory is ignored by Git.
-- `build_engine`: notebook workflow for importing YOLO26 pose `.pt` models into the `models/` package layout.
-- `squeakview/apps/inference`: Python DeepStream pipeline runner.
-- `squeakview/apps/operator`: operator GUI/backend used to launch the direct FLIR path.
-- `squeakview/common`: run metadata, profiles, dashboard, and serial helpers.
-- `squeakview/config.py`: central path configuration for the local repo and `/opt/nvidia/deepstream`.
+SqueakView treats the compressed camera recording as scientific ground truth:
 
-This repo does not vendor NVIDIA DeepStream. It expects the device install at:
+- The recording branch is non-leaky. It never intentionally drops a frame.
+- Inference is downstream-leaky so slow inference cannot backpressure recording.
+- GUI preview is leaky because it is only an operator spot check.
+- Every recorded frame is reconciled against a durable source audit and the
+  recording admission ledger.
+- Missed live inference can be recovered later by replaying `raw.mp4` offline.
 
-```bash
-/opt/nvidia/deepstream/deepstream
+`raw.mp4` is H.264-compressed with CPU `x264enc`. It is authoritative, but not
+an uncompressed sensor dump. CPU encoding is intentional because the Orin Nano
+does not provide the hardware encoder used by larger Jetson modules.
+
+## Repository layout
+
+```text
+build_me/                         Tracked source checkpoints and dataset YAMLs
+build_engine/build_engine.ipynb  YOLO26 → ONNX/TensorRT model-package builder
+configs/                         Runtime tracker configuration
+native/flir_gst_source/          Scientific Spinnaker GStreamer source
+native/nvdsinfer_custom_impl_yolo/ DeepStream YOLO26 detector parser
+squeakview/apps/inference/        Live and offline PyServiceMaker pipelines
+squeakview/apps/operator/         Qt operator GUI and run lifecycle
+squeakview/common/                Run, profile, serial, and dashboard utilities
+scripts/preflight.sh              Device/model readiness checks
+scripts/align_run_outputs.py      Camera, video, inference, and TTL alignment
+data_viz/analysis_demo_viz.ipynb Scientific run analysis and visualization
+tests/                            Pure-Python and on-device pipeline tests
 ```
 
-Override with:
+Device-local state is written under `models/`, `profiles/`, and `runs/`. Those
+directories are ignored by Git. `build_me/` is intentionally tracked and its
+source YAML files are treated as read-only ground truth by the builder.
 
-```bash
-export SQUEAKVIEW_DEEPSTREAM_SDK=/opt/nvidia/deepstream/deepstream
-```
+To build and deploy custom models, place .pt and corresponding .yamls in build_me
+and then run the build_engine.ipynb notebook to generate device specific deployments
 
-## Fresh Clone Setup
+## Platform prerequisites
 
-For a new Jetson clone, the normal setup order is:
+Install these before setting up the repository:
 
-1. Install system prerequisites.
-2. Sync the Python environment.
-3. Build the two native `.so` files.
-4. Import/build a YOLO26 pose model package under `models/`.
-5. Run preflight.
-6. Launch the GUI.
-
-`models/`, `runs/`, and `profiles/` are local machine state and are ignored by
-Git. `build_me/` is intentionally tracked so a fresh clone contains the inputs
-needed to build its own model packages.
-
-## Install Prerequisites
-
-Install these on the Jetson before setting up the Python environment:
-
-- NVIDIA DeepStream SDK at `/opt/nvidia/deepstream/deepstream`
+- JetPack 7.2 with CUDA/TensorRT
+- NVIDIA DeepStream 9.1 at `/opt/nvidia/deepstream/deepstream`
 - FLIR/Teledyne Spinnaker SDK at `/opt/spinnaker`
-- CUDA/TensorRT matching the JetPack/DeepStream install
+- Spinnaker for JetPack 7.2 is in beta - https://teledyne.app.box.com/s/ccj73r4xu8rusbnu12pytcisbexdchfa
 - GStreamer runtime and development headers
-- CMake and a C++ compiler
-- `uv`
+- Jetson Orin Nano specific install of ffmpeg (sudo apt install ffmpeg)
+- CMake, a C++ compiler, and `uv`
 
-Typical Ubuntu packages for the native builds:
+Typical native-build packages:
 
 ```bash
 sudo apt install build-essential cmake pkg-config \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 ```
 
-The native build expects these local paths:
+Expected vendor paths:
 
 ```text
 /opt/spinnaker/include
 /opt/spinnaker/lib
 /opt/nvidia/deepstream/deepstream/sources/includes
-/usr/local/cuda-<CUDA_VER>
+/usr/local/cuda-13.2
 ```
 
-## Python Environment
+Override the DeepStream root when necessary:
 
-The project targets Python 3.10 on Jetson:
+```bash
+export SQUEAKVIEW_DEEPSTREAM_SDK=/opt/nvidia/deepstream/deepstream
+```
+
+## Python environment
+
+SqueakView targets Python 3.12 on Linux AArch64:
 
 ```bash
 uv sync
 source .venv/bin/activate
 ```
 
-`pyds` is expected from:
+The project uses CUDA 13.2 PyTorch wheels and a CUDA 13 ONNX Runtime index as
+configured in `pyproject.toml`. DeepStream 9.1 supplies PyServiceMaker through
+the system Python installation.
 
-```text
-wheel_files/pyds-1.2.0-cp310-cp310-linux_aarch64.whl
-```
+The live tensor decoder currently uses PyTorch DLPack to read DeepStream tensor
+metadata. DeepStream performs TensorRT inference; ONNX Runtime is used by model
+export tooling rather than by the live pipeline.
 
-If `uv sync` reinstalls PyTorch, make sure the selected wheels match the Jetson
-CUDA driver. A mismatched PyTorch wheel can still let DeepStream run, but it can
-break notebook-based model export.
+## Build native components
 
-## Build Native Components
-
-Build the FLIR Spinnaker GStreamer source:
+### FLIR GStreamer source
 
 ```bash
 cmake -S native/flir_gst_source -B native/flir_gst_source/build
 cmake --build native/flir_gst_source/build -j
-```
-
-This creates:
-
-```text
-native/flir_gst_source/build/gstflirspinsrc.so
-```
-
-Quick check:
-
-```bash
 GST_PLUGIN_PATH=$PWD/native/flir_gst_source/build gst-inspect-1.0 flirspinsrc
 ```
 
-Build the DeepStream YOLO parser used by `nvinfer`:
+This produces `native/flir_gst_source/build/gstflirspinsrc.so`.
+
+`flirspinsrc` uses Spinnaker directly and emits `GRAY8` frames. Its scientific
+metadata profile records the FLIR chunk frame ID, acquisition-local image ID,
+camera timestamp, exposure, gain, black level, ROI, pixel format, sequencer
+state, CRC, image status, payload size, host clocks, camera/host clock
+correlation, temperature, and transport counters. Incomplete images fail the
+acquisition instead of being silently accepted.
+
+See [native/flir_gst_source/README.md](native/flir_gst_source/README.md) for the
+standalone camera smoke tests and complete metadata contract.
+
+### DeepStream YOLO parser
+
+Build against the CUDA version installed on the device:
 
 ```bash
-cd native/nvdsinfer_custom_impl_yolo
-CUDA_VER=12.6 make -j
-cd ../..
+make -C native/nvdsinfer_custom_impl_yolo CUDA_VER=13.2 -j
 ```
 
-Use the CUDA version installed on the Jetson. For example, CUDA 12.6 uses
-`CUDA_VER=12.6`. This creates:
+This produces:
 
 ```text
 native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so
 ```
 
-Quick check:
+The library satisfies DeepStream's detector parser ABI for the YOLO26
+end-to-end output. The PyServiceMaker `Yolo26PoseTensorOperator` is the
+authoritative pose decoder: it reads `output0` tensor metadata, applies the
+model-sidecar thresholds, restores source-image coordinates, and hands objects
+and keypoints to NvDCF tracking and CSV persistence.
 
-```bash
-test -f native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so
-```
+Rebuild both native components after JetPack, CUDA, TensorRT, DeepStream, or
+Spinnaker upgrades.
 
-Both native outputs are build artifacts and are ignored by Git. The source and
-build recipes are shipped; each Jetson rebuilds the `.so` files locally.
+## Build a YOLO26 pose model package
 
-## Native Runtime Roles
-
-`flirspinsrc` is the live camera source. It talks to the FLIR camera through
-Spinnaker and publishes `GRAY8` GStreamer frames:
-
-```text
-flirspinsrc ! video/x-raw,format=GRAY8 ! nvvideoconvert ! nvstreammux
-```
-
-`libnvdsinfer_custom_impl_Yolo.so` is the DeepStream parser library. Generated
-YOLO26 pose model configs point `nvinfer` at this library:
-
-```text
-parse-bbox-func-name=NvDsInferParseYolo26Pose
-custom-lib-path=<repo>/native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so
-```
-
-Without the FLIR plugin, the camera pipe cannot start. Without the YOLO parser,
-DeepStream can load the TensorRT engine but cannot decode YOLO26 pose outputs
-into detections/keypoints.
-
-## Build A YOLO26 Model Package
-
-Fresh clones contain source `.pt` and YAML inputs under `build_me/`, but contain
-no selectable model packages. Use the notebook workflow to build the required
-ONNX, TensorRT engine, configuration, labels, and validation metadata locally:
+Fresh clones contain model inputs but no generated TensorRT packages. Start
+Jupyter from the repository root:
 
 ```bash
 uv run jupyter lab build_engine/build_engine.ipynb
 ```
 
-The notebook writes a complete package under `models/<model_name>/`, including
-labels, ONNX, TensorRT engine, DeepStream config, pose sidecar JSON, and a
-`model.yaml` manifest.
+Edit only the first notebook cell for the source checkpoint, dataset YAML,
+package name, precision, batch size, image size, and confidence thresholds.
+The remaining cells:
 
-`models/` is local generated state and is ignored by Git. Source inputs under
-`build_me/` are tracked. Experiment profiles should use repo-relative paths such as
-`models/<model_name>/configs/<model_name>.txt` and `tasks/default.yaml`.
-Generated DeepStream `nvinfer` configs use paths relative to the config file.
-The GUI still localizes those configs into each run directory before launching
-inference so DeepStream receives concrete paths for the active clone.
+1. Read standard class names, keypoint names, and keypoint shape from the YAML
+   and checkpoint without modifying the YAML.
+2. Pass the YAML to `Ultralytics.export(data=...)`.
+3. Export an end-to-end FP16 or FP32 TensorRT engine on the target Jetson.
+4. Strip the Ultralytics metadata prefix to produce the raw TensorRT plan
+   expected by DeepStream.
+5. Validate ONNX and TensorRT input/output shapes.
+6. Write and validate a schema-v2 model package.
 
-Before running acquisition, make sure the selected model package contains:
+Generated layout:
 
 ```text
 models/<model_name>/
-  configs/<model_name>.txt
-  configs/<model_name>.pose.json
+  weights/<source>.pt
+  onnx/<model>_<precision>_b<batch>.onnx
   engines/<model>_<precision>_b<batch>.engine
   labels/classes.txt
   labels/labels.txt
+  configs/<model_name>.txt
+  configs/<model_name>.pose.json
+  validation/import_report.json
   model.yaml
 ```
 
+The pose sidecar contains tensor geometry, class thresholds, tracking policy, and keypoint labels. SqueakView stores and displays labeled keypoint dots.
+
+TensorRT plan files are device-specific. Build each engine on the Jetson that
+will run it. The model package batch size must match the configured camera
+count. The currently validated packages and normal GUI workflow are batch 1.
+Multi-camera support is planned, you may implement it now at your own risk by
+matching the batch size to the number of configured cameras.
+
+See [build_engine/README.md](build_engine/README.md) for builder details.
+
 ## Preflight
 
-Run this after the native plugins and the selected model package exist:
+Select a generated model explicitly and run preflight with the project
+interpreter:
 
 ```bash
+PYTHON_BIN=.venv/bin/python \
+SQUEAKVIEW_MODEL_NAME=<model_name> \
 bash scripts/preflight.sh
 ```
 
-Preflight checks DeepStream, GStreamer elements, the FLIR source plugin, the
-YOLO parser library, the explicitly selected model package, Jetson memory state,
-and Python imports. Model selection is never inferred from directory order.
-Pass the model config with `DS_CFG`:
+You can provide the config directly instead:
 
 ```bash
-DS_CFG=models/<model_name>/configs/<model_name>.txt bash scripts/preflight.sh
+PYTHON_BIN=.venv/bin/python \
+DS_CFG=models/<model_name>/configs/<model_name>.txt \
+bash scripts/preflight.sh
 ```
 
-Alternatively, select a package by name:
+Run the same check remotely:
 
 ```bash
-SQUEAKVIEW_MODEL_NAME=<model_name> bash scripts/preflight.sh
+ssh -t jetson@<jetson-host> 'cd ~/Documents/SqueakView && PYTHON_BIN=.venv/bin/python SQUEAKVIEW_MODEL_NAME=<model_name> bash scripts/preflight.sh'
 ```
 
-The operator GUI does not provide built-in model choices or select an installed
-package automatically. After building a package on the device, explicitly
-select its config when creating an experiment profile. When inference is
-enabled without a selected package, configuration and preflight fail with an
-explicit error. Each run manifest records the package name plus SHA-256 hashes
-of its DeepStream config and TensorRT engine.
+For camera-only testing without inference:
 
-## Launch GUI
+```bash
+PYTHON_BIN=.venv/bin/python INFERENCE_ENABLED=0 bash scripts/preflight.sh
+```
+
+Preflight checks the DeepStream install, required GStreamer elements, the FLIR
+plugin and capture-ledger API, NvDCF dependencies, the selected model package,
+Jetson memory state, `ffprobe`, and Python imports.
+
+DeepStream may print plugin-scanner warnings for unused optional plugins when an
+OpenTelemetry library is absent. They do not affect SqueakView if every required
+element passes preflight. Low contiguous NvMap memory is worth addressing before
+a long run by closing Jupyter/GPU processes or rebooting the Jetson.
+
+Note: clearing memory cache and setting the jetson to "cool" thermal profiles are
+easily achieved by installing jtop.
+
+## Launch the operator GUI
 
 ```bash
 uv run squeakview_gui.py
 ```
 
-The default capture backend is `FLIR Direct (Spinnaker/GStreamer)`.
+Create or select an experiment, select the model config explicitly, configure
+the FLIR camera and optional serial controller, and start the run. Serial
+capture defaults to `/dev/ttyACM0` at 115200 baud; choose the actual device shown
+by `ls /dev/ttyACM*`.
 
-If you need to override the workspace, DeepStream SDK, model root, or run
-directory:
+Useful path overrides:
 
 ```bash
 export SQUEAKVIEW_WORKSPACE=/path/to/SqueakView
@@ -241,87 +256,180 @@ export SQUEAKVIEW_RUNS_DIR=/path/to/runs
 uv run squeakview_gui.py
 ```
 
-## Runtime Shape
+The GUI launches inference first and reports the run as recording only after the
+PyServiceMaker pipeline reaches `PLAYING`. In triggered mode, it sends `START`
+to the controller only after that readiness signal. The default readiness
+timeout is 30 seconds and can be changed with
+`SQUEAKVIEW_INFERENCE_READY_TIMEOUT`.
 
-The operator GUI launches only one camera path:
+The 30 second timeout is to prewarm the inference hot path, you can decrease this
+at your own risk, but early frame inference outputs may return blank until the 
+model warms up and reaches at steady state of inferring poses.
 
-```text
-flirspinsrc -> source frame tap -> tee
-  record branch: non-leaky queue -> compressed MP4
-  inference branch: leaky queue -> nvvideoconvert -> nvstreammux -> nvinfer -> nvdsosd -> preview
-```
+## Live DeepStream pipeline
 
-Run status moves through `created`, `starting`, and `recording`; `recording` is
-written only after the DeepStream child reports that its pipeline is playing.
-Unexpected child exits mark the run `failed`, close the serial controller, and
-return the operator GUI to an idle state. In triggered mode, the controller is
-started only after inference readiness is confirmed. The readiness timeout
-defaults to 8 seconds and can be changed with
-`SQUEAKVIEW_INFERENCE_READY_TIMEOUT`; a timeout fails the run without sending
-`START` to the controller.
-
-Runs are local-only and are created under:
+The validated single-camera path is:
 
 ```text
-runs/<experiment>/<subject>/<subject>_<YYYY-MM-DD_HH-MM-SS>_<shortid>/
+flirspinsrc → GRAY8 caps → tee
+  ├─ record queue (30 frames, non-leaky)
+  │    → videoconvert/I420 → x264enc → h264parse → mp4mux → raw.mp4
+  └─ inference queue (32 frames, downstream-leaky)
+       → nvvideoconvert/NVMM-NV12 → nvstreammux
+       → nvinfer/TensorRT → Python YOLO26 pose decode
+       → CUDA NvDCF → nvosdbin → nvstreamdemux
+       → preview queue (1 frame, downstream-leaky) → nvunixfdsink
+       → Qt nvunixfdsrc preview
 ```
 
-Each run writes `run_status.json`, `run_manifest.json`, `camera_settings.json`,
-`frames.csv`, `drop_events.csv`, `raw.mp4`, `serial.csv` when the Arduino is
-enabled, and `detections.csv` when inference is enabled. Single-file recording
-is the default because it gives unambiguous frame provenance.
-The GUI verifies that `SQUEAKVIEW_RUNS_DIR` is writable and has at least 1 GB
-free before starting; override that threshold with
-`SQUEAKVIEW_MIN_RUN_FREE_BYTES` for long recordings.
+The record queue intentionally backpressures rather than discarding data. If
+CPU encoding cannot sustain acquisition, the run should fail or expose a source
+problem instead of silently producing a plausible but incomplete video.
 
-Use `frames.csv` as the source of truth for global frame identity. In default
-single-file mode, `record_segment_file=raw.mp4`,
-`segment_local_frame_index=raw_frame_index`, and
-`segment_mapping_source=single_file`.
+We've made the choice to explode runs rather than silently fail to preseve 
+precise timing and data integrity. If your camera settings (expsoure, gain, etc.)
+are correct, there should be minimal worries about faults in the camera hot path.
+We've achieved multi-day runs without issue.
 
-On stop, the backend builds `analysis/` transactionally from `analysis.tmp`.
-Chunked MP4 recording is disabled unless `SQUEAKVIEW_ENABLE_CHUNKED_RECORDING=1`
-is set. Chunked runs must include writer-owned `video_segments.csv`, emitted
-from `splitmuxsink` boundary signals. Analysis fails hard if chunked `raw_*.mp4`
-files exist without that ledger; runtime PTS estimates are not accepted as
-authoritative chunk provenance. The aligned CSVs include Arduino TTL timing and
-detection rows.
+The GUI/runtime can construct multiple camera branches, producing `raw.mp4` for
+camera zero and `raw_camN.mp4` for additional cameras. Multi-camera inference
+also requires a batch-N model package and has not received the same scientific
+validation as the single-camera path. 
 
-The old external capture worker, shared-memory camera sockets, and ZED path are intentionally not part of this repo.
+We will release future GUI updates to make this easily user configurable in the future
+but currently use this at your own risk.
 
-Debug logging is opt-in:
+SqueakView uses the CUDA NvDCF tracker in `configs/tracker_mouse_nvdcf.yml`.
+Jetson Orin Nano has no PVA hardware, so a PVA/VPI tracker profile is not an
+acceleration option. Tracker thresholds remain model- and experiment-specific.
+
+## Run outputs and frame identity
+
+Runs are stored under:
+
+```text
+runs/<experiment>/<subject>/<subject>_<timestamp>_<shortid>/
+```
+
+Important outputs include:
+
+```text
+raw.mp4                         Authoritative compressed camera recording
+capture_cam0.jsonl              Durable pre-tee FLIR source audit
+record_admission.csv            Frames admitted to the non-leaky writer
+frames.csv                      Authoritative recorded-frame ledger
+recording_validation.json       MP4 decoded-frame/admission validation
+capture_reconciliation.json     Source-versus-recording reconciliation
+camera_runtime.json             Camera identity and clock calibration
+camera_telemetry.csv            Temperature and transport health samples
+serial.csv                      RP2040 events, TTLs, markers, and host clocks
+inference/frames.csv            Frames admitted to the inference path
+inference_admission.csv/.json   Captured/admitted/skipped inference audit
+detections.csv                  Detector observations and provenance
+objects.csv                     Detector/tracker object rows
+keypoints.csv                   Normalized pose keypoints
+tracks.csv                      Per-track summaries
+drop_events.csv                 Camera gaps, CRC, and metadata failures
+run_manifest.json               Configuration, model identity, and artifacts
+run_status.json                 Lifecycle history and analysis summary
+analysis/                       Aligned scientific tables and validation
+```
+
+`frames.csv` is the source of truth for recorded frame identity. It contains
+only source buffers observed at `record_admission.csv`. A buffer acquired during
+shutdown but never admitted to recording remains visible in the source audit and
+is correctly excluded from the recorded-frame ledger.
+
+The FLIR chunk `FrameID` is stored as `camera_frame_id`. It increments for
+every acquired image. The aligner derives a per-run offset between that hardware
+frame sequence and RP2040 `CAMERA_HIGH` counts. It validates frame continuity,
+MP4 length, inference mapping, PTS, and camera/controller elapsed-clock agreement.
+
+On stop, SqueakView asks the controller to stop before draining DeepStream,
+keeps the serial reader open for final acknowledgements, validates `raw.mp4`,
+and builds `analysis/` transactionally.
+
+## Analyze a run
+
+Launch the visualization notebook:
 
 ```bash
-SQUEAKVIEW_DEBUG_INFER=1 SQUEAKVIEW_SURF_DEBUG=1 SQUEAKVIEW_POSE_PARSER_DEBUG=1 uv run squeakview_gui.py
+uv run jupyter lab data_viz/analysis_demo_viz.ipynb
 ```
 
-Known optional DeepStream plugin scanner warnings for Triton/Rivermax are hidden in the GUI log by default. To show them:
+By default it reads `runs/.latest_run`. Set `RUN_DIR` in the first code cell for
+an explicit run. Set `INFERENCE_RESULT` to `"live"`, `"latest_offline"`, or an
+offline result path.
+
+The notebook reports acquisition and inference health, TTL/PTS timing,
+behavioral events, mapping provenance, NvDCF tracks, keypoint confidence, event-
+locked object data, and an optional exact-frame `raw.mp4` preview with boxes and
+keypoint dots.
+
+## Offline re-inference
+
+Replay the immutable recording through the current TensorRT decoder and tracker:
+
+```bash
+uv run python -m squeakview.apps.inference.offline /path/to/run
+```
+
+The command defaults to the model recorded in `run_manifest.json`. To evaluate a
+different package:
+
+```bash
+uv run python -m squeakview.apps.inference.offline /path/to/run \
+  --cfg models/<model_name>/configs/<model_name>.txt
+```
+
+Offline replay first requires the decoded `raw.mp4` frame count to match
+`frames.csv`. It maps decoded ordinal back to the authoritative ledger and
+writes a new timestamped directory under `offline_inference/`; live data and
+`raw.mp4` are never overwritten. Offline replay currently supports a
+single-camera run.
+
+## Diagnostics
+
+Show optional DeepStream plugin warnings that the GUI normally filters:
 
 ```bash
 SQUEAKVIEW_SHOW_PLUGIN_WARNINGS=1 uv run squeakview_gui.py
 ```
 
-Fan control is also opt-in because `jetson_clocks --fan` usually requires privileges:
+Request fan control when the current user has the required privileges:
 
 ```bash
 SQUEAKVIEW_SET_FAN=1 uv run squeakview_gui.py
 ```
 
-## Git Policy
+Temporarily bypass GUI preflight only for deliberate diagnosis:
 
-Commit source, configuration templates, notebooks, scripts, and documentation.
-Do not commit generated local artifacts:
+```bash
+SQUEAKVIEW_SKIP_PREFLIGHT=1 uv run squeakview_gui.py
+```
+
+Run the test suite without changing the environment:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+## Git policy
+
+Commit source code, tests, documentation, notebooks without saved outputs,
+configuration, native build recipes, and the tracked `build_me/` model inputs.
+Do not commit device-local or generated state:
 
 ```text
 .venv/
-runs/
-profiles/
-build_me/
 models/
-native/**/build/
+profiles/
+runs/
+native/flir_gst_source/build/
 native/**/*.o
 native/**/*.so
 ```
 
-The repo should ship enough source for a Jetson user to rebuild the FLIR source
-plugin and YOLO parser locally, then import their own YOLO26 pose model package.
+A fresh clone should contain everything needed to rebuild the native plugins
+and local model packages on a compatible Jetson, but no device-specific engine
+or experimental run output.

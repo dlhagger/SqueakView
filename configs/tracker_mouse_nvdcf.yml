@@ -1,0 +1,54 @@
+# DeepStream 9.1 NvDCF starting profile for laboratory mice on Jetson Orin Nano.
+# Orin Nano does not expose a PVA device. Use the stable CUDA NvDCF tracker
+# instead of the alpha VPI tracker, which probes PVA and logs a device-node
+# failure on this platform. Tune association values from annotated SqueakView
+# recordings after deployment.
+%YAML:1.0
+
+BaseConfig:
+  minDetectorConfidence: 0.0430
+  checkClassMatch: 1
+
+TargetManagement:
+  enableBboxUnClipping: 1
+  preserveStreamUpdateOrder: 1
+  maxTargetsPerStream: 32
+  minIouDiff4NewTarget: 0.7418
+  minTrackerConfidence: 0.4009
+  probationAge: 2
+  maxShadowTrackingAge: 51
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 0
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1
+  minMatchingScore4Overall: 0.4290
+  minMatchingScore4SizeSimilarity: 0.3627
+  minMatchingScore4Iou: 0.2575
+  minMatchingScore4VisualSimilarity: 0.5356
+  matchingScoreWeight4VisualSimilarity: 0.3370
+  matchingScoreWeight4SizeSimilarity: 0.4354
+  matchingScoreWeight4Iou: 0.3656
+  tentativeDetectorConfidence: 0.2008
+  minMatchingScore4TentativeIou: 0.5296
+
+StateEstimator:
+  stateEstimatorType: 1
+  processNoiseVar4Loc: 1.5110
+  processNoiseVar4Size: 1.3159
+  processNoiseVar4Vel: 0.0300
+  measurementNoiseVar4Detector: 3.0283
+  measurementNoiseVar4Tracker: 8.1505
+
+VisualTracker:
+  visualTrackerType: 1
+  useColorNames: 1
+  useHog: 0
+  featureImgSizeLevel: 2
+  featureFocusOffsetFactor_y: -0.2000
+  filterLr: 0.0750
+  filterChannelWeightsLr: 0.1000
+  gaussianSigma: 0.7500

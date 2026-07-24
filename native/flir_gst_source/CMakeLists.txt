@@ -19,15 +19,19 @@ add_library(gstflirspinsrc SHARED
 
 target_include_directories(gstflirspinsrc SYSTEM PRIVATE
   /opt/spinnaker/include
+  /opt/nvidia/deepstream/deepstream/sources/includes
 )
 
 target_link_directories(gstflirspinsrc PRIVATE
   /opt/spinnaker/lib
+  /opt/nvidia/deepstream/deepstream/lib
 )
 
 target_link_libraries(gstflirspinsrc PRIVATE
   PkgConfig::GST
   Spinnaker
+  nvds_meta
+  nvdsgst_meta
 )
 
 target_compile_definitions(gstflirspinsrc PRIVATE
@@ -43,6 +47,6 @@ target_compile_options(gstflirspinsrc PRIVATE
 set_target_properties(gstflirspinsrc PROPERTIES
   PREFIX ""
   OUTPUT_NAME "gstflirspinsrc"
-  BUILD_RPATH "/opt/spinnaker/lib"
-  INSTALL_RPATH "/opt/spinnaker/lib"
+  BUILD_RPATH "/opt/spinnaker/lib;/opt/nvidia/deepstream/deepstream/lib"
+  INSTALL_RPATH "/opt/spinnaker/lib;/opt/nvidia/deepstream/deepstream/lib"
 )

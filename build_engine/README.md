@@ -29,19 +29,24 @@ models/<model_name>/
 
 ## What It Does
 
-1. Copies the source `.pt` into the model package.
-2. Reads class names and keypoint shape from the `.pt` and data YAML.
-3. Validates the YOLO26 pose contract: class count, keypoint count, and `x/y/conf`
-   keypoint layout.
-4. Exports ONNX with Ultralytics using `nms=False`.
-5. Builds a TensorRT engine with local TensorRT `trtexec`.
-6. Writes a DeepStream `nvinfer` config for `NvDsInferParseYolo26Pose`.
-7. Writes a pose sidecar JSON used by SqueakView instead of unsupported custom
-   keys inside the DeepStream config.
-8. Writes `model.yaml` and `validation/import_report.json` for later GUI and
-   preflight integration.
-9. Verifies that the generated DeepStream config paths are absolute and point to
-   existing files.
+1. Reads classes, keypoint labels, and keypoint shape from the dataset YAML.
+2. Treats the dataset YAML as read-only ground truth; no SqueakView-specific fields are required or written. No model-specific labels or indices live in the notebook.
+3. Validates those values against the source `.pt` checkpoint.
+4. Passes the same YAML to the Ultralytics exporter with `data=...`.
+5. Exports a static, end-to-end TensorRT engine directly on the target Jetson.
+6. Validates the ONNX model and `(batch, 300, 6 + 3*kpts)` output contract.
+7. Removes the Ultralytics JSON prefix from the engine and validates the raw
+   TensorRT plan before giving it to DeepStream.
+8. Writes a detector config with clustering disabled because YOLO26 end-to-end
+   output already contains final detections.
+9. Writes the complete pose schema v2 with tensor/input contracts, a global confidence threshold, all keypoints assigned to each class, and class zero tracked by default.
+10. Writes `model.yaml` and `validation/import_report.json` with portable
+    dataset provenance and a schema-v2 check.
+11. Writes the completed model package under `models/<model_name>/`.
+
+## Dataset Metadata
+
+The builder reads standard `names`, `kpt_shape`, and any of `kp_names`, `keypoint_names`, or Ultralytics `kpt_names`. The checkpoint supplies classes, shape, and named keypoints when the YAML omits them. The source YAML is never modified.
 
 ## Environment
 
@@ -57,16 +62,14 @@ Ultralytics, PyTorch, ONNX, PyYAML, and TensorRT available.
 ## Runtime Assumptions
 
 - DeepStream is installed on the Jetson.
-- `trtexec` is available at `/usr/src/tensorrt/bin/trtexec`, on `PATH`, or via
-  `TRTEXEC=/path/to/trtexec`.
+- The TensorRT Python bindings installed by JetPack are importable.
 - The generated DeepStream config uses paths relative to the config file for the
   ONNX, engine, labels, and custom parser library, keeping model packages
   portable across clone locations.
 - The generated config is for YOLO26 pose only:
   `parse-bbox-func-name=NvDsInferParseYolo26Pose`.
-- Engine builds and notebooks can fragment Jetson GPU/NvMap memory. Before long
-  acquisition runs, close Jupyter/build processes or reboot if preflight reports
-  low `tegrastats` `lfb` memory.
+- Build the native parser after system CUDA/TensorRT updates and before running
+  the notebook. Close Jupyter after engine builds before long acquisition runs.
 
 ## Before Selecting The Model In The GUI
 
@@ -76,3 +79,9 @@ Check these values in the generated package:
 2. `configs/<model_name>.txt` points to an existing ONNX and engine.
 3. `labels/classes.txt` and `labels/labels.txt` are correct.
 4. `validation/import_report.json` has no failed checks.
+
+Then run the strict package validation used by preflight:
+
+```bash
+uv run python -m squeakview.model_package --config models/<model_name>/configs/<model_name>.txt
+```

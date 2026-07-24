@@ -19,6 +19,7 @@ from squeakview.apps.operator.gui.config_dialog import (
     center_window,
 )
 from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+from squeakview.apps.operator.gui.ipc_preview import IpcPreviewController
 from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile
 from squeakview import config as squeakview_config
 from squeakview import model_package
@@ -248,6 +249,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         self._build_ui()
+        self._preview_controller = IpcPreviewController(self._emit_log, self)
+        self._preview_controller.ready.connect(self._on_preview_ready)
+        self._preview_controller.failed.connect(self._on_preview_failed)
+        self._preview_controller.ended.connect(self._on_preview_ended)
         self._apply_brand_theme()
         apply_dark_combo_popups(self)
         QtCore.QTimer.singleShot(0, self._capture_preview_window_id)
@@ -700,7 +705,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "serial_baud": defaults.serial_baud,
             "ds_cfg": str(ds_cfg) if ds_cfg else "",
             "inference_enabled": defaults.inference_enabled,
-            "draw_skeleton": False,
             "task_cfg": str(task_cfg),
             "num_cameras": max(1, defaults.num_cameras),
             "bitrate": defaults.bitrate,
@@ -1023,7 +1027,6 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.exposure_us = data.get("exposure_us", 10000)
         cfg.ds_cfg = ds_cfg
         cfg.inference_enabled = inference_on
-        cfg.draw_skeleton = data.get("draw_skeleton", False)
         cfg.num_cameras = int(data.get("num_cameras", 1))
         cfg.bitrate = data["bitrate"]
         cfg.serial_enabled = data["serial_enabled"]
@@ -1059,7 +1062,6 @@ class MainWindow(QtWidgets.QMainWindow):
             arduino_fps=data["arduino_fps"],
             mouse_id=data.get("mouse_id", ""),
             experiment_name=data.get("experiment_name", ""),
-            draw_skeleton=data.get("draw_skeleton", False),
             task_cfg=task_cfg,
         )
         cfg.bottles = self._collect_bottle_payload(include_final=False, strict=False)
@@ -1206,6 +1208,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.backend.start_run(config):
             self._emit_log("[GUI] Failed to start run")
             return
+        self._start_ipc_preview(config)
         self._clear_bottle_final_fields()
         if self.backend.state.run_dir is not None:
             self._set_bottle_status("Initial bottle info saved with current run.")
@@ -1224,8 +1227,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview.set_status("Live", color="#5c6df5")
         self._emit_log("[GUI] Run started")
 
+    def _start_ipc_preview(self, config: process.LaunchConfig) -> None:
+        sockets = tuple(config.preview_socket_paths)
+        if not sockets or self._preview_window_id is None:
+            self._on_preview_failed("Preview unavailable: no IPC socket was configured")
+            return
+        if len(sockets) > 1:
+            self._emit_log(
+                f"[PREVIEW] {len(sockets)} camera streams are available; displaying camera 0"
+            )
+        self._preview_controller.start(sockets[0], self._preview_window_id)
+
+    @QtCore.Slot()
+    def _on_preview_ready(self) -> None:
+        self.preview.show_hint(False)
+        self.preview.set_status("Live", color="#5c6df5")
+
+    @QtCore.Slot(str)
+    def _on_preview_failed(self, error: str) -> None:
+        self.preview.label.setText(error)
+        self.preview.show_hint(True)
+        self.preview.set_status("Recording (no preview)")
+
+    @QtCore.Slot()
+    def _on_preview_ended(self) -> None:
+        if not self._stop_in_progress:
+            self.preview.label.setText("Preview stream ended")
+            self.preview.show_hint(True)
+            self.preview.set_status("Preview ended")
+
     @QtCore.Slot(str)
     def _on_backend_run_failed(self, error: str) -> None:
+        self._preview_controller.stop()
         self._stop_in_progress = False
         self._hide_stop_overlay()
         self.preview.show_hint(True)
@@ -1260,6 +1293,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.configure_btn.setEnabled(False)
         self.preview.set_status("Finalizing")
         self._emit_log("[GUI] Stopping run…")
+        self._preview_controller.stop()
 
         def _worker() -> None:
             try:
@@ -1321,6 +1355,7 @@ class MainWindow(QtWidgets.QMainWindow):
         print(msg, flush=True)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        self._preview_controller.stop()
         try:
             self.backend.shutdown()
         except Exception:

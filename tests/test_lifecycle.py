@@ -16,6 +16,7 @@ class FakeProcessHandle:
     def __init__(self) -> None:
         self.running = True
         self.terminate_calls = 0
+        self.returncode = 0
 
     def is_running(self) -> bool:
         return self.running
@@ -24,8 +25,9 @@ class FakeProcessHandle:
         self.terminate_calls += 1
         self.running = False
 
-    def wait(self, timeout: float | None = None) -> None:
+    def wait(self, timeout: float | None = None) -> int:
         del timeout
+        return self.returncode
 
 
 class FakeSerialHandle:
@@ -65,6 +67,9 @@ class BackendLifecycleTests(unittest.TestCase):
         self.task_cfg.write_text("task_name: test\n")
         self.run_dir = self.root / "run"
         self.run_dir.mkdir()
+        run_context.atomic_write_json(
+            self.run_dir / "recording_validation.json", {"passed": True}
+        )
         self.logs: list[str] = []
         self.started: list[bool] = []
         self.failures: list[str] = []
@@ -167,6 +172,70 @@ class BackendLifecycleTests(unittest.TestCase):
         self.assertEqual(self.status()["state"], "finalized")
         self.assertEqual(self.handle.terminate_calls, 0)
 
+    def test_stop_halts_controller_before_draining_capture(self) -> None:
+        FakeSerialHandle.instances.clear()
+        with (
+            mock.patch.object(manager.serial_util, "have_pyserial", return_value=True),
+            mock.patch.object(manager.serial_util, "SerialHandle", FakeSerialHandle),
+        ):
+            self.assertTrue(self.backend.start_run(self.config(serial_enabled=True)))
+
+        serial_handle = FakeSerialHandle.instances[-1]
+        events: list[str] = []
+
+        def log_marker(marker: str) -> None:
+            events.append(f"marker:{marker}")
+
+        def send_line(line: str) -> None:
+            events.append(f"send:{line}")
+
+        def terminate(*_args, **_kwargs) -> None:
+            events.append("inference:terminate")
+            self.handle.running = False
+
+        serial_handle.log_marker = log_marker
+        serial_handle.send_line = send_line
+        serial_handle.close = lambda: events.append("serial:close")
+        self.handle.terminate_group_graceful = terminate
+
+        self.backend.stop_run()
+
+        self.assertEqual(
+            events,
+            [
+                "marker:CAPTURE_STOP_REQUESTED",
+                "marker:STOP_SENT",
+                "send:STOP",
+                "inference:terminate",
+                "marker:CAPTURE_STOP_DONE",
+                "serial:close",
+            ],
+        )
+        self.assertEqual(self.status()["state"], "finalized")
+
+    def test_stop_marks_failed_when_recording_validation_fails(self) -> None:
+        self.assertTrue(self.backend.start_run(self.config()))
+        run_context.atomic_write_json(
+            self.run_dir / "recording_validation.json", {"passed": False}
+        )
+
+        self.backend.stop_run()
+
+        status = self.status()
+        self.assertEqual(status["state"], "failed")
+        self.assertIn("recording frame-count validation failed", status["error"])
+        self.assertEqual(self.failures, [status["error"]])
+
+    def test_stop_marks_failed_when_inference_process_exits_nonzero(self) -> None:
+        self.assertTrue(self.backend.start_run(self.config()))
+        self.handle.returncode = 9
+
+        self.backend.stop_run()
+
+        status = self.status()
+        self.assertEqual(status["state"], "failed")
+        self.assertIn("inference exit code 9", status["error"])
+
     def test_trigger_timeout_never_sends_start(self) -> None:
         FakeSerialHandle.instances.clear()
         self.patches.extend(
@@ -213,6 +282,37 @@ class BackendLifecycleTests(unittest.TestCase):
 
 
 class ProcessHandleTests(unittest.TestCase):
+    def test_preview_socket_paths_are_short_unique_and_per_camera(self) -> None:
+        paths = process.preview_socket_paths(
+            Path("/a/very/long/run/directory/that/cannot/be/a/unix/socket/path"),
+            2,
+        )
+
+        self.assertEqual(len(paths), 2)
+        self.assertNotEqual(paths[0], paths[1])
+        self.assertTrue(all(path.parent == Path("/tmp") for path in paths))
+        self.assertTrue(all(len(str(path).encode()) < 108 for path in paths))
+
+    def test_spawn_inference_passes_ipc_sockets_not_window_id(self) -> None:
+        root = Path("/tmp/squeakview-process-test")
+        cfg = process.LaunchConfig(
+            ds_cfg=None,
+            inference_enabled=False,
+            num_cameras=2,
+            preview_window_id=12345,
+            run_dir=root,
+        )
+        sentinel = object()
+        with mock.patch.object(process, "_spawn", return_value=sentinel) as spawn:
+            result = process.spawn_inference(cfg, lambda _line: None)
+
+        self.assertIs(result, sentinel)
+        args = spawn.call_args.args[1]
+        self.assertNotIn("--window-xid", args)
+        self.assertEqual(args.count("--preview-socket"), 2)
+        for socket_path in process.preview_socket_paths(root, 2):
+            self.assertIn(str(socket_path), args)
+
     def test_exit_callback_receives_child_return_code(self) -> None:
         exited = threading.Event()
         returncodes: list[int] = []

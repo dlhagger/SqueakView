@@ -33,7 +33,13 @@ class DeepStreamConfigLocalizationTests(unittest.TestCase):
             "batch-size=1\n"
         )
         self.sidecar = self.config_dir / "model.pose.json"
-        self.sidecar.write_text('{"keypoint_labels_path": "../labels/labels.txt", "draw_threshold": 0.5}\n')
+        self.sidecar.write_text(json.dumps({
+            "schema_version": 2,
+            "postprocess": "pyservicemaker_yolo26_pose_v1",
+            "keypoint_labels_path": "../labels/labels.txt",
+            "keypoint_threshold": 0.5,
+            "classes": [],
+        }) + "\n")
         self.run_dir = self.root / "run"
         self.logs: list[str] = []
 

@@ -25,12 +25,6 @@ def _now() -> str:
     return time.strftime("%H:%M:%S")
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
 
 def _relocate_summary_outputs(
     summary: dict[str, Any], source_dir: Path, final_dir: Path
@@ -255,7 +249,14 @@ class OperatorBackend:
         csv_rows = {
             "frames": self._csv_data_rows(artifacts.frames_csv),
             "drop_events": self._csv_data_rows(artifacts.drop_events_csv),
+            "inference_frames": self._csv_data_rows(run_dir / "inference" / "frames.csv"),
+            "record_admission": self._csv_data_rows(run_dir / "record_admission.csv"),
+            "inference_admission": self._csv_data_rows(run_dir / "inference_admission.csv"),
+            "camera_telemetry": self._csv_data_rows(run_dir / "camera_telemetry.csv"),
             "detections": self._csv_data_rows(artifacts.detections_csv),
+            "objects": self._csv_data_rows(artifacts.objects_csv),
+            "keypoints": self._csv_data_rows(artifacts.keypoints_csv),
+            "tracks": self._csv_data_rows(artifacts.tracks_csv),
             "serial": self._csv_data_rows(artifacts.serial_csv) if artifacts.serial_csv else None,
             "perf": self._csv_data_rows(run_dir / "perf_stats.csv"),
             "bottle_measurements": self._csv_data_rows(artifacts.bottle_measurements_csv),
@@ -265,6 +266,11 @@ class OperatorBackend:
         return {
             "csv_rows": csv_rows,
             "video_files": [self._file_info(path) for path in video_files],
+            "inference_admission": self._file_info(run_dir / "inference_admission.json"),
+            "recording_validation": self._file_info(run_dir / "recording_validation.json"),
+            "capture_reconciliation": self._file_info(run_dir / "capture_reconciliation.json"),
+            "camera_runtime": self._file_info(run_dir / "camera_runtime.json"),
+            "camera_telemetry": self._file_info(run_dir / "camera_telemetry.csv"),
             "analysis_dir": str(run_dir / "analysis"),
             "has_analysis": (run_dir / "analysis").exists(),
             "bottle_measurements_complete": bool(bottle_summary.get("complete")) if bottle_summary else False,
@@ -291,7 +297,6 @@ class OperatorBackend:
         artifacts = run_context.run_artifacts(run_dir)
         experiment = (cfg.experiment_name or "").strip() or None
         mouse_id = (cfg.mouse_id or "").strip() or None
-        chunked_recording = _env_flag("SQUEAKVIEW_ENABLE_CHUNKED_RECORDING", False)
         try:
             relative_run_dir = run_dir.relative_to(run_context.RUNS_DIR).as_posix()
         except ValueError:
@@ -311,6 +316,7 @@ class OperatorBackend:
             "capture": {
                 "backend": str(getattr(cfg, "capture_backend", "flir_direct")),
                 "num_cameras": int(getattr(cfg, "num_cameras", 1)),
+                "camera_serials": list(getattr(cfg, "camera_serials", ())),
                 "width": cfg.width,
                 "height": cfg.height,
                 "fps": cfg.fps,
@@ -318,26 +324,41 @@ class OperatorBackend:
                 "trigger_on": cfg.trigger_on,
                 "trigger_activation": cfg.trigger_activation,
                 "arduino_fps": cfg.arduino_fps,
+                "metadata_profile": "scientific",
+                "runtime_metadata": "camera_runtime.json",
+                "frame_identity": {
+                    "camera_frame_id": "FLIR chunk FrameID",
+                    "stream_frame_id": "Spinnaker Image.GetFrameID acquisition-local counter",
+                    "source_sequence_index": "flirspinsrc emitted-buffer counter",
+                    "missing_value_policy": "null; never substitute a sequential counter",
+                },
             },
             "inference": {
                 "enabled": cfg.inference_enabled,
                 "deepstream_config": (str(cfg.ds_cfg) if cfg.ds_cfg else None),
                 "model_package": self._model_snapshot,
                 "bitrate_kbps": cfg.bitrate,
-                "preview_window_id": cfg.preview_window_id,
+                "preview_transport": "nvunixfd",
+                "preview_sockets": [str(path) for path in cfg.preview_socket_paths],
+                "flow_control": "downstream-leaky; latest pending frames retained",
+                "admission_manifest": "inference_admission.csv",
+                "admission_summary": "inference_admission.json",
+                "frame_manifest": "inference/frames.csv",
             },
             "recording": {
                 "container": "mp4",
-                "segmented": chunked_recording,
-                "pattern": "raw_%06d.mp4" if chunked_recording else "raw.mp4",
-                "segment_seconds": (
-                    int(os.environ.get("SQUEAKVIEW_RECORD_SEGMENT_SECONDS", "600")) if chunked_recording else None
-                ),
-                "video_segments": "video_segments.csv" if chunked_recording else None,
+                "file": "raw.mp4",
+                "admission_manifest": "record_admission.csv",
+                "source_ledger": "capture_cam0.jsonl",
                 "frame_manifest": artifacts.frames_csv.name,
                 "drop_events": artifacts.drop_events_csv.name,
+                "validation": "recording_validation.json",
+                "camera_telemetry": "camera_telemetry.csv",
                 "detections": artifacts.detections_csv.name,
-                "serial": artifacts.serial_csv.name if artifacts.serial_csv else None,
+                "objects": artifacts.objects_csv.name,
+                "keypoints": artifacts.keypoints_csv.name,
+                "tracks": artifacts.tracks_csv.name,
+                "serial": artifacts.serial_csv.name if cfg.serial_enabled and artifacts.serial_csv else None,
                 "perf": "perf_stats.csv",
             },
             "task_config": str(cfg.task_cfg) if cfg.task_cfg else None,
@@ -351,13 +372,22 @@ class OperatorBackend:
                 "status": run_context.RUN_STATUS_FILENAME,
                 "manifest": run_context.RUN_MANIFEST_FILENAME,
                 "camera_settings": artifacts.metadata_json.name,
+                "camera_runtime": "camera_runtime.json",
+                "camera_telemetry": "camera_telemetry.csv",
                 "deepstream_config_dir": "deepstream_config",
                 "frames": artifacts.frames_csv.name,
                 "drop_events": artifacts.drop_events_csv.name,
                 "detections": artifacts.detections_csv.name if cfg.inference_enabled else None,
+                "objects": artifacts.objects_csv.name if cfg.inference_enabled else None,
+                "keypoints": artifacts.keypoints_csv.name if cfg.inference_enabled else None,
+                "tracks": artifacts.tracks_csv.name if cfg.inference_enabled else None,
                 "serial": artifacts.serial_csv.name if cfg.serial_enabled and artifacts.serial_csv else None,
-                "raw_video": artifacts.raw_video_pattern.name if chunked_recording else artifacts.raw_video.name,
-                "video_segments": "video_segments.csv" if chunked_recording else None,
+                "raw_video": artifacts.raw_video.name,
+                "record_admission": "record_admission.csv",
+                "capture_reconciliation": "capture_reconciliation.json",
+                "inference_frames": "inference/frames.csv" if cfg.inference_enabled else None,
+                "inference_admission": "inference_admission.csv" if cfg.inference_enabled else None,
+                "recording_validation": "recording_validation.json",
                 "bottle_setup": artifacts.bottle_setup_json.name,
                 "bottle_measurements": artifacts.bottle_measurements_csv.name,
                 "bottle_summary": artifacts.bottle_summary_json.name,
@@ -403,7 +433,6 @@ class OperatorBackend:
         if self._metadata_written:
             return
         cfg = self.launch_cfg
-        chunked_recording = _env_flag("SQUEAKVIEW_ENABLE_CHUNKED_RECORDING", False)
         payload = {
             "schema_version": "1.0",
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -411,6 +440,7 @@ class OperatorBackend:
             "capture": {
                 "backend": str(getattr(cfg, "capture_backend", "flir_direct")),
                 "num_cameras": int(getattr(cfg, "num_cameras", 1)),
+                "camera_serials": list(getattr(cfg, "camera_serials", ())),
                 "width": cfg.width,
                 "height": cfg.height,
                 "fps": cfg.fps,
@@ -418,24 +448,29 @@ class OperatorBackend:
                 "trigger_on": cfg.trigger_on,
                 "trigger_activation": cfg.trigger_activation,
                 "arduino_fps": cfg.arduino_fps,
+                "metadata_profile": "scientific",
+                "runtime_metadata": "camera_runtime.json",
+                "frame_identity": {
+                    "camera_frame_id": "FLIR chunk FrameID",
+                    "stream_frame_id": "Spinnaker Image.GetFrameID acquisition-local counter",
+                    "source_sequence_index": "flirspinsrc emitted-buffer counter",
+                    "missing_value_policy": "null; never substitute a sequential counter",
+                },
             },
             "inference": {
                 "enabled": cfg.inference_enabled,
                 "deepstream_config": (str(cfg.ds_cfg) if cfg.ds_cfg else None),
                 "model_package": self._model_snapshot,
                 "bitrate_kbps": cfg.bitrate,
-                "preview_window_id": cfg.preview_window_id,
+                "preview_transport": "nvunixfd",
+                "preview_sockets": [str(path) for path in cfg.preview_socket_paths],
             },
             "recording": {
                 "container": "mp4",
-                "segmented": chunked_recording,
-                "pattern": "raw_%06d.mp4" if chunked_recording else "raw.mp4",
-                "segment_seconds": (
-                    int(os.environ.get("SQUEAKVIEW_RECORD_SEGMENT_SECONDS", "600")) if chunked_recording else None
-                ),
-                "video_segments": "video_segments.csv" if chunked_recording else None,
+                "file": "raw.mp4",
                 "frame_manifest": "frames.csv",
                 "drop_events": "drop_events.csv",
+                "camera_telemetry": "camera_telemetry.csv",
             },
             "task_config": str(cfg.task_cfg) if cfg.task_cfg else None,
             "serial": {
@@ -459,25 +494,6 @@ class OperatorBackend:
             return None
 
         run_dir = Path(run_dir)
-        chunked_video_files = sorted(run_dir.glob("raw_*.mp4"))
-        if chunked_video_files:
-            ledger_path = run_dir / "video_segments.csv"
-            try:
-                ledger_rows = self._csv_data_rows(ledger_path)
-            except Exception:
-                ledger_rows = None
-            if not ledger_path.exists() or not ledger_rows:
-                error = (
-                    "chunked MP4 files exist without writer-owned video_segments.csv; "
-                    "segment provenance is not authoritative"
-                )
-                self._log(f"[ANALYSIS] failed: {error}")
-                try:
-                    run_context.write_status(run_dir, "analysis_failed", error=error)
-                except Exception:
-                    pass
-                return None
-
         def skip(reason: str) -> None:
             self._log(f"[ANALYSIS] skipped; {reason}")
             try:
@@ -488,6 +504,10 @@ class OperatorBackend:
         enabled = os.environ.get("SQUEAKVIEW_AUTO_ALIGN", "1").lower()
         if enabled in {"0", "false", "no", "off"}:
             skip("SQUEAKVIEW_AUTO_ALIGN=0")
+            return None
+
+        if not self.launch_cfg.serial_enabled:
+            skip("serial capture disabled; TTL alignment not requested")
             return None
 
         missing = [name for name in ("frames.csv", "serial.csv") if not (run_dir / name).exists()]
@@ -544,6 +564,9 @@ class OperatorBackend:
                 value = section.get(key)
                 if value not in (None, 0):
                     warnings.append(f"{key}={value}")
+            frame_alignment = summary.get("frame_alignment", {})
+            if frame_alignment.get("validated") is False:
+                warnings.append("frame_alignment.validated=false")
             if validation.get("video_frame_count_matches_frames_csv") is False:
                 warnings.append("video_frame_count_matches_frames_csv=false")
             elif validation.get("video_frame_count_matches_frames_csv") is None:
@@ -583,6 +606,7 @@ class OperatorBackend:
             run_dir = self.state.run_dir
             inference = self.state.inference
             inference_running = bool(inference and inference.is_running())
+            inference_returncode: int | None = None
 
             if final_state == "finalized":
                 self._log("[BACKEND] stopping run")
@@ -592,26 +616,49 @@ class OperatorBackend:
                     except Exception:
                         pass
 
-            if terminate_inference and inference_running and inference is not None:
-                if self.state.serial:
-                    self.state.serial.log_marker("CAPTURE_STOP_REQUESTED")
-                inference.terminate_group_graceful(signal.SIGINT, 10.0, True)
-                inference.wait(timeout=2)
-                if self.state.serial:
-                    self.state.serial.log_marker("CAPTURE_STOP_DONE")
+            serial_handle = self.state.serial
+            stopping_capture = bool(terminate_inference and inference_running and inference is not None)
+            if stopping_capture and serial_handle:
+                serial_handle.log_marker("CAPTURE_STOP_REQUESTED")
 
-            if self.state.serial:
+            # Stop the controller first so it cannot generate unrecorded trigger
+            # pulses while DeepStream drains the recording branch and closes MP4.
+            if serial_handle:
                 try:
-                    self.state.serial.log_marker("STOP_SENT")
-                    self.state.serial.send_line("STOP")
+                    serial_handle.log_marker("STOP_SENT")
+                    serial_handle.send_line("STOP")
                 except Exception:
                     pass
+
+            if stopping_capture and inference is not None:
+                inference.terminate_group_graceful(signal.SIGINT, 10.0, True)
+                inference_returncode = inference.wait(timeout=2)
+                if serial_handle:
+                    serial_handle.log_marker("CAPTURE_STOP_DONE")
+
+            if serial_handle:
                 try:
                     time.sleep(0.5)
                 except Exception:
                     pass
-                self.state.serial.close()
+                serial_handle.close()
                 self.state.serial = None
+
+            failure_reasons: list[str] = []
+            if final_state == "finalized":
+                if inference_returncode not in (None, 0):
+                    failure_reasons.append(f"inference exit code {inference_returncode}")
+                if run_dir:
+                    validation_path = Path(run_dir) / "recording_validation.json"
+                    validation = run_context.read_json(validation_path)
+                    if not validation_path.exists():
+                        failure_reasons.append("recording validation was not produced")
+                    elif validation.get("passed") is not True:
+                        failure_reasons.append("recording frame-count validation failed")
+            if failure_reasons:
+                final_state = "failed"
+                error = "; ".join(failure_reasons)
+                self._log(f"[BACKEND] run failed validation: {error}")
 
             self.state.inference = None
             analysis_summary = self._run_post_run_alignment(run_dir)
@@ -695,6 +742,7 @@ class OperatorBackend:
             self._log(f"[SAVE] failed to create run directory: {exc}")
             return False
         cfg.run_dir = run_dir
+        cfg.preview_socket_paths = process.preview_socket_paths(run_dir, cfg.num_cameras)
         self.state.run_dir = run_dir
         self._run_finalized = False
         try:
@@ -765,9 +813,9 @@ class OperatorBackend:
         if serial_handle and cfg.trigger_on:
             self._log("[BACKEND] waiting for inference ready before START")
             try:
-                ready_timeout = max(1.0, float(os.environ.get("SQUEAKVIEW_INFERENCE_READY_TIMEOUT", "8")))
+                ready_timeout = max(1.0, float(os.environ.get("SQUEAKVIEW_INFERENCE_READY_TIMEOUT", "30")))
             except ValueError:
-                ready_timeout = 8.0
+                ready_timeout = 30.0
             ready = self._inference_ready.wait(timeout=ready_timeout)
             if not ready:
                 error = f"inference was not ready within {ready_timeout:.1f}s; controller was not started"
@@ -798,16 +846,3 @@ class OperatorBackend:
 
     def shutdown(self) -> None:
         self.stop_run()
-
-    def set_skeleton_enabled(self, enabled: bool) -> None:
-        """Toggle pose skeleton drawing at runtime by touching the control file."""
-        run_dir = self._maybe_set_run_dir_from_marker()
-        if not run_dir:
-            self._log("[BACKEND] skeleton toggle ignored; run dir unknown")
-            return
-        path = run_dir / "skeleton_toggle.txt"
-        try:
-            path.write_text("on" if enabled else "off")
-            self._log(f"[BACKEND] skeleton {'on' if enabled else 'off'}")
-        except Exception as exc:
-            self._log(f"[BACKEND] skeleton toggle failed: {exc}")
