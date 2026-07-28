@@ -55,6 +55,10 @@ class FakeSerialHandle:
         del timeout_s
         return True
 
+    def wait_for_stop_ack(self, timeout_s: float = 2.0) -> bool:
+        del timeout_s
+        return True
+
     def close(self) -> None:
         self.closed = True
 
@@ -68,7 +72,8 @@ class BackendLifecycleTests(unittest.TestCase):
         self.run_dir = self.root / "run"
         self.run_dir.mkdir()
         run_context.atomic_write_json(
-            self.run_dir / "recording_validation.json", {"passed": True}
+            self.run_dir / "run_status.json",
+            {"recording_validation": {"passed": True}},
         )
         self.logs: list[str] = []
         self.started: list[bool] = []
@@ -93,7 +98,7 @@ class BackendLifecycleTests(unittest.TestCase):
             mock.patch.object(self.backend, "_write_run_manifest"),
             mock.patch.object(self.backend, "_write_bottle_measurements", return_value={}),
             mock.patch.object(self.backend, "_ensure_metadata"),
-            mock.patch.object(self.backend, "_run_post_run_alignment", return_value=None),
+            mock.patch.object(self.backend, "_run_capture_finalizer", return_value=0),
             mock.patch.object(self.backend, "_run_output_snapshot", return_value={}),
             mock.patch.object(manager.time, "sleep"),
         ]
@@ -155,6 +160,7 @@ class BackendLifecycleTests(unittest.TestCase):
 
     def test_invalid_model_is_rejected_before_run_creation(self) -> None:
         missing_config = self.root / "models" / "missing" / "configs" / "missing.txt"
+        (self.run_dir / run_context.RUN_STATUS_FILENAME).unlink()
 
         result = self.backend.start_run(self.config(inference_enabled=True, ds_cfg=missing_config))
 
@@ -195,6 +201,7 @@ class BackendLifecycleTests(unittest.TestCase):
 
         serial_handle.log_marker = log_marker
         serial_handle.send_line = send_line
+        serial_handle.wait_for_stop_ack = lambda **_kwargs: events.append("wait:ACK_STOP") or True
         serial_handle.close = lambda: events.append("serial:close")
         self.handle.terminate_group_graceful = terminate
 
@@ -206,6 +213,8 @@ class BackendLifecycleTests(unittest.TestCase):
                 "marker:CAPTURE_STOP_REQUESTED",
                 "marker:STOP_SENT",
                 "send:STOP",
+                "wait:ACK_STOP",
+                "marker:CAPTURE_STOP_ACKED",
                 "inference:terminate",
                 "marker:CAPTURE_STOP_DONE",
                 "serial:close",
@@ -215,8 +224,8 @@ class BackendLifecycleTests(unittest.TestCase):
 
     def test_stop_marks_failed_when_recording_validation_fails(self) -> None:
         self.assertTrue(self.backend.start_run(self.config()))
-        run_context.atomic_write_json(
-            self.run_dir / "recording_validation.json", {"passed": False}
+        run_context.update_status(
+            self.run_dir, recording_validation={"passed": False}
         )
 
         self.backend.stop_run()
@@ -235,6 +244,36 @@ class BackendLifecycleTests(unittest.TestCase):
         status = self.status()
         self.assertEqual(status["state"], "failed")
         self.assertIn("inference exit code 9", status["error"])
+
+    def test_capture_drain_waits_for_quiet_source_and_admission_ledgers(self) -> None:
+        (self.run_dir / "capture_cam0.jsonl").write_text("{}\n")
+        (self.run_dir / "record_admission.csv").write_text("pts_ns\n")
+        self.backend.launch_cfg = self.config(num_cameras=1)
+
+        with mock.patch.dict(
+            manager.os.environ,
+            {
+                "SQUEAKVIEW_CAPTURE_DRAIN_QUIET_S": "0.1",
+                "SQUEAKVIEW_CAPTURE_DRAIN_TIMEOUT_S": "0.5",
+            },
+        ):
+            drained = self.backend._wait_for_capture_drain(
+                self.run_dir, expected_ttl_count=123
+            )
+
+        self.assertTrue(drained)
+        status = self.status()
+        self.assertEqual(status["state"], "capture_drained")
+        self.assertEqual(status["expected_ttl_count"], 123)
+
+    def test_stop_marks_failed_when_independent_finalizer_fails(self) -> None:
+        self.assertTrue(self.backend.start_run(self.config()))
+        with mock.patch.object(self.backend, "_run_capture_finalizer", return_value=1):
+            self.backend.stop_run()
+
+        status = self.status()
+        self.assertEqual(status["state"], "failed")
+        self.assertIn("post-run finalizer exit code 1", status["error"])
 
     def test_trigger_timeout_never_sends_start(self) -> None:
         FakeSerialHandle.instances.clear()

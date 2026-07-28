@@ -457,11 +457,21 @@ class SessionLauncherDialog(QtWidgets.QDialog):
             QPushButton#launcherDangerButton:hover {
                 background-color: #493047;
             }
+            QPushButton#launcherDangerButton:disabled {
+                background-color: #242535;
+                border-color: #303247;
+                color: #686d82;
+            }
             QPushButton#launcherPrimaryButton {
                 background-color: #5c6df5;
                 border-color: #5c6df5;
                 min-height: 38px;
                 padding: 8px 18px;
+            }
+            QPushButton#launcherPrimaryButton:disabled {
+                background-color: #2a3248;
+                border-color: #313c5d;
+                color: #7f8aac;
             }
             """
         )
@@ -695,10 +705,10 @@ class SessionLauncherDialog(QtWidgets.QDialog):
         try:
             self.subject_combo.clear()
             self.subject_combo.addItem("Select subject…", "")
-            for profile in self._subjects:
-                if allowed and profile.subject_id not in allowed:
-                    continue
-                self.subject_combo.addItem(profile.name, profile.subject_id)
+            if experiment is not None:
+                for profile in self._subjects:
+                    if profile.subject_id in allowed:
+                        self.subject_combo.addItem(profile.name, profile.subject_id)
             idx = self.subject_combo.findData(selected_subject)
             if idx < 0:
                 idx = 0

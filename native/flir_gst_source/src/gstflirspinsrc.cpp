@@ -64,6 +64,7 @@ enum {
   PROP_TIMEOUT_MS,
   PROP_DROP_INCOMPLETE,
   PROP_BUFFER_HANDLING,
+  PROP_STREAM_BUFFER_COUNT,
   PROP_CAMERA_SERIAL,
   PROP_METADATA_PROFILE,
   PROP_MAX_CONSECUTIVE_TIMEOUTS,
@@ -85,6 +86,7 @@ struct _GstFlirSpinSrc {
   guint timeout_ms;
   gboolean drop_incomplete;
   gchar* buffer_handling;
+  guint stream_buffer_count;
   gchar* camera_serial;
   gchar* metadata_profile;
   guint max_consecutive_timeouts;
@@ -112,6 +114,7 @@ struct _GstFlirSpinSrc {
   guint64 total_timeouts;
   guint64 total_incomplete;
   guint64 total_frame_gaps;
+  guint64 actual_stream_buffer_count;
   gchar* resolved_serial;
   gchar* device_model;
   gchar* firmware_version;
@@ -480,19 +483,33 @@ static void maybe_set_trigger(GstFlirSpinSrc* self, CameraPtr cam) {
   enum_set(node_map, "TriggerMode", "On", true);
 }
 
-static void maybe_set_stream_buffer_handling(GstFlirSpinSrc* self, CameraPtr cam) {
-  if (!self->buffer_handling || !*self->buffer_handling) {
+static void configure_stream_buffers(GstFlirSpinSrc* self, CameraPtr cam) {
+  self->actual_stream_buffer_count = 0;
+  INodeMap& stream_map = cam->GetTLStreamNodeMap();
+  if (self->buffer_handling && *self->buffer_handling) {
+    enum_set(stream_map, "StreamBufferHandlingMode", self->buffer_handling, false);
+  }
+  if (self->stream_buffer_count == 0) {
     return;
   }
-
-  INodeMap& stream_map = cam->GetTLStreamNodeMap();
-  enum_set(stream_map, "StreamBufferHandlingMode", self->buffer_handling, false);
+  enum_set(stream_map, "StreamBufferCountMode", "Manual", false);
+  CIntegerPtr count = stream_map.GetNode("StreamBufferCountManual");
+  if (!IsAvailable(count) || !IsWritable(count)) {
+    GST_WARNING_OBJECT(self, "StreamBufferCountManual is unavailable; using camera default");
+    return;
+  }
+  const int64_t minimum = count->GetMin();
+  const int64_t maximum = count->GetMax();
+  const int64_t desired = std::clamp<int64_t>(
+      static_cast<int64_t>(self->stream_buffer_count), minimum, maximum);
+  count->SetValue(desired);
+  self->actual_stream_buffer_count = static_cast<guint64>(count->GetValue());
 }
 
 static void configure_camera(GstFlirSpinSrc* self, CameraPtr cam) {
   INodeMap& node_map = cam->GetNodeMap();
 
-  maybe_set_stream_buffer_handling(self, cam);
+  configure_stream_buffers(self, cam);
   enum_set(node_map, "AcquisitionMode", "Continuous", false);
 
   if (self->pixel_format && *self->pixel_format) {
@@ -828,6 +845,9 @@ static void gst_flir_spin_src_set_property(GObject* object, guint prop_id, const
       g_free(self->buffer_handling);
       self->buffer_handling = g_value_dup_string(value);
       break;
+    case PROP_STREAM_BUFFER_COUNT:
+      self->stream_buffer_count = g_value_get_uint(value);
+      break;
     case PROP_CAMERA_SERIAL:
       g_free(self->camera_serial);
       self->camera_serial = g_value_dup_string(value);
@@ -888,6 +908,9 @@ static void gst_flir_spin_src_get_property(GObject* object, guint prop_id, GValu
       break;
     case PROP_BUFFER_HANDLING:
       g_value_set_string(value, self->buffer_handling);
+      break;
+    case PROP_STREAM_BUFFER_COUNT:
+      g_value_set_uint(value, self->stream_buffer_count);
       break;
     case PROP_CAMERA_SERIAL:
       g_value_set_string(value, self->camera_serial);
@@ -1241,6 +1264,7 @@ static GstFlowReturn copy_image_to_buffer(
       << ",\"configured_exposure_us\":" << self->actual_exposure_us
       << ",\"configured_gain_db\":" << self->actual_gain_db
       << ",\"actual_fps\":" << self->actual_fps
+      << ",\"configured_stream_buffer_count\":" << self->actual_stream_buffer_count
       << ",\"enabled_chunks\":\"" << json_escape(self->enabled_chunks ? self->enabled_chunks : "") << "\""
       << ",\"total_timeouts\":" << self->total_timeouts
       << ",\"total_incomplete\":" << self->total_incomplete
@@ -1509,6 +1533,17 @@ static void gst_flir_spin_src_class_init(GstFlirSpinSrcClass* klass) {
           static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(
       object_class,
+      PROP_STREAM_BUFFER_COUNT,
+      g_param_spec_uint(
+          "stream-buffer-count",
+          "Stream buffer count",
+          "Requested Spinnaker host transport buffers; zero leaves the camera default",
+          0,
+          G_MAXUINT,
+          64,
+          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      object_class,
       PROP_CAMERA_SERIAL,
       g_param_spec_string(
           "camera-serial",
@@ -1575,6 +1610,7 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   self->timeout_ms = DEFAULT_TIMEOUT_MS;
   self->drop_incomplete = FALSE;
   self->buffer_handling = g_strdup("OldestFirst");
+  self->stream_buffer_count = 64;
   self->camera_serial = g_strdup("");
   self->metadata_profile = g_strdup(DEFAULT_METADATA_PROFILE);
   self->max_consecutive_timeouts = DEFAULT_MAX_CONSECUTIVE_TIMEOUTS;
@@ -1601,6 +1637,7 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   self->total_timeouts = 0;
   self->total_incomplete = 0;
   self->total_frame_gaps = 0;
+  self->actual_stream_buffer_count = 0;
   self->resolved_serial = g_strdup("");
   self->device_model = g_strdup("");
   self->firmware_version = g_strdup("");

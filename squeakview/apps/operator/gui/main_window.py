@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import csv
+import io
+import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -20,6 +25,7 @@ from squeakview.apps.operator.gui.config_dialog import (
 )
 from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
 from squeakview.apps.operator.gui.ipc_preview import IpcPreviewController
+from squeakview.common import run_context
 from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile
 from squeakview import config as squeakview_config
 from squeakview import model_package
@@ -53,6 +59,48 @@ RUN_FAILURE_DIALOG_STYLESHEET = """
         background-color: #5c6df5;
     }
 """
+
+
+def _tail_text_line(path: Path, *, max_bytes: int = 131_072) -> str:
+    """Read the last complete non-empty line without scanning a growing run file."""
+
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            text = handle.read().decode(errors="replace")
+    except OSError:
+        return ""
+    lines = [line for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _last_csv_row(path: Path) -> dict[str, str]:
+    try:
+        with Path(path).open(newline="") as handle:
+            header = next(csv.reader(handle))
+    except (OSError, StopIteration, csv.Error):
+        return {}
+    raw = _tail_text_line(path)
+    if not raw or raw == ",".join(header):
+        return {}
+    try:
+        values = next(csv.reader(io.StringIO(raw)))
+    except (StopIteration, csv.Error):
+        return {}
+    return dict(zip(header, values))
+
+
+def _elapsed_text(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _is_serial_log_message(message: str) -> bool:
+    return any(marker in message for marker in ("【SER】", "【SER→】", "[SER]"))
 
 
 class PreviewWidget(QtWidgets.QWidget):
@@ -126,10 +174,27 @@ class PreviewWidget(QtWidgets.QWidget):
 
     def set_status(self, text: str, *, color: str | None = None) -> None:
         self.status_badge.setText(text)
-        if color:
-            self.status_badge.setStyleSheet(
-                self.status_badge.styleSheet() + f"\nQLabel#statusBadge {{ background-color: {color}; }}"
-            )
+        normalized = text.lower()
+        if color is None:
+            if "fail" in normalized or "ended" in normalized or "unavailable" in normalized:
+                color = "#a93750"
+            elif "live" in normalized or "recording" in normalized:
+                color = "#c4425f"
+            elif "start" in normalized or "waiting" in normalized:
+                color = "#a66a20"
+            elif "final" in normalized or "stopping" in normalized:
+                color = "#6855c7"
+            elif "complete" in normalized:
+                color = "#267a58"
+            elif "ready" in normalized:
+                color = "#4357bd"
+            else:
+                color = "#34394f"
+        self.status_badge.setStyleSheet(
+            "QLabel#statusBadge {"
+            f"background-color: {color}; color: #ffffff; padding: 4px 10px; "
+            "border-radius: 8px; font-weight: 700; font-size: 11px; }"
+        )
         self._reposition_overlays()
 
     def set_info(self, text: str | None) -> None:
@@ -215,6 +280,8 @@ class PreviewWidget(QtWidgets.QWidget):
 
 class MainWindow(QtWidgets.QMainWindow):
     log_msg = QtCore.Signal(str)
+    start_finished = QtCore.Signal(bool)
+    start_error = QtCore.Signal(str)
     stop_done = QtCore.Signal()
     stop_failed = QtCore.Signal(str)
     run_started = QtCore.Signal()
@@ -229,13 +296,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._config_data: dict | None = None
         self._preview_window_id: int | None = None
+        self._start_in_progress = False
+        self._start_thread: threading.Thread | None = None
+        self._pending_start_config: process.LaunchConfig | None = None
+        self._close_after_start = False
+        self._start_failure_reported = False
         self._stop_in_progress = False
         self._stop_thread: threading.Thread | None = None
+        self._close_after_stop = False
         self._profile_store = ProfileStore()
         self._experiments: list[ExperimentProfile] = []
         self._subjects: list[SubjectProfile] = []
         self._profile_selection_updating = False
         self._centered_once = False
+        self._recording_active = False
+        self._recording_started_monotonic: float | None = None
+        self._stop_started_monotonic: float | None = None
+        self._last_health_poll_monotonic = 0.0
+        self.start_finished.connect(self._on_start_finished)
+        self.start_error.connect(self._on_start_error)
         self.stop_done.connect(self._on_stop_complete)
         self.stop_failed.connect(self._on_stop_failed)
         self.run_started.connect(self._on_backend_run_started)
@@ -253,6 +332,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_controller.ready.connect(self._on_preview_ready)
         self._preview_controller.failed.connect(self._on_preview_failed)
         self._preview_controller.ended.connect(self._on_preview_ended)
+        self._runtime_timer = QtCore.QTimer(self)
+        self._runtime_timer.setInterval(500)
+        self._runtime_timer.timeout.connect(self._refresh_runtime_status)
+        self._runtime_timer.start()
         self._apply_brand_theme()
         apply_dark_combo_popups(self)
         QtCore.QTimer.singleShot(0, self._capture_preview_window_id)
@@ -277,6 +360,46 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(central)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(14)
+
+        run_control = QtWidgets.QFrame(self)
+        run_control.setObjectName("runControlBar")
+        run_control_layout = QtWidgets.QHBoxLayout(run_control)
+        run_control_layout.setContentsMargins(12, 9, 12, 9)
+        run_control_layout.setSpacing(10)
+        self.run_state_label = QtWidgets.QLabel("READY", self)
+        self.run_state_label.setObjectName("runStateBadge")
+        self.run_identity_label = QtWidgets.QLabel("No session selected", self)
+        self.run_identity_label.setObjectName("runIdentity")
+        self.run_elapsed_label = QtWidgets.QLabel("00:00:00", self)
+        self.run_elapsed_label.setObjectName("runElapsed")
+        self.capture_health_label = QtWidgets.QLabel("Camera --  ·  Queue --  ·  Disk --", self)
+        self.capture_health_label.setObjectName("captureHealth")
+        self.capture_health_label.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        run_control_layout.addWidget(self.run_state_label, 0)
+        run_control_layout.addWidget(self.run_identity_label, 0)
+        run_control_layout.addWidget(self.run_elapsed_label, 0)
+        run_control_layout.addWidget(self.capture_health_label, 1)
+
+        self.events_btn = QtWidgets.QPushButton("Events", self)
+        self.events_btn.setObjectName("secondaryButton")
+        self.configure_btn = QtWidgets.QPushButton("Configure…", self)
+        self.configure_btn.setObjectName("secondaryButton")
+        self.configure_btn.clicked.connect(self._on_configure)
+        self.run_btn = QtWidgets.QPushButton("Start Recording", self)
+        self.run_btn.setObjectName("primaryButton")
+        self.run_btn.setEnabled(False)
+        self.run_btn.clicked.connect(self._on_run)
+        self.stop_btn = QtWidgets.QPushButton("Stop Recording", self)
+        self.stop_btn.setObjectName("dangerButton")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._on_stop)
+        run_control_layout.addWidget(self.events_btn, 0)
+        run_control_layout.addWidget(self.configure_btn, 0)
+        run_control_layout.addWidget(self.run_btn, 0)
+        run_control_layout.addWidget(self.stop_btn, 0)
+        layout.addWidget(run_control, 0)
 
         # Main content grid: top row (preview + meters/summary/task), bottom row (graphs)
         grid = QtWidgets.QGridLayout()
@@ -337,6 +460,7 @@ class MainWindow(QtWidgets.QMainWindow):
         meters_layout.addWidget(self.summary_label)
 
         bottle_group = QtWidgets.QGroupBox("Bottles", self)
+        self.bottle_group = bottle_group
         bottle_layout = QtWidgets.QGridLayout(bottle_group)
         bottle_layout.setHorizontalSpacing(8)
         bottle_layout.setVerticalSpacing(8)
@@ -377,27 +501,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QSizePolicy.Policy.Maximum,
         )
 
-        # Move run controls into the system load panel
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.setSpacing(8)
-        btn_row.addStretch(1)
-        self.configure_btn = QtWidgets.QPushButton("Configure…")
-        self.configure_btn.setObjectName("secondaryButton")
-        self.configure_btn.clicked.connect(self._on_configure)
-        btn_row.addWidget(self.configure_btn)
-        self.run_btn = QtWidgets.QPushButton("Start Recording")
-        self.run_btn.setObjectName("primaryButton")
-        self.run_btn.setEnabled(False)
-        self.run_btn.clicked.connect(self._on_run)
-        btn_row.addWidget(self.run_btn)
-        self.stop_btn = QtWidgets.QPushButton("Stop Recording")
-        self.stop_btn.setObjectName("dangerButton")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._on_stop)
-        btn_row.addWidget(self.stop_btn)
-        meters_layout.addSpacing(6)
-        meters_layout.addLayout(btn_row)
-
         grid.addWidget(meters_group, 0, 1, 1, 1)
 
         right_column = QtWidgets.QWidget(self)
@@ -420,14 +523,14 @@ class MainWindow(QtWidgets.QMainWindow):
         dashboard_group = QtWidgets.QGroupBox("Behavior Dashboard")
         dash_layout = QtWidgets.QVBoxLayout(dashboard_group)
         dash_layout.setContentsMargins(16, 16, 16, 16)
-        self.dashboard.setMinimumHeight(360)
+        self.dashboard.setMinimumHeight(300)
         dash_layout.addWidget(self.dashboard)
-        dashboard_group.setMinimumHeight(390)
+        dashboard_group.setMinimumHeight(330)
         grid.addWidget(dashboard_group, 1, 0, 1, 3)
 
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(0, 5)
+        grid.setColumnStretch(1, 4)
+        grid.setColumnStretch(2, 4)
         grid.setRowStretch(0, 1)
         grid.setRowStretch(1, 2)
 
@@ -461,6 +564,36 @@ class MainWindow(QtWidgets.QMainWindow):
         overlay_layout.addWidget(self.stop_overlay_msg, 0, QtCore.Qt.AlignmentFlag.AlignCenter)
         overlay_layout.addWidget(self.stop_overlay_bar, 0, QtCore.Qt.AlignmentFlag.AlignCenter)
         self._resize_stop_overlay()
+
+        self.event_dock = QtWidgets.QDockWidget("Operator Events", self)
+        self.event_dock.setObjectName("eventDock")
+        self.event_dock.setAllowedAreas(
+            QtCore.Qt.DockWidgetArea.BottomDockWidgetArea
+            | QtCore.Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        event_panel = QtWidgets.QWidget(self.event_dock)
+        event_layout = QtWidgets.QVBoxLayout(event_panel)
+        event_layout.setContentsMargins(8, 8, 8, 8)
+        event_actions = QtWidgets.QHBoxLayout()
+        event_actions.addStretch(1)
+        copy_events_btn = QtWidgets.QPushButton("Copy", event_panel)
+        copy_events_btn.clicked.connect(self._copy_event_log)
+        open_run_btn = QtWidgets.QPushButton("Open Run Folder", event_panel)
+        open_run_btn.clicked.connect(self._open_run_folder)
+        event_actions.addWidget(copy_events_btn)
+        event_actions.addWidget(open_run_btn)
+        self.event_log = QtWidgets.QPlainTextEdit(event_panel)
+        self.event_log.setReadOnly(True)
+        self.event_log.setMaximumBlockCount(500)
+        self.event_log.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        event_layout.addLayout(event_actions)
+        event_layout.addWidget(self.event_log, 1)
+        self.event_dock.setWidget(event_panel)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.event_dock)
+        self.event_dock.hide()
+        self.events_btn.clicked.connect(
+            lambda: self.event_dock.setVisible(not self.event_dock.isVisible())
+        )
 
     def _apply_brand_theme(self) -> None:
         self.setStyleSheet("""
@@ -584,6 +717,39 @@ class MainWindow(QtWidgets.QMainWindow):
                 border: 1px solid #333a55;
                 padding: 4px 6px;
             }
+            QFrame#runControlBar {
+                background-color: #14192a;
+                border: 1px solid #303751;
+                border-radius: 10px;
+            }
+            QLabel#runStateBadge {
+                background-color: #4357bd;
+                color: #ffffff;
+                border-radius: 8px;
+                padding: 5px 10px;
+                font-size: 11px;
+                font-weight: 800;
+            }
+            QLabel#runIdentity {
+                color: #eef1ff;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QLabel#runElapsed {
+                color: #aeb8ff;
+                font-family: monospace;
+                font-size: 14px;
+                font-weight: 800;
+            }
+            QLabel#captureHealth {
+                color: #a7d9c2;
+                font-size: 11px;
+            }
+            QDockWidget#eventDock {
+                color: #eef1ff;
+                background-color: #14192a;
+                font-weight: 700;
+            }
             QFrame#brandHeader {
                 background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2b2f46, stop:1 #202336);
                 border: 1px solid #333650;
@@ -650,12 +816,22 @@ class MainWindow(QtWidgets.QMainWindow):
             QPushButton#primaryButton:hover {
                 background-color: #4959e6;
             }
+            QPushButton#primaryButton:disabled {
+                background-color: #2b3043;
+                border-color: #343a50;
+                color: #737b96;
+            }
             QPushButton#dangerButton {
                 background-color: #d9536f;
                 border: 1px solid #d9536f;
             }
             QPushButton#dangerButton:hover {
                 background-color: #c13d59;
+            }
+            QPushButton#dangerButton:disabled {
+                background-color: #342a33;
+                border-color: #44313b;
+                color: #78636c;
             }
             QPushButton#secondaryButton {
                 background-color: #353a4d;
@@ -785,6 +961,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_bottle_status(self, text: str) -> None:
         self.bottle_status_label.setText(text)
 
+    def _set_bottle_completion_pending(self, pending: bool) -> None:
+        if pending:
+            self.bottle_group.setStyleSheet(
+                "QGroupBox { border: 2px solid #b98335; } "
+                "QGroupBox::title { color: #ffd28b; }"
+            )
+            self.save_bottles_btn.setText("Save Final Weights")
+        else:
+            self.bottle_group.setStyleSheet("")
+            self.save_bottles_btn.setText("Save Bottle Info")
+
     @QtCore.Slot()
     def _on_save_bottles(self) -> None:
         try:
@@ -810,6 +997,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         state = "complete" if summary.get("complete") else "saved; missing one or more weights"
         self._set_bottle_status(f"Bottle info {state}.")
+        self._set_bottle_completion_pending(not bool(summary.get("complete")))
 
     def _reload_profiles(self) -> None:
         self._experiments = self._profile_store.list_experiments()
@@ -983,6 +1171,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if data.get("mouse_id"):
             session_bits.append(f"Subject {data['mouse_id']}")
         session_text = " / ".join(session_bits) if session_bits else "No session profile"
+        self.run_identity_label.setText(session_text)
+        if not self._recording_active and not self._start_in_progress and not self._stop_in_progress:
+            self._set_run_state("ready")
         model_name = "Inference off"
         if ds_cfg is not None:
             try:
@@ -1092,6 +1283,143 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    @QtCore.Slot()
+    def _copy_event_log(self) -> None:
+        QtWidgets.QApplication.clipboard().setText(self.event_log.toPlainText())
+        self.statusBar().showMessage("Operator events copied.", 3000)
+
+    @QtCore.Slot()
+    def _open_run_folder(self) -> None:
+        target = self.backend.state.run_dir or squeakview_config.RUNS_DIR
+        path = Path(target)
+        if not path.exists():
+            self._emit_log(f"[GUI] Run folder does not exist: {path}")
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def _set_run_state(self, state: str) -> None:
+        states = {
+            "ready": ("READY", "#4357bd"),
+            "starting": ("STARTING", "#a66a20"),
+            "recording": ("RECORDING", "#c4425f"),
+            "finalizing": ("FINALIZING", "#6855c7"),
+            "complete": ("COMPLETE", "#267a58"),
+            "failed": ("FAILED", "#a93750"),
+        }
+        label, color = states.get(state, (state.upper(), "#34394f"))
+        self.run_state_label.setText(label)
+        self.run_state_label.setStyleSheet(
+            "QLabel#runStateBadge {"
+            f"background-color: {color}; color: #ffffff; border-radius: 8px; "
+            "padding: 5px 10px; font-size: 11px; font-weight: 800; }"
+        )
+
+    def _set_capture_health(self, text: str, level: str = "ok") -> None:
+        color = {"ok": "#a7d9c2", "warning": "#ffd28b", "error": "#ff8ca4"}.get(
+            level, "#a7d9c2"
+        )
+        self.capture_health_label.setText(text)
+        self.capture_health_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+    def _refresh_runtime_status(self) -> None:
+        now = time.monotonic()
+        if self._recording_active and self._recording_started_monotonic is not None:
+            self.run_elapsed_label.setText(
+                _elapsed_text(now - self._recording_started_monotonic)
+            )
+        elif self._start_in_progress:
+            self.run_elapsed_label.setText("STARTING")
+        elif self._stop_in_progress and self._stop_started_monotonic is not None:
+            self.run_elapsed_label.setText(
+                f"STOP +{_elapsed_text(now - self._stop_started_monotonic)}"
+            )
+
+        if self._stop_in_progress:
+            self._refresh_stop_progress()
+        if now - self._last_health_poll_monotonic >= 1.0:
+            self._last_health_poll_monotonic = now
+            self._refresh_capture_health()
+
+    def _refresh_capture_health(self) -> None:
+        run_dir = self.backend.state.run_dir
+        disk_target = Path(run_dir) if run_dir is not None else squeakview_config.RUNS_DIR
+        try:
+            disk_free_gb = shutil.disk_usage(disk_target).free / (1024**3)
+            disk_text = f"{disk_free_gb:,.0f} GB"
+        except OSError:
+            disk_free_gb = None
+            disk_text = "--"
+
+        if not self._recording_active:
+            if self._start_in_progress or self._stop_in_progress:
+                return
+            if self.run_state_label.text() in {"COMPLETE", "FAILED"}:
+                return
+            self._set_capture_health(f"Camera --  ·  Queue --  ·  Disk {disk_text}")
+            return
+        if run_dir is None:
+            self._set_capture_health("Waiting for run diagnostics…", "warning")
+            return
+
+        run_path = Path(run_dir)
+        try:
+            capture = json.loads(_tail_text_line(run_path / "capture_cam0.jsonl") or "{}")
+        except json.JSONDecodeError:
+            capture = {}
+        recording = _last_csv_row(run_path / "diagnostics" / "recording.csv")
+
+        frames = int(capture.get("source_sequence_index", -1)) + 1
+        gaps = int(capture.get("total_frame_gap_events") or 0)
+        incomplete = int(capture.get("total_incomplete") or 0)
+        dropped = int(capture.get("stream_dropped_frames") or 0)
+        lost = int(capture.get("stream_lost_frames") or 0)
+        waiting = int(recording.get("waiting_for_record_admission") or 0)
+        in_flight = int(recording.get("encoder_in_flight") or 0)
+        temp = capture.get("sensor_temperature_c")
+        temp_text = f"{float(temp):.1f}°C" if isinstance(temp, (int, float)) else "--"
+
+        issues = gaps + incomplete + dropped + lost
+        level = "error" if issues else "warning" if waiting >= 30 else "ok"
+        frame_text = f"{frames:,}" if frames > 0 else "--"
+        self._set_capture_health(
+            f"Frames {frame_text}  ·  Gaps {gaps}  ·  Queue {waiting}/{in_flight}  ·  "
+            f"Cam {temp_text}  ·  Disk {disk_text}",
+            level,
+        )
+
+    def _refresh_stop_progress(self) -> None:
+        run_dir = self.backend.state.run_dir
+        if run_dir is None:
+            return
+        run_path = Path(run_dir)
+        status = run_context.read_json(run_path / "run_status.json")
+        progress = run_context.read_json(run_path / "post_run_progress.json")
+        state = str(status.get("state") or "stopping")
+        if state in {"finalizing", "analyzing"}:
+            stage = str(status.get("stage") or progress.get("stage") or state)
+        elif state in {"stopping", "capture_draining", "capture_drained", "capture_closed"}:
+            stage = state
+        else:
+            stage = str(progress.get("stage") or status.get("stage") or state)
+        processed = int(progress.get("frames_processed") or 0)
+        stages = {
+            "stopping": ("Stopping Capture…", "Stopping the controller and closing the capture pipeline."),
+            "capture_draining": ("Draining Capture…", "Waiting for camera and recording buffers to become quiet."),
+            "capture_drained": ("Closing Capture…", "All captured buffers are accounted for; closing the MP4."),
+            "capture_closed": ("Capture Saved — Validating…", "The MP4 is safely closed. Starting post-run validation."),
+            "capture_reconciliation": ("Validating Capture…", "Reconciling source frames with the non-leaky recording branch."),
+            "inference_admission": ("Validating Inference…", "Checking which captured frames entered inference."),
+            "recording_validation": ("Validating Video…", "Comparing MP4 frame counts with recorded source frames."),
+            "recording_validation_complete": ("Video Validated…", "Recording frame counts passed. Preparing timing alignment."),
+            "streaming_alignment": ("Aligning Timing…", "Aligning camera and controller timestamps."),
+            "complete": ("Validation Complete…", "Capture validation passed; finishing the run manifest."),
+        }
+        title, message = stages.get(stage, stages.get(state, ("Finalizing Run…", f"Post-run stage: {stage}")))
+        if processed:
+            message += f"  {processed:,} frames processed."
+        self.stop_overlay_title.setText(title)
+        self.stop_overlay_msg.setText(message)
+
     # ---- Actions --------------------------------------------------------
     def _run_preflight(self) -> bool:
         if os.environ.get("SQUEAKVIEW_SKIP_PREFLIGHT") == "1":
@@ -1143,13 +1471,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if output:
             for line in output.splitlines():
                 self._emit_log(f"[PREFLIGHT] {line}")
-        QtWidgets.QMessageBox.critical(
-            self,
-            "Preflight Failed",
-            "System prerequisites are missing.\n\n"
-            "See the log output for details and suggested fixes.\n\n"
-            "Set SQUEAKVIEW_SKIP_PREFLIGHT=1 to bypass this check temporarily.",
-        )
         return False
 
     def _on_configure(self) -> None:
@@ -1174,6 +1495,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return max(1, int(getattr(config, "num_cameras", 1)))
 
     def _on_run(self) -> None:
+        if self._start_in_progress or self._stop_in_progress:
+            return
         if self._preview_window_id is None:
             self._emit_log("[GUI] Preview still initializing; please wait a moment and try again.")
             QtCore.QTimer.singleShot(200, self._capture_preview_window_id)
@@ -1201,30 +1524,105 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"[GUI] blocked: camera count ({cam_count}) != config batch-size ({cfg_batch})"
                 )
                 return
-        if not self._run_preflight():
-            self._emit_log("[GUI] Run blocked: preflight checks failed.")
-            return
         config.preview_window_id = self._preview_window_id
-        if not self.backend.start_run(config):
-            self._emit_log("[GUI] Failed to start run")
+        self._start_in_progress = True
+        self._start_failure_reported = False
+        self._pending_start_config = config
+        self._recording_active = False
+        self._recording_started_monotonic = None
+        self.run_elapsed_label.setText("STARTING")
+        self._set_run_state("starting")
+        self.preview.show_hint(False)
+        self.preview.set_status("Starting")
+        self.preview.set_preview_enabled(True)
+        self._set_capture_health("Running preflight…", "warning")
+        self._emit_log("[GUI] Running preflight and starting capture…")
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.configure_btn.setEnabled(False)
+
+        def _worker() -> None:
+            try:
+                if not self._run_preflight():
+                    self.start_error.emit(
+                        "System preflight failed. Open Operator Events for the failed check."
+                    )
+                    return
+                if not self.backend.start_run(config):
+                    self.start_error.emit("The backend did not start the run. Check Operator Events for details.")
+                    return
+            except Exception as exc:
+                self.start_error.emit(str(exc))
+                return
+            self.start_finished.emit(True)
+
+        self._start_thread = threading.Thread(target=_worker, daemon=True)
+        self._start_thread.start()
+
+    @QtCore.Slot(bool)
+    def _on_start_finished(self, started: bool) -> None:
+        config = self._pending_start_config
+        self._pending_start_config = None
+        self._start_in_progress = False
+        if not started or config is None:
+            self.run_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.configure_btn.setEnabled(True)
+            if not self._start_failure_reported:
+                self._set_run_state("failed")
+            if self._close_after_start:
+                self._close_after_start = False
+                QtCore.QTimer.singleShot(0, self.close)
             return
+
         self._start_ipc_preview(config)
         self._clear_bottle_final_fields()
+        self._set_bottle_completion_pending(False)
         if self.backend.state.run_dir is not None:
             self._set_bottle_status("Initial bottle info saved with current run.")
         self.dashboard.clear_jam_alert()
         self.preview.show_hint(False)
-        self.preview.set_status("Starting")
         self.preview.set_preview_enabled(True)
-        self._emit_log("[GUI] Run is waiting for inference readiness")
+        self._emit_log("[GUI] Capture started and is ready for recording")
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.configure_btn.setEnabled(False)
+        if self._close_after_start:
+            self._close_after_start = False
+            self._close_after_stop = True
+            self._on_stop()
+
+    @QtCore.Slot(str)
+    def _on_start_error(self, error: str) -> None:
+        if self._start_failure_reported:
+            self._on_start_finished(False)
+            return
+        self._start_failure_reported = True
+        self._on_start_finished(False)
+        self._recording_active = False
+        self.run_elapsed_label.setText("00:00:00")
+        self._set_run_state("failed")
+        self._set_capture_health("Run could not start — open Events", "error")
+        self.preview.show_hint(True)
+        self.preview.set_status("Failed")
+        self.event_dock.show()
+        self._emit_log(f"[GUI] Start failed: {error}")
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Icon.Critical)
+        dialog.setWindowTitle("Run Could Not Start")
+        dialog.setText("SqueakView could not start the run.")
+        dialog.setInformativeText(error)
+        dialog.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        dialog.setStyleSheet(RUN_FAILURE_DIALOG_STYLESHEET)
+        dialog.exec()
 
     @QtCore.Slot()
     def _on_backend_run_started(self) -> None:
+        self._recording_active = True
+        self._recording_started_monotonic = time.monotonic()
+        self._set_run_state("recording")
         self.preview.show_hint(False)
-        self.preview.set_status("Live", color="#5c6df5")
+        self.preview.set_status("Recording")
         self._emit_log("[GUI] Run started")
 
     def _start_ipc_preview(self, config: process.LaunchConfig) -> None:
@@ -1241,7 +1639,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def _on_preview_ready(self) -> None:
         self.preview.show_hint(False)
-        self.preview.set_status("Live", color="#5c6df5")
+        self.preview.set_status("Recording")
 
     @QtCore.Slot(str)
     def _on_preview_failed(self, error: str) -> None:
@@ -1258,11 +1656,28 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _on_backend_run_failed(self, error: str) -> None:
+        self._start_failure_reported = True
+        close_after_failure = (
+            (self._close_after_stop and not self._stop_in_progress)
+            or self._close_after_start
+        )
+        self._close_after_start = False
         self._preview_controller.stop()
+        self._start_in_progress = False
+        self._pending_start_config = None
         self._stop_in_progress = False
+        self._recording_active = False
+        if self._recording_started_monotonic is not None:
+            stop_mark = self._stop_started_monotonic or time.monotonic()
+            self.run_elapsed_label.setText(
+                _elapsed_text(stop_mark - self._recording_started_monotonic)
+            )
         self._hide_stop_overlay()
+        self._set_run_state("failed")
+        self._set_capture_health("Run failed — open Events", "error")
         self.preview.show_hint(True)
         self.preview.set_status("Failed")
+        self.event_dock.show()
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.configure_btn.setEnabled(True)
@@ -1282,11 +1697,17 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog.setInformativeText(error)
         dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
         dialog.exec()
+        if close_after_failure:
+            self._close_after_stop = False
+            QtCore.QTimer.singleShot(0, self.close)
 
     def _on_stop(self) -> None:
-        if self._stop_in_progress:
+        if self._stop_in_progress or self._start_in_progress:
             return
         self._stop_in_progress = True
+        self._recording_active = False
+        self._stop_started_monotonic = time.monotonic()
+        self._set_run_state("finalizing")
         self._show_stop_overlay()
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
@@ -1308,24 +1729,85 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _on_stop_complete(self) -> None:
+        close_after_stop = self._close_after_stop
+        self._close_after_stop = False
         self._stop_in_progress = False
+        self._recording_active = False
+        if self._recording_started_monotonic is not None:
+            stop_mark = self._stop_started_monotonic or time.monotonic()
+            self.run_elapsed_label.setText(
+                _elapsed_text(stop_mark - self._recording_started_monotonic)
+            )
+        self._stop_started_monotonic = None
         self._hide_stop_overlay()
         self.preview.show_hint(True)
-        self.preview.set_status("Idle")
         self.preview.set_preview_enabled(True)
-        self._emit_log("[GUI] Run stopped")
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.configure_btn.setEnabled(True)
         run_dir = self.backend.state.run_dir
+        status = (
+            run_context.read_json(Path(run_dir) / "run_status.json")
+            if run_dir is not None
+            else {}
+        )
+        validation = status.get("recording_validation")
+        passed = isinstance(validation, dict) and validation.get("passed") is True
+        failed = str(status.get("state") or "") in {
+            "failed",
+            "finalization_failed",
+            "analysis_failed",
+            "capture_drain_timeout",
+        } or not passed
+        if failed:
+            self._set_run_state("failed")
+            self.preview.set_status("Failed")
+            self._set_capture_health("Run ended with a validation failure — open Events", "error")
+            self.event_dock.show()
+            self._emit_log("[GUI] Run stopped, but validation did not pass")
+        else:
+            self._set_run_state("complete")
+            self.preview.set_status("Complete")
+            self._set_capture_health("Capture saved · frame-count validation PASS", "ok")
+            self._emit_log("[GUI] Run stopped and capture validation passed")
         if run_dir is not None:
             self._emit_log(f"[SAVE] local run finalized: {run_dir}")
-            self._set_bottle_status("Run finalized; final weights can be saved.")
+            if failed:
+                self._set_bottle_status(
+                    "Run validation failed; inspect Events before completing bottle data."
+                )
+                self._set_bottle_completion_pending(False)
+            else:
+                bottles_complete = bool(
+                    status.get("outputs", {}).get("bottle_measurements_complete")
+                )
+                if bottles_complete:
+                    self._set_bottle_status("Run finalized; bottle measurements complete.")
+                    self._set_bottle_completion_pending(False)
+                else:
+                    self._set_bottle_status(
+                        "Capture validated. Enter final bottle weights, then save."
+                    )
+                    self._set_bottle_completion_pending(True)
+        if close_after_stop:
+            QtCore.QTimer.singleShot(0, self.close)
 
     @QtCore.Slot(str)
     def _on_stop_failed(self, err: str) -> None:
+        self._close_after_stop = False
         self._stop_in_progress = False
+        self._recording_active = False
+        if self._recording_started_monotonic is not None:
+            stop_mark = self._stop_started_monotonic or time.monotonic()
+            self.run_elapsed_label.setText(
+                _elapsed_text(stop_mark - self._recording_started_monotonic)
+            )
+        self._stop_started_monotonic = None
         self._hide_stop_overlay()
+        self._set_run_state("failed")
+        self.preview.set_status("Failed")
+        self._set_capture_health("Shutdown failed — open Events", "error")
+        self.event_dock.show()
         self._emit_log(f"[GUI] Stop failed: {err}")
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -1351,11 +1833,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _append_log(self, msg: str) -> None:
-        self.statusBar().showMessage(msg, 5000)
+        if hasattr(self, "event_log"):
+            self.event_log.appendPlainText(msg)
+        if not _is_serial_log_message(msg):
+            self.statusBar().showMessage(msg, 5000)
         print(msg, flush=True)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         self._preview_controller.stop()
+        if self._start_in_progress:
+            self._close_after_start = True
+            event.ignore()
+            return
+        inference = self.backend.state.inference
+        capture_running = bool(inference is not None and inference.is_running())
+        finalizing = self.backend.finalization_in_progress
+        if self._stop_in_progress or capture_running or finalizing:
+            self._close_after_stop = True
+            if capture_running and not self._stop_in_progress and not finalizing:
+                self._on_stop()
+            event.ignore()
+            return
         try:
             self.backend.shutdown()
         except Exception:
@@ -1364,6 +1862,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.dashboard.close()
         except Exception:
             pass
+        self._runtime_timer.stop()
         super().closeEvent(event)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802

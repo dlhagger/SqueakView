@@ -65,13 +65,10 @@ class OfflineInferenceTests(unittest.TestCase):
         )
         operator.handle_metadata(SimpleNamespace(frame_items=[frame]))
         operator.close()
-        with (self.root / "detections.csv").open(newline="") as handle:
-            row = next(csv.DictReader(handle))
-        self.assertEqual(row["raw_frame_num"], "7")
-        self.assertEqual(row["raw_frame_mapping_method"], "offline_video_ledger")
-        self.assertEqual(row["source"], "offline_raw_mp4:0")
+        self.assertFalse((self.root / "detections.csv").exists())
         with (self.root / "objects.csv").open(newline="") as handle:
             obj = next(csv.DictReader(handle))
+        self.assertEqual(obj["source_sequence_index"], "7")
         self.assertEqual(obj["camera_frame_id"], "20338")
         self.assertEqual(obj["gst_pts_ns"], "0")
 

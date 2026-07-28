@@ -298,12 +298,6 @@ class Yolo26PoseTensorOperator(BatchMetadataOperator):
 class ObservationOperator(BatchMetadataOperator):
     """Persist tracked objects/keypoints and produce the matching live overlay."""
 
-    DETECTION_HEADERS = [
-        "frame", "raw_frame_num", "ts_us", "raw_frame_mapping_method",
-        "raw_frame_mapping_ok", "raw_frame_mapping_pts_ns", "raw_frame_mapping_delta",
-        "stream_id", "source", "obj_id", "class_id", "class_label", "conf",
-        "x", "y", "w", "h",
-    ]
     OBJECT_HEADERS = [
         "observation_id", "stream_id", "deepstream_frame_number", "source_sequence_index",
         "camera_frame_id", "camera_timestamp_ns", "gst_pts_ns", "class_id", "class_label",
@@ -317,11 +311,6 @@ class ObservationOperator(BatchMetadataOperator):
         "keypoint_name", "x_px", "y_px", "x_norm", "y_norm", "confidence", "visible",
         "coordinate_space", "source",
     ]
-    TRACK_HEADERS = [
-        "stream_id", "track_id", "class_id", "class_label", "first_frame", "last_frame",
-        "observed_frames", "predicted_frames", "total_rows",
-    ]
-
     def __init__(
         self,
         run_dir: Path,
@@ -342,11 +331,9 @@ class ObservationOperator(BatchMetadataOperator):
         self.source_name = str(source_name)
         self._lock = threading.Lock()
         self._closed = False
-        self._tracks: dict[tuple[int, int, int], dict[str, Any]] = {}
         self._files: dict[str, Any] = {}
         self._writers: dict[str, csv.writer] = {}
         for name, headers in (
-            ("detections", self.DETECTION_HEADERS),
             ("objects", self.OBJECT_HEADERS),
             ("keypoints", self.KEYPOINT_HEADERS),
         ):
@@ -354,7 +341,6 @@ class ObservationOperator(BatchMetadataOperator):
             self._files[name] = handle
             self._writers[name] = csv.writer(handle)
             self._writers[name].writerow(headers)
-        self._tracks_path = run_dir / "tracks.csv"
         atexit.register(self.close)
 
     @staticmethod
@@ -484,16 +470,6 @@ class ObservationOperator(BatchMetadataOperator):
                             int(pose is not None), pose.get("schema_version", "") if pose else "",
                         ]
                     )
-                    self._writers["detections"].writerow(
-                        [
-                            frame_number, "" if source_sequence is None else source_sequence,
-                            pts_ns // 1000, self.mapping_method if source_sequence is not None else "unmapped",
-                            int(source_sequence is not None), pts_ns, "", stream_id,
-                            f"{self.source_name}:{stream_id}", "" if track_id is None else track_id,
-                            class_id, label, detector_confidence,
-                            float(rect.left), float(rect.top), float(rect.width), float(rect.height),
-                        ]
-                    )
                     if pose:
                         for point in pose.get("keypoints", []):
                             self._writers["keypoints"].writerow(
@@ -508,19 +484,6 @@ class ObservationOperator(BatchMetadataOperator):
                                     pose.get("coordinate_space", "source_pixels"), "detector",
                                 ]
                             )
-                    if track_id is not None:
-                        key = (stream_id, track_id, class_id)
-                        summary = self._tracks.setdefault(
-                            key,
-                            {
-                                "label": label, "first": frame_number, "last": frame_number,
-                                "observed": 0, "predicted": 0, "total": 0,
-                            },
-                        )
-                        summary["last"] = frame_number
-                        summary["observed"] += int(detected)
-                        summary["predicted"] += int(predicted)
-                        summary["total"] += 1
                     self._decorate(batch_meta, frame_meta, object_meta, pose, track_id, predicted)
                 self.store.discard(stream_id, frame_number)
 
@@ -532,13 +495,3 @@ class ObservationOperator(BatchMetadataOperator):
             for handle in self._files.values():
                 handle.flush()
                 handle.close()
-            with self._tracks_path.open("w", newline="") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(self.TRACK_HEADERS)
-                for (stream_id, track_id, class_id), value in sorted(self._tracks.items()):
-                    writer.writerow(
-                        [
-                            stream_id, track_id, class_id, value["label"], value["first"],
-                            value["last"], value["observed"], value["predicted"], value["total"],
-                        ]
-                    )

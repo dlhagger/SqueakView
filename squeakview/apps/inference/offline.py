@@ -189,7 +189,7 @@ class OfflineInferenceApp:
 
     def _write_manifest(self, status: str, error: str | None = None) -> None:
         outputs = {}
-        for name in ("detections.csv", "objects.csv", "keypoints.csv", "tracks.csv"):
+        for name in ("objects.csv", "keypoints.csv"):
             path = self.out_dir / name
             if path.exists():
                 with path.open(newline="") as handle:
@@ -319,10 +319,10 @@ class OfflineInferenceApp:
             print(f"[OFFLINE] {error}", flush=True)
         elif self.exit_code == 0:
             try:
-                from scripts.align_run_outputs import build_alignment
+                from scripts.align_run_outputs_streaming import build_alignment
                 build_alignment(
-                    self.run_dir, self.out_dir / "analysis",
-                    detections_path=self.out_dir / "detections.csv",
+                    self.run_dir, self.out_dir,
+                    objects_path=self.out_dir / "objects.csv",
                 )
             except Exception as exc:
                 self.exit_code = 1

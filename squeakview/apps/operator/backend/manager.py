@@ -3,10 +3,7 @@ from __future__ import annotations
 """Backend orchestrator for the operator GUI."""
 
 import os
-import importlib.util
-import json
 import signal
-import shutil
 import subprocess
 import threading
 import time
@@ -24,22 +21,6 @@ from squeakview.common import serial as serial_util
 def _now() -> str:
     return time.strftime("%H:%M:%S")
 
-
-
-def _relocate_summary_outputs(
-    summary: dict[str, Any], source_dir: Path, final_dir: Path
-) -> dict[str, Any]:
-    """Update output paths after the temporary analysis directory is renamed."""
-    outputs = summary.get("outputs")
-    if not isinstance(outputs, dict):
-        return summary
-    for key, value in outputs.items():
-        try:
-            relative = Path(str(value)).relative_to(source_dir)
-        except (TypeError, ValueError):
-            continue
-        outputs[key] = str(final_dir / relative)
-    return summary
 
 
 @dataclass(slots=True)
@@ -79,6 +60,12 @@ class OperatorBackend:
 
     def _log(self, message: str) -> None:
         self.emit(f"[{_now()}] {message}")
+
+    @property
+    def finalization_in_progress(self) -> bool:
+        """True while a stop/failure worker owns the run-finalization path."""
+
+        return self._finalize_lock.locked() and not self._run_finalized
 
     def _serial_emit(self, message: str) -> None:
         self.emit(message)
@@ -194,17 +181,6 @@ class OperatorBackend:
             self._log(f"[SYS] jetson_clocks error: {exc}")
 
     @staticmethod
-    def _csv_data_rows(path: Path) -> int | None:
-        if not path.exists():
-            return None
-        try:
-            with path.open(newline="") as f:
-                rows = sum(1 for _ in f)
-            return max(0, rows - 1)
-        except Exception:
-            return None
-
-    @staticmethod
     def _file_info(path: Path) -> dict[str, Any]:
         exists = path.exists()
         info: dict[str, Any] = {
@@ -246,33 +222,29 @@ class OperatorBackend:
 
     def _run_output_snapshot(self, run_dir: Path) -> dict[str, Any]:
         artifacts = run_context.run_artifacts(run_dir)
-        csv_rows = {
-            "frames": self._csv_data_rows(artifacts.frames_csv),
-            "drop_events": self._csv_data_rows(artifacts.drop_events_csv),
-            "inference_frames": self._csv_data_rows(run_dir / "inference" / "frames.csv"),
-            "record_admission": self._csv_data_rows(run_dir / "record_admission.csv"),
-            "inference_admission": self._csv_data_rows(run_dir / "inference_admission.csv"),
-            "camera_telemetry": self._csv_data_rows(run_dir / "camera_telemetry.csv"),
-            "detections": self._csv_data_rows(artifacts.detections_csv),
-            "objects": self._csv_data_rows(artifacts.objects_csv),
-            "keypoints": self._csv_data_rows(artifacts.keypoints_csv),
-            "tracks": self._csv_data_rows(artifacts.tracks_csv),
-            "serial": self._csv_data_rows(artifacts.serial_csv) if artifacts.serial_csv else None,
-            "perf": self._csv_data_rows(run_dir / "perf_stats.csv"),
-            "bottle_measurements": self._csv_data_rows(artifacts.bottle_measurements_csv),
-        }
+        diagnostics_dir = run_dir / "diagnostics"
+        status = run_context.read_json(artifacts.status_json)
         bottle_summary = run_context.read_json(artifacts.bottle_summary_json)
         video_files = sorted(run_dir.glob("raw*.mp4"))
         return {
-            "csv_rows": csv_rows,
+            "csv_files": {
+                "frames": self._file_info(artifacts.frames_csv),
+                "errors": self._file_info(artifacts.drop_events_csv),
+                "recording": self._file_info(diagnostics_dir / "recording.csv"),
+                "camera": self._file_info(diagnostics_dir / "camera.csv"),
+                "objects": self._file_info(artifacts.objects_csv),
+                "keypoints": self._file_info(artifacts.keypoints_csv),
+                "serial": self._file_info(artifacts.serial_csv) if artifacts.serial_csv else None,
+                "bottle_measurements": self._file_info(artifacts.bottle_measurements_csv),
+            },
             "video_files": [self._file_info(path) for path in video_files],
-            "inference_admission": self._file_info(run_dir / "inference_admission.json"),
-            "recording_validation": self._file_info(run_dir / "recording_validation.json"),
-            "capture_reconciliation": self._file_info(run_dir / "capture_reconciliation.json"),
-            "camera_runtime": self._file_info(run_dir / "camera_runtime.json"),
-            "camera_telemetry": self._file_info(run_dir / "camera_telemetry.csv"),
-            "analysis_dir": str(run_dir / "analysis"),
-            "has_analysis": (run_dir / "analysis").exists(),
+            "recording_validation": status.get("recording_validation"),
+            "capture_reconciliation": status.get("capture_reconciliation"),
+            "inference_admission": status.get("inference_admission"),
+            "camera_runtime": self._file_info(diagnostics_dir / "camera_runtime.json"),
+            "camera_telemetry": self._file_info(diagnostics_dir / "camera.csv"),
+            "alignment_summary": self._file_info(run_dir / "alignment_summary.json"),
+            "has_analysis": (run_dir / "alignment_summary.json").exists(),
             "bottle_measurements_complete": bool(bottle_summary.get("complete")) if bottle_summary else False,
             "bottle_files": {
                 "setup": self._file_info(artifacts.bottle_setup_json),
@@ -302,7 +274,7 @@ class OperatorBackend:
         except ValueError:
             relative_run_dir = str(run_dir)
         return {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "run_id": run_dir.name,
             "run_directory": str(run_dir),
             "run_directory_relative": relative_run_dir,
@@ -325,7 +297,7 @@ class OperatorBackend:
                 "trigger_activation": cfg.trigger_activation,
                 "arduino_fps": cfg.arduino_fps,
                 "metadata_profile": "scientific",
-                "runtime_metadata": "camera_runtime.json",
+                "runtime_metadata": "diagnostics/camera_runtime.json",
                 "frame_identity": {
                     "camera_frame_id": "FLIR chunk FrameID",
                     "stream_frame_id": "Spinnaker Image.GetFrameID acquisition-local counter",
@@ -341,25 +313,30 @@ class OperatorBackend:
                 "preview_transport": "nvunixfd",
                 "preview_sockets": [str(path) for path in cfg.preview_socket_paths],
                 "flow_control": "downstream-leaky; latest pending frames retained",
-                "admission_manifest": "inference_admission.csv",
-                "admission_summary": "inference_admission.json",
-                "frame_manifest": "inference/frames.csv",
+                "admission_field": "frames.csv:inference_admitted",
             },
             "recording": {
                 "container": "mp4",
                 "file": "raw.mp4",
-                "admission_manifest": "record_admission.csv",
-                "source_ledger": "capture_cam0.jsonl",
+                "encoder": {
+                    "element": "x264enc",
+                    "implementation": "software",
+                    "input_format": "GRAY8",
+                    "speed_preset": "ultrafast",
+                    "sliced_threads": False,
+                },
+                "record_queue_capacity_frames": max(120, int(cfg.fps) * 4),
+                "backpressure_warning_frames": max(24, int(cfg.fps)),
+                "backpressure_failure_frames": max(90, int(cfg.fps) * 3),
+                "source_transport_buffer_count": max(64, int(cfg.fps) * 2),
+                "backpressure_telemetry": "diagnostics/recording.csv",
                 "frame_manifest": artifacts.frames_csv.name,
-                "drop_events": artifacts.drop_events_csv.name,
-                "validation": "recording_validation.json",
-                "camera_telemetry": "camera_telemetry.csv",
-                "detections": artifacts.detections_csv.name,
+                "drop_events": "diagnostics/errors.csv",
+                "validation": "run_status.json:recording_validation",
+                "camera_telemetry": "diagnostics/camera.csv",
                 "objects": artifacts.objects_csv.name,
                 "keypoints": artifacts.keypoints_csv.name,
-                "tracks": artifacts.tracks_csv.name,
                 "serial": artifacts.serial_csv.name if cfg.serial_enabled and artifacts.serial_csv else None,
-                "perf": "perf_stats.csv",
             },
             "task_config": str(cfg.task_cfg) if cfg.task_cfg else None,
             "serial": {
@@ -371,27 +348,20 @@ class OperatorBackend:
             "expected_outputs": {
                 "status": run_context.RUN_STATUS_FILENAME,
                 "manifest": run_context.RUN_MANIFEST_FILENAME,
-                "camera_settings": artifacts.metadata_json.name,
-                "camera_runtime": "camera_runtime.json",
-                "camera_telemetry": "camera_telemetry.csv",
-                "deepstream_config_dir": "deepstream_config",
+                "camera_runtime": "diagnostics/camera_runtime.json",
+                "camera_telemetry": "diagnostics/camera.csv",
+                "config_dir": "config",
                 "frames": artifacts.frames_csv.name,
-                "drop_events": artifacts.drop_events_csv.name,
-                "detections": artifacts.detections_csv.name if cfg.inference_enabled else None,
+                "drop_events": "diagnostics/errors.csv",
                 "objects": artifacts.objects_csv.name if cfg.inference_enabled else None,
                 "keypoints": artifacts.keypoints_csv.name if cfg.inference_enabled else None,
-                "tracks": artifacts.tracks_csv.name if cfg.inference_enabled else None,
                 "serial": artifacts.serial_csv.name if cfg.serial_enabled and artifacts.serial_csv else None,
                 "raw_video": artifacts.raw_video.name,
-                "record_admission": "record_admission.csv",
-                "capture_reconciliation": "capture_reconciliation.json",
-                "inference_frames": "inference/frames.csv" if cfg.inference_enabled else None,
-                "inference_admission": "inference_admission.csv" if cfg.inference_enabled else None,
-                "recording_validation": "recording_validation.json",
+                "recording_path_telemetry": "diagnostics/recording.csv",
+                "alignment_summary": "alignment_summary.json" if cfg.serial_enabled else None,
                 "bottle_setup": artifacts.bottle_setup_json.name,
                 "bottle_measurements": artifacts.bottle_measurements_csv.name,
                 "bottle_summary": artifacts.bottle_summary_json.name,
-                "analysis": "analysis",
             },
             "actual_outputs": self._run_output_snapshot(run_dir),
         }
@@ -432,164 +402,105 @@ class OperatorBackend:
     def _ensure_metadata(self, run_dir: Path) -> None:
         if self._metadata_written:
             return
-        cfg = self.launch_cfg
-        payload = {
-            "schema_version": "1.0",
-            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "run_directory": str(run_dir),
-            "capture": {
-                "backend": str(getattr(cfg, "capture_backend", "flir_direct")),
-                "num_cameras": int(getattr(cfg, "num_cameras", 1)),
-                "camera_serials": list(getattr(cfg, "camera_serials", ())),
-                "width": cfg.width,
-                "height": cfg.height,
-                "fps": cfg.fps,
-                "pixel_format": cfg.pixel_format,
-                "trigger_on": cfg.trigger_on,
-                "trigger_activation": cfg.trigger_activation,
-                "arduino_fps": cfg.arduino_fps,
-                "metadata_profile": "scientific",
-                "runtime_metadata": "camera_runtime.json",
-                "frame_identity": {
-                    "camera_frame_id": "FLIR chunk FrameID",
-                    "stream_frame_id": "Spinnaker Image.GetFrameID acquisition-local counter",
-                    "source_sequence_index": "flirspinsrc emitted-buffer counter",
-                    "missing_value_policy": "null; never substitute a sequential counter",
-                },
-            },
-            "inference": {
-                "enabled": cfg.inference_enabled,
-                "deepstream_config": (str(cfg.ds_cfg) if cfg.ds_cfg else None),
-                "model_package": self._model_snapshot,
-                "bitrate_kbps": cfg.bitrate,
-                "preview_transport": "nvunixfd",
-                "preview_sockets": [str(path) for path in cfg.preview_socket_paths],
-            },
-            "recording": {
-                "container": "mp4",
-                "file": "raw.mp4",
-                "frame_manifest": "frames.csv",
-                "drop_events": "drop_events.csv",
-                "camera_telemetry": "camera_telemetry.csv",
-            },
-            "task_config": str(cfg.task_cfg) if cfg.task_cfg else None,
-            "serial": {
-                "enabled": cfg.serial_enabled,
-                "port": cfg.serial_port if cfg.serial_enabled else None,
-                "baud": cfg.serial_baud if cfg.serial_enabled else None,
-            },
-            "mouse_id": cfg.mouse_id,
-        }
         try:
-            path = run_context.write_metadata(run_dir, payload)
-            self._log(f"[BACKEND] metadata written → {path}")
             self._metadata_written = True
             self._write_run_manifest(run_dir)
         except Exception as exc:  # pragma: no cover
             self._log(f"[BACKEND] metadata write failed: {exc}")
 
-    def _run_post_run_alignment(self, run_dir: Path | None) -> dict[str, Any] | None:
-        if run_dir is None:
-            self._log("[ANALYSIS] skipped; run directory unknown")
-            return None
-
-        run_dir = Path(run_dir)
-        def skip(reason: str) -> None:
-            self._log(f"[ANALYSIS] skipped; {reason}")
+    @staticmethod
+    def _capture_drain_snapshot(run_dir: Path, camera_count: int) -> tuple[int, ...]:
+        paths: list[Path] = []
+        for index in range(max(1, int(camera_count))):
+            paths.append(run_dir / f"capture_cam{index}.jsonl")
+            paths.append(
+                run_dir
+                / (
+                    "record_admission.csv"
+                    if index == 0
+                    else f"record_admission_cam{index}.csv"
+                )
+            )
+        sizes: list[int] = []
+        for path in paths:
             try:
-                run_context.write_status(run_dir, "analysis_skipped", reason=reason)
-            except Exception:
-                pass
+                sizes.append(int(path.stat().st_size))
+            except FileNotFoundError:
+                sizes.append(-1)
+        return tuple(sizes)
 
-        enabled = os.environ.get("SQUEAKVIEW_AUTO_ALIGN", "1").lower()
-        if enabled in {"0", "false", "no", "off"}:
-            skip("SQUEAKVIEW_AUTO_ALIGN=0")
-            return None
+    def _wait_for_capture_drain(
+        self, run_dir: Path, *, expected_ttl_count: int | None = None
+    ) -> bool:
+        """Wait for source and recording ledgers to become quiescent after ACK_STOP."""
 
-        if not self.launch_cfg.serial_enabled:
-            skip("serial capture disabled; TTL alignment not requested")
-            return None
-
-        missing = [name for name in ("frames.csv", "serial.csv") if not (run_dir / name).exists()]
-        if missing:
-            skip(f"missing {', '.join(missing)}")
-            return None
-
-        script_path = process.WORKSPACE / "scripts" / "align_run_outputs.py"
-        if not script_path.exists():
-            skip(f"align script missing: {script_path}")
-            return None
-
-        tmp_dir = run_dir / "analysis.tmp"
-        final_dir = run_dir / "analysis"
         try:
-            self._log("[ANALYSIS] building aligned CSVs")
-            run_context.write_status(run_dir, "analyzing")
-            if tmp_dir.exists():
-                shutil.rmtree(tmp_dir)
-            spec = importlib.util.spec_from_file_location("squeakview_align_run_outputs", script_path)
-            if spec is None or spec.loader is None:
-                raise RuntimeError(f"could not load {script_path}")
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            summary = module.build_alignment(run_dir, tmp_dir)
-            if final_dir.exists():
-                shutil.rmtree(final_dir)
-            tmp_dir.replace(final_dir)
-            summary = _relocate_summary_outputs(summary, tmp_dir, final_dir)
-            (final_dir / "alignment_summary.json").write_text(
-                json.dumps(summary, indent=2, sort_keys=True)
+            quiet_s = max(
+                0.1, float(os.environ.get("SQUEAKVIEW_CAPTURE_DRAIN_QUIET_S", "0.35"))
             )
-            counts = summary.get("counts", {})
-            validation = summary.get("validation", {})
-            self._log(
-                "[ANALYSIS] complete → "
-                f"{final_dir} "
-                f"({counts.get('recorded_frames', 0)} frames, {counts.get('detections', 0)} detections)"
+            timeout_s = max(
+                quiet_s, float(os.environ.get("SQUEAKVIEW_CAPTURE_DRAIN_TIMEOUT_S", "5.0"))
             )
-
-            warning_keys = [
-                ("counts", "frame_gaps_detected"),
-                ("counts", "frames_missing_ttl"),
-                ("counts", "drop_events"),
-                ("validation", "detection_mapping_failed_rows"),
-                ("validation", "detection_mapping_fallback_rows"),
-                ("validation", "detections_missing_frame_count"),
-                ("validation", "detection_ts_mismatch_count"),
-                ("validation", "detection_pts_mismatch_count"),
-            ]
-            warnings: list[str] = []
-            for section_name, key in warning_keys:
-                section = counts if section_name == "counts" else validation
-                value = section.get(key)
-                if value not in (None, 0):
-                    warnings.append(f"{key}={value}")
-            frame_alignment = summary.get("frame_alignment", {})
-            if frame_alignment.get("validated") is False:
-                warnings.append("frame_alignment.validated=false")
-            if validation.get("video_frame_count_matches_frames_csv") is False:
-                warnings.append("video_frame_count_matches_frames_csv=false")
-            elif validation.get("video_frame_count_matches_frames_csv") is None:
-                warnings.append("video_frame_count_matches_frames_csv=unknown")
-            if warnings:
-                self._log(f"[ANALYSIS] warnings: {', '.join(warnings)}")
+        except ValueError:
+            quiet_s, timeout_s = 0.35, 5.0
+        run_context.write_status(
+            run_dir,
+            "capture_draining",
+            quiet_period_s=quiet_s,
+            timeout_s=timeout_s,
+            expected_ttl_count=expected_ttl_count,
+        )
+        deadline = time.monotonic() + timeout_s
+        previous: tuple[int, ...] | None = None
+        stable_since: float | None = None
+        while time.monotonic() < deadline:
+            snapshot = self._capture_drain_snapshot(
+                run_dir, int(getattr(self.launch_cfg, "num_cameras", 1))
+            )
+            now = time.monotonic()
+            ledgers_exist = bool(snapshot) and all(size >= 0 for size in snapshot)
+            if ledgers_exist and snapshot == previous:
+                if stable_since is None:
+                    stable_since = now
+                if now - stable_since >= quiet_s:
+                    run_context.write_status(
+                        run_dir,
+                        "capture_drained",
+                        ledger_sizes=list(snapshot),
+                        expected_ttl_count=expected_ttl_count,
+                    )
+                    return True
             else:
-                self._log("[ANALYSIS] validation passed")
-            run_context.write_status(run_dir, "analysis_complete", analysis_summary=summary)
-            return summary
-        except Exception as exc:
-            try:
-                failed_dir = run_dir / f"analysis_failed_{int(time.time())}"
-                if tmp_dir.exists():
-                    tmp_dir.replace(failed_dir)
-            except Exception:
-                pass
-            try:
-                run_context.write_status(run_dir, "analysis_failed", error=str(exc))
-            except Exception:
-                pass
-            self._log(f"[ANALYSIS] failed: {exc}")
-            return None
+                stable_since = now if ledgers_exist else None
+            previous = snapshot
+            time.sleep(0.05)
+        run_context.write_status(run_dir, "capture_drain_timeout")
+        return False
+
+    def _run_capture_finalizer(self, run_dir: Path) -> int:
+        self._log("[POST-RUN] starting independent bounded-memory finalizer")
+        worker = process.spawn_post_run(
+            run_dir,
+            camera_count=int(getattr(self.launch_cfg, "num_cameras", 1)),
+            enable_infer=bool(getattr(self.launch_cfg, "inference_enabled", True)),
+            enable_align=(
+                bool(getattr(self.launch_cfg, "serial_enabled", False))
+                and os.environ.get("SQUEAKVIEW_AUTO_ALIGN", "1").lower()
+                not in {"0", "false", "no", "off"}
+            ),
+        )
+        last_reported = -1
+        while worker.poll() is None:
+            progress = run_context.read_json(run_dir / "post_run_progress.json")
+            processed = int(progress.get("frames_processed") or 0)
+            if processed >= last_reported + 100_000:
+                self._log(
+                    f"[POST-RUN] {progress.get('stage', 'starting')}: "
+                    f"{processed} frames"
+                )
+                last_reported = processed
+            time.sleep(0.2)
+        return int(worker.returncode or 0)
 
     def _finalize_run(
         self,
@@ -627,11 +538,35 @@ class OperatorBackend:
                 try:
                     serial_handle.log_marker("STOP_SENT")
                     serial_handle.send_line("STOP")
+                    if stopping_capture:
+                        stop_acked = serial_handle.wait_for_stop_ack(timeout_s=2.0)
+                        serial_handle.log_marker(
+                            "CAPTURE_STOP_ACKED" if stop_acked else "CAPTURE_STOP_ACK_TIMEOUT"
+                        )
                 except Exception:
                     pass
 
+            if (
+                stopping_capture
+                and run_dir is not None
+                and serial_handle is not None
+                and bool(getattr(self.launch_cfg, "trigger_on", False))
+            ):
+                drained = self._wait_for_capture_drain(
+                    Path(run_dir),
+                    expected_ttl_count=getattr(serial_handle, "stop_ack_count", None),
+                )
+                if serial_handle:
+                    serial_handle.log_marker(
+                        "CAPTURE_SOURCE_DRAINED"
+                        if drained
+                        else "CAPTURE_SOURCE_DRAIN_TIMEOUT"
+                    )
+
             if stopping_capture and inference is not None:
-                inference.terminate_group_graceful(signal.SIGINT, 10.0, True)
+                # The capture runner now exits after EOS/MP4 closure. Audit and
+                # analysis happen in an independent post-run worker.
+                inference.terminate_group_graceful(signal.SIGINT, 30.0, True)
                 inference_returncode = inference.wait(timeout=2)
                 if serial_handle:
                     serial_handle.log_marker("CAPTURE_STOP_DONE")
@@ -649,9 +584,14 @@ class OperatorBackend:
                 if inference_returncode not in (None, 0):
                     failure_reasons.append(f"inference exit code {inference_returncode}")
                 if run_dir:
-                    validation_path = Path(run_dir) / "recording_validation.json"
-                    validation = run_context.read_json(validation_path)
-                    if not validation_path.exists():
+                    finalizer_returncode = self._run_capture_finalizer(Path(run_dir))
+                    if finalizer_returncode not in (0,):
+                        failure_reasons.append(
+                            f"post-run finalizer exit code {finalizer_returncode}"
+                        )
+                    status = run_context.read_json(Path(run_dir) / "run_status.json")
+                    validation = status.get("recording_validation")
+                    if not isinstance(validation, dict):
                         failure_reasons.append("recording validation was not produced")
                     elif validation.get("passed") is not True:
                         failure_reasons.append("recording frame-count validation failed")
@@ -661,12 +601,25 @@ class OperatorBackend:
                 self._log(f"[BACKEND] run failed validation: {error}")
 
             self.state.inference = None
-            analysis_summary = self._run_post_run_alignment(run_dir)
+            finalizer_status = (
+                run_context.read_json(Path(run_dir) / "run_status.json")
+                if run_dir
+                else {}
+            )
+            analysis_summary = (
+                run_context.read_json(Path(run_dir) / "alignment_summary.json")
+                if run_dir
+                and (Path(run_dir) / "alignment_summary.json").exists()
+                else None
+            )
             if run_dir:
                 try:
                     self._write_run_manifest(run_dir)
                     updates: dict[str, Any] = {
-                        "analysis_complete": analysis_summary is not None,
+                        "analysis_complete": bool(
+                            analysis_summary is not None
+                            and finalizer_status.get("alignment_validated") is True
+                        ),
                         "outputs": self._run_output_snapshot(run_dir),
                     }
                     if error:

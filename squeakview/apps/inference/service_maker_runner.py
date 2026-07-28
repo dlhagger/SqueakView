@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import atexit
-from collections import Counter
+from collections import OrderedDict
 import csv
 import ctypes
 import json
@@ -13,7 +13,6 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Callable
 
 from pyservicemaker import (
@@ -36,6 +35,9 @@ from .pose_pipeline import (
 
 
 FLIR_FRAME_META_DESCRIPTOR = b"SQUEAKVIEW.FLIR.FRAME_META.v1"
+RECORD_QUEUE_SECONDS = 4
+RECORD_BACKPRESSURE_WARNING_SECONDS = 1
+RECORD_BACKPRESSURE_FATAL_SECONDS = 3
 
 
 def _user_meta_type(descriptor: bytes) -> int:
@@ -160,7 +162,12 @@ class RecordingAdmissionOperator(BufferOperator):
 
     HEADERS = ["stream_id", "record_frame_index", "pts_ns", "observer_monotonic_ns"]
 
-    def __init__(self, path: Path, stream_id: int):
+    def __init__(
+        self,
+        path: Path,
+        stream_id: int,
+        telemetry: "RecordingPathTelemetry | None" = None,
+    ):
         super().__init__()
         self.path = path
         self.stream_id = int(stream_id)
@@ -170,6 +177,7 @@ class RecordingAdmissionOperator(BufferOperator):
         self._count = 0
         self._lock = threading.Lock()
         self._closed = False
+        self._telemetry = telemetry
         atexit.register(self.close)
 
     def handle_buffer(self, buffer) -> bool:
@@ -179,6 +187,8 @@ class RecordingAdmissionOperator(BufferOperator):
             self._writer.writerow(
                 [self.stream_id, self._count, int(buffer.timestamp), time.monotonic_ns()]
             )
+            if self._telemetry is not None:
+                self._telemetry.admit(int(buffer.timestamp))
             self._count += 1
         return True
 
@@ -189,6 +199,235 @@ class RecordingAdmissionOperator(BufferOperator):
             self._closed = True
             self._file.flush()
             self._file.close()
+
+
+class RecordingPathTelemetry:
+    """Sample recording backlog and encoder latency with bounded state."""
+
+    HEADERS = [
+        "host_unix_ns",
+        "host_monotonic_ns",
+        "stream_id",
+        "event",
+        "pts_ns",
+        "egress_timestamp_ns",
+        "encoder_correlation",
+        "queue_wait_ms",
+        "encoder_latency_ms",
+        "waiting_for_record_admission",
+        "encoder_in_flight",
+        "max_waiting_since_sample",
+        "max_encoder_in_flight_since_sample",
+        "pending_evictions",
+    ]
+
+    def __init__(
+        self,
+        path: Path,
+        stream_id: int,
+        *,
+        sample_interval_s: float = 1.0,
+        warning_depth: int = 24,
+        fatal_depth: int | None = None,
+        max_pending: int = 4096,
+        on_fatal: Callable[[str], None] | None = None,
+    ):
+        self.path = path
+        self.stream_id = int(stream_id)
+        self.sample_interval_ns = max(1, int(sample_interval_s * 1_000_000_000))
+        self.warning_depth = max(1, int(warning_depth))
+        self.fatal_depth = (
+            max(self.warning_depth + 1, int(fatal_depth))
+            if fatal_depth is not None
+            else None
+        )
+        self.max_pending = max(self.warning_depth, int(max_pending))
+        self.on_fatal = on_fatal
+        self._file = path.open("w", newline="", buffering=1)
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(self.HEADERS)
+        self._source_pending: OrderedDict[int, int] = OrderedDict()
+        self._pending: OrderedDict[int, int] = OrderedDict()
+        self._lock = threading.Lock()
+        self._last_sample_ns = time.monotonic_ns()
+        self._max_source_depth = 0
+        self._max_encoder_depth = 0
+        self._evictions = 0
+        self._warning_active = False
+        self._fatal_reported = False
+        self._closed = False
+        atexit.register(self.close)
+
+    def _write(
+        self,
+        event: str,
+        now_ns: int,
+        pts_ns: int | str,
+        egress_timestamp_ns="",
+        encoder_correlation="",
+        queue_wait_ms="",
+        encoder_latency_ms="",
+    ) -> None:
+        self._writer.writerow(
+            [
+                time.time_ns(),
+                now_ns,
+                self.stream_id,
+                event,
+                pts_ns,
+                egress_timestamp_ns,
+                encoder_correlation,
+                queue_wait_ms,
+                encoder_latency_ms,
+                len(self._source_pending),
+                len(self._pending),
+                self._max_source_depth,
+                self._max_encoder_depth,
+                self._evictions,
+            ]
+        )
+
+    def _sample_if_due(
+        self,
+        now_ns: int,
+        pts_ns: int,
+        queue_wait_ms="",
+        encoder_latency_ms="",
+        egress_timestamp_ns="",
+        encoder_correlation="",
+    ) -> str | None:
+        source_depth = len(self._source_pending)
+        encoder_depth = len(self._pending)
+        self._max_source_depth = max(self._max_source_depth, source_depth)
+        self._max_encoder_depth = max(self._max_encoder_depth, encoder_depth)
+        warning = max(source_depth, encoder_depth) >= self.warning_depth
+        if warning != self._warning_active:
+            self._warning_active = warning
+            self._write(
+                "backpressure_enter" if warning else "backpressure_exit",
+                now_ns,
+                pts_ns,
+                egress_timestamp_ns,
+                encoder_correlation,
+                queue_wait_ms,
+                encoder_latency_ms,
+            )
+        fatal_message = None
+        if (
+            self.fatal_depth is not None
+            and source_depth >= self.fatal_depth
+            and not self._fatal_reported
+        ):
+            self._fatal_reported = True
+            fatal_message = (
+                f"recording queue backlog reached {source_depth} frames "
+                f"(fatal threshold {self.fatal_depth}) on stream {self.stream_id}"
+            )
+            self._write("backpressure_fatal", now_ns, pts_ns)
+        if now_ns - self._last_sample_ns >= self.sample_interval_ns:
+            self._write(
+                "sample",
+                now_ns,
+                pts_ns,
+                egress_timestamp_ns,
+                encoder_correlation,
+                queue_wait_ms,
+                encoder_latency_ms,
+            )
+            self._last_sample_ns = now_ns
+            self._max_source_depth = source_depth
+            self._max_encoder_depth = encoder_depth
+        return fatal_message
+
+    def source(self, pts_ns: int) -> None:
+        now_ns = time.monotonic_ns()
+        fatal_message = None
+        with self._lock:
+            if self._closed:
+                return
+            self._source_pending[int(pts_ns)] = now_ns
+            while len(self._source_pending) > self.max_pending:
+                self._source_pending.popitem(last=False)
+                self._evictions += 1
+            fatal_message = self._sample_if_due(now_ns, int(pts_ns))
+        if fatal_message is not None and self.on_fatal is not None:
+            self.on_fatal(fatal_message)
+
+    def admit(self, pts_ns: int) -> None:
+        now_ns = time.monotonic_ns()
+        with self._lock:
+            if self._closed:
+                return
+            source_ns = self._source_pending.pop(int(pts_ns), None)
+            queue_wait_ms = (
+                f"{(now_ns - source_ns) / 1_000_000.0:.6f}"
+                if source_ns is not None
+                else ""
+            )
+            self._pending[int(pts_ns)] = now_ns
+            while len(self._pending) > self.max_pending:
+                self._pending.popitem(last=False)
+                self._evictions += 1
+            self._sample_if_due(now_ns, int(pts_ns), queue_wait_ms=queue_wait_ms)
+
+    def egress(self, egress_timestamp_ns: int) -> None:
+        now_ns = time.monotonic_ns()
+        with self._lock:
+            if self._closed:
+                return
+            output_timestamp = int(egress_timestamp_ns)
+            input_pts_ns = output_timestamp
+            admitted_ns = self._pending.pop(output_timestamp, None)
+            correlation = "pts" if admitted_ns is not None else ""
+            if admitted_ns is None and self._pending:
+                # x264 is configured with bframes=0 and both lookaheads at 0,
+                # so encoded access units retain input order even when the
+                # parser exposes a rewritten timestamp through ServiceMaker.
+                input_pts_ns, admitted_ns = self._pending.popitem(last=False)
+                correlation = "fifo"
+            elif admitted_ns is None:
+                correlation = "unmatched"
+            encoder_latency_ms = (
+                f"{(now_ns - admitted_ns) / 1_000_000.0:.6f}"
+                if admitted_ns is not None
+                else ""
+            )
+            self._sample_if_due(
+                now_ns,
+                input_pts_ns,
+                encoder_latency_ms=encoder_latency_ms,
+                egress_timestamp_ns=output_timestamp,
+                encoder_correlation=correlation,
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._write("closed", time.monotonic_ns(), "")
+            self._file.flush()
+            self._file.close()
+
+
+class RecordingEgressOperator(BufferOperator):
+    def __init__(self, telemetry: RecordingPathTelemetry):
+        super().__init__()
+        self.telemetry = telemetry
+
+    def handle_buffer(self, buffer) -> bool:
+        self.telemetry.egress(int(buffer.timestamp))
+        return True
+
+
+class RecordingIngressOperator(BufferOperator):
+    def __init__(self, telemetry: RecordingPathTelemetry):
+        super().__init__()
+        self.telemetry = telemetry
+
+    def handle_buffer(self, buffer) -> bool:
+        self.telemetry.source(int(buffer.timestamp))
+        return True
 
 
 class FrameCsvOperator(BatchMetadataOperator):
@@ -232,7 +471,7 @@ class FrameCsvOperator(BatchMetadataOperator):
         "source_height",
         "source_pixel_format",
         "metadata_status",
-        "metadata_json",
+        "inference_admitted",
     ]
     TELEMETRY_HEADERS = [
         "host_unix_ns", "host_monotonic_ns", "stream_id", "camera_serial",
@@ -246,26 +485,49 @@ class FrameCsvOperator(BatchMetadataOperator):
         "expected_frame_id", "actual_frame_id", "details",
     ]
 
-    def __init__(self, path: Path, *, meta_type: int | None = None):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        meta_type: int | None = None,
+        audit_dir: Path | None = None,
+        write_audit_sidecars: bool = True,
+    ):
         super().__init__()
         self.path = path
         self.meta_type = _flir_frame_meta_type() if meta_type is None else int(meta_type)
+        path.parent.mkdir(parents=True, exist_ok=True)
         self._file = path.open("w", newline="", buffering=1)
         self._writer = csv.writer(self._file)
         self._writer.writerow(self.HEADERS)
         self._lock = threading.Lock()
         self._closed = False
-        self._runtime_path = path.with_name("camera_runtime.json")
+        self._audit_dir = Path(audit_dir) if audit_dir is not None else path.parent
+        self._write_audit_sidecars = bool(write_audit_sidecars)
+        if self._write_audit_sidecars:
+            self._audit_dir.mkdir(parents=True, exist_ok=True)
+        self._runtime_path = (
+            self._audit_dir / "camera_runtime.json"
+            if self._write_audit_sidecars
+            else None
+        )
         self._camera_runtime: dict[str, dict] = {}
         self._last_source_sequence: dict[int, int] = {}
-        self._telemetry_file = path.with_name("camera_telemetry.csv").open(
-            "w", newline="", buffering=1
-        )
-        self._telemetry_writer = csv.writer(self._telemetry_file)
-        self._telemetry_writer.writerow(self.TELEMETRY_HEADERS)
-        self._events_file = path.with_name("drop_events.csv").open("w", newline="", buffering=1)
-        self._events_writer = csv.writer(self._events_file)
-        self._events_writer.writerow(self.EVENT_HEADERS)
+        self._telemetry_file = None
+        self._telemetry_writer = None
+        self._events_file = None
+        self._events_writer = None
+        if self._write_audit_sidecars:
+            self._telemetry_file = (self._audit_dir / "camera.csv").open(
+                "w", newline="", buffering=1
+            )
+            self._telemetry_writer = csv.writer(self._telemetry_file)
+            self._telemetry_writer.writerow(self.TELEMETRY_HEADERS)
+            self._events_file = (self._audit_dir / "errors.csv").open(
+                "w", newline="", buffering=1
+            )
+            self._events_writer = csv.writer(self._events_file)
+            self._events_writer.writerow(self.EVENT_HEADERS)
         atexit.register(self.close)
 
     @staticmethod
@@ -301,7 +563,7 @@ class FrameCsvOperator(BatchMetadataOperator):
 
     def _remember_camera(self, payload: dict) -> None:
         serial = str(payload.get("camera_serial") or f"index:{payload.get('camera_index', '')}")
-        if not payload or serial in self._camera_runtime:
+        if self._runtime_path is None or not payload or serial in self._camera_runtime:
             return
         self._camera_runtime[serial] = {
             "camera_index": payload.get("camera_index"),
@@ -314,6 +576,7 @@ class FrameCsvOperator(BatchMetadataOperator):
             "actual_fps": payload.get("actual_fps"),
             "configured_exposure_us": payload.get("configured_exposure_us"),
             "configured_gain_db": payload.get("configured_gain_db"),
+            "configured_stream_buffer_count": payload.get("configured_stream_buffer_count"),
             "timestamp_increment_ns": payload.get("timestamp_increment_ns"),
             "timestamp_latch_available": payload.get("timestamp_latch_available"),
             "timestamp_latch_raw": payload.get("timestamp_latch_raw"),
@@ -340,10 +603,16 @@ class FrameCsvOperator(BatchMetadataOperator):
         expected_frame_id="",
         actual_frame_id="",
         details: dict | None = None,
+        host_unix_ns: int | None = None,
+        host_monotonic_ns: int | None = None,
     ) -> None:
+        if self._events_writer is None:
+            return
         self._events_writer.writerow(
             [
-                time.time_ns(), time.monotonic_ns(), event_type, stream_id,
+                host_unix_ns if host_unix_ns is not None else time.time_ns(),
+                host_monotonic_ns if host_monotonic_ns is not None else time.monotonic_ns(),
+                event_type, stream_id,
                 expected_frame_id, actual_frame_id,
                 json.dumps(details or {}, sort_keys=True, separators=(",", ":")),
             ]
@@ -352,7 +621,11 @@ class FrameCsvOperator(BatchMetadataOperator):
     def _write_audit_rows(
         self, payload: dict, status: str, stream_id: int, pipeline_missing
     ) -> None:
-        if payload.get("telemetry_sample"):
+        event_clocks = {
+            "host_unix_ns": payload.get("host_received_unix_ns"),
+            "host_monotonic_ns": payload.get("host_received_monotonic_ns"),
+        }
+        if payload.get("telemetry_sample") and self._telemetry_writer is not None:
             self._telemetry_writer.writerow(
                 [
                     self._value(payload, "host_received_unix_ns"),
@@ -381,6 +654,7 @@ class FrameCsvOperator(BatchMetadataOperator):
                 expected_frame_id=camera_frame_id - camera_missing,
                 actual_frame_id=camera_frame_id,
                 details={"missing_frames": camera_missing},
+                **event_clocks,
             )
         if isinstance(pipeline_missing, int) and pipeline_missing > 0:
             source_sequence = payload.get("source_sequence_index")
@@ -390,15 +664,17 @@ class FrameCsvOperator(BatchMetadataOperator):
                 expected_frame_id=(source_sequence - pipeline_missing) if isinstance(source_sequence, int) else "",
                 actual_frame_id=source_sequence if isinstance(source_sequence, int) else "",
                 details={"missing_frames": pipeline_missing},
+                **event_clocks,
             )
         if payload.get("crc_valid") is False:
             self._event(
                 "payload_crc_failure",
                 stream_id=stream_id,
                 actual_frame_id=camera_frame_id if isinstance(camera_frame_id, int) else "",
+                **event_clocks,
             )
         if not status.startswith("ok"):
-            self._event("frame_metadata_" + status, stream_id=stream_id)
+            self._event("frame_metadata_" + status, stream_id=stream_id, **event_clocks)
 
     def handle_metadata(self, batch_meta) -> None:
         with self._lock:
@@ -461,7 +737,7 @@ class FrameCsvOperator(BatchMetadataOperator):
                         self._value(payload, "source_height"),
                         self._value(payload, "source_pixel_format"),
                         status,
-                        json.dumps(payload, sort_keys=True, separators=(",", ":")) if payload else "",
+                        self._value(payload, "inference_admitted"),
                     ]
                 )
 
@@ -472,55 +748,12 @@ class FrameCsvOperator(BatchMetadataOperator):
             self._closed = True
             self._file.flush()
             self._file.close()
-            self._telemetry_file.flush()
-            self._telemetry_file.close()
-            self._events_file.flush()
-            self._events_file.close()
-
-
-def _load_capture_payloads(run_dir: Path, camera_count: int) -> list[dict]:
-    payloads: list[dict] = []
-    for index in range(camera_count):
-        path = run_dir / f"capture_cam{index}.jsonl"
-        if not path.exists():
-            continue
-        with path.open() as handle:
-            for line_number, line in enumerate(handle, 1):
-                raw = line.strip()
-                if not raw:
-                    continue
-                try:
-                    payload = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError(
-                        f"invalid capture ledger {path.name}:{line_number}: {exc}"
-                    ) from exc
-                if not isinstance(payload, dict):
-                    raise RuntimeError(f"invalid capture ledger object in {path.name}:{line_number}")
-                payload.setdefault("camera_index", index)
-                payloads.append(payload)
-    payloads.sort(
-        key=lambda item: (int(item.get("host_received_monotonic_ns") or 0), int(item.get("camera_index") or 0))
-    )
-    return payloads
-
-def _load_record_admissions(run_dir: Path, camera_count: int) -> tuple[Counter, dict[int, int]]:
-    admissions: Counter = Counter()
-    counts: dict[int, int] = {}
-    for index in range(camera_count):
-        path = run_dir / ("record_admission.csv" if index == 0 else f"record_admission_cam{index}.csv")
-        counts[index] = 0
-        if not path.exists():
-            raise RuntimeError(f"recording admission ledger is missing: {path.name}")
-        with path.open(newline="") as handle:
-            for line_number, row in enumerate(csv.DictReader(handle), 2):
-                try:
-                    pts_ns = int(row["pts_ns"])
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise RuntimeError(f"invalid recording admission {path.name}:{line_number}") from exc
-                admissions[(index, pts_ns)] += 1
-                counts[index] += 1
-    return admissions, counts
+            if self._telemetry_file is not None:
+                self._telemetry_file.flush()
+                self._telemetry_file.close()
+            if self._events_file is not None:
+                self._events_file.flush()
+                self._events_file.close()
 
 
 class ServiceMakerApp:
@@ -547,122 +780,17 @@ class ServiceMakerApp:
         self.observations: ObservationOperator | None = None
         self.frames: FrameCsvOperator | None = None
         self.record_admissions: list[RecordingAdmissionOperator] = []
+        self.record_telemetry: list[RecordingPathTelemetry] = []
         self._ready = False
         self._stopped = False
         self.exit_code = 0
         self._stop_event = threading.Event()
 
-    def _finalize_capture_manifest(self) -> list[dict]:
-        payloads = _load_capture_payloads(self.run_dir, self.config.num_cameras)
-        if not payloads:
-            print(f"[{ts()}] [WARN] no source capture ledger was produced", flush=True)
-            return []
-        admissions, admission_counts = _load_record_admissions(
-            self.run_dir, self.config.num_cameras
-        )
-        source_counts = {stream_id: 0 for stream_id in range(self.config.num_cameras)}
-        for payload in payloads:
-            stream_id = int(payload.get("camera_index") or 0)
-            source_counts[stream_id] = source_counts.get(stream_id, 0) + 1
-        recorded: list[dict] = []
-        for payload in payloads:
-            stream_id = int(payload.get("camera_index") or 0)
-            pts_ns = int(payload.get("gst_pts_ns") or 0)
-            key = (stream_id, pts_ns)
-            if admissions[key] <= 0:
-                continue
-            admissions[key] -= 1
-            recorded.append(payload)
-        unmatched = sum(admissions.values())
-        if unmatched:
-            raise RuntimeError(f"{unmatched} recording admissions have no matching source metadata")
-        reconciliation = {
-            "schema_version": "1.0",
-            "source_frames": source_counts,
-            "record_admitted_frames": admission_counts,
-            "source_not_recorded_frames": {
-                stream_id: source_counts[stream_id] - admission_counts.get(stream_id, 0)
-                for stream_id in source_counts
-            },
-            "policy": "frames.csv contains only buffers admitted to the non-leaky recording branch",
-        }
-        run_context.atomic_write_json(self.run_dir / "capture_reconciliation.json", reconciliation)
-        payloads = recorded
-        operator = FrameCsvOperator(self.artifacts.frames_csv, meta_type=0)
-        try:
-            for payload in payloads:
-                stream_id = int(payload.get("camera_index") or 0)
-                sequence = int(payload.get("source_sequence_index") or 0)
-                pts_ns = int(payload.get("gst_pts_ns") or 0)
-                user_meta = SimpleNamespace(
-                    get_user_data_json=lambda payload=payload: payload
-                )
-                frame_meta = SimpleNamespace(
-                    frame_number=sequence,
-                    source_id=stream_id,
-                    pad_index=stream_id,
-                    buffer_pts=pts_ns,
-                    user_meta_items=lambda _meta_type, user_meta=user_meta: iter([user_meta]),
-                )
-                operator.handle_metadata(SimpleNamespace(frame_items=[frame_meta]))
-        finally:
-            operator.close()
-        print(
-            f"[{ts()}] [CAPTURE] finalized {len(payloads)} record-admitted frames",
-            flush=True,
-        )
-        return payloads
-
-    def _write_inference_admission(self, payloads: list[dict]) -> None:
-        if not self.config.enable_infer or not payloads:
-            return
-        ledger_path = self.run_dir / "inference" / "frames.csv"
-        admitted: set[tuple[int, int]] = set()
-        if ledger_path.exists():
-            with ledger_path.open(newline="") as handle:
-                for row in csv.DictReader(handle):
-                    try:
-                        admitted.add((int(row["stream_id"]), int(row["source_sequence_index"])))
-                    except (KeyError, TypeError, ValueError):
-                        continue
-        output_path = self.run_dir / "inference_admission.csv"
-        with output_path.open("w", newline="") as handle:
-            fields = ["stream_id", "source_sequence_index", "camera_frame_id", "admitted"]
-            writer = csv.DictWriter(handle, fieldnames=fields)
-            writer.writeheader()
-            for payload in payloads:
-                stream_id = int(payload.get("camera_index") or 0)
-                sequence = int(payload.get("source_sequence_index") or 0)
-                writer.writerow(
-                    {
-                        "stream_id": stream_id,
-                        "source_sequence_index": sequence,
-                        "camera_frame_id": payload.get("camera_frame_id"),
-                        "admitted": int((stream_id, sequence) in admitted),
-                    }
-                )
-        capture_counts = {stream_id: 0 for stream_id in range(self.config.num_cameras)}
-        for payload in payloads:
-            stream_id = int(payload.get("camera_index") or 0)
-            capture_counts[stream_id] = capture_counts.get(stream_id, 0) + 1
-        admitted_counts = {stream_id: 0 for stream_id in capture_counts}
-        for stream_id, _sequence in admitted:
-            admitted_counts[stream_id] = admitted_counts.get(stream_id, 0) + 1
-        summary = {
-            "schema_version": "1.0",
-            "policy": "capture_non_leaky_inference_leaky_downstream",
-            "captured_frames": capture_counts,
-            "inference_admitted_frames": admitted_counts,
-            "inference_skipped_frames": {
-                stream_id: capture_counts[stream_id] - admitted_counts.get(stream_id, 0)
-                for stream_id in capture_counts
-            },
-        }
-        run_context.atomic_write_json(self.run_dir / "inference_admission.json", summary)
-        print(
-            f"[{ts()}] [INFER] admission audit: {summary['inference_skipped_frames']}",
-            flush=True,
-        )
+    def _recording_fault(self, message: str) -> None:
+        if self.exit_code == 0:
+            self.exit_code = 4
+            print(f"[{ts()}] [RECORD] FATAL: {message}", flush=True)
+        self._stop_event.set()
 
     def _prewarm_cuda(self) -> None:
         if not self.config.enable_infer:
@@ -684,75 +812,75 @@ class ServiceMakerApp:
         )
 
     @staticmethod
-    def _video_frame_count(path: Path) -> int | None:
+    def _video_frame_probe(path: Path) -> dict[str, object]:
         ffprobe = shutil.which("ffprobe")
         if ffprobe is None or not path.is_file():
-            return None
-        result = subprocess.run(
-            [
-                ffprobe,
-                "-v",
-                "error",
-                "-count_frames",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=nb_read_frames",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(path),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            return None
-        try:
-            return int(result.stdout.strip())
-        except ValueError:
-            return None
+            reason = "ffprobe is unavailable" if ffprobe is None else "video file is missing"
+            return {"count": None, "method": None, "error": reason}
 
-    def _validate_recordings(self, payloads: list[dict]) -> None:
-        if not payloads:
-            return
-        captured = {stream_id: 0 for stream_id in range(self.config.num_cameras)}
-        for payload in payloads:
-            stream_id = int(payload.get("camera_index") or 0)
-            captured[stream_id] = captured.get(stream_id, 0) + 1
-        cameras = []
-        failed = False
-        for stream_id in range(self.config.num_cameras):
-            video_path = self.artifacts.raw_video if stream_id == 0 else self.run_dir / f"raw_cam{stream_id}.mp4"
-            source_frames = captured.get(stream_id, 0)
-            video_frames = self._video_frame_count(video_path)
-            exists = video_path.is_file() and video_path.stat().st_size > 0
-            matches = video_frames == source_frames if video_frames is not None else None
-            if not exists or matches is False:
-                failed = True
-            cameras.append(
-                {
-                    "stream_id": stream_id,
-                    "video": video_path.name,
-                    "exists": exists,
-                    "source_frames": source_frames,
-                    "record_admitted_frames": source_frames,
-                    "video_frames": video_frames,
-                    "frame_count_matches": matches,
-                }
-            )
-        report = {
-            "schema_version": "1.0",
-            "policy": "every_record_admitted_frame_must_be_present_in_ground_truth_video",
-            "cameras": cameras,
-            "passed": not failed and all(item["frame_count_matches"] is True for item in cameras),
-        }
-        run_context.atomic_write_json(self.run_dir / "recording_validation.json", report)
-        level = "ERROR" if failed else ("PASS" if report["passed"] else "WARN")
-        print(f"[{ts()}] [RECORD] {level} validation: {cameras}", flush=True)
-        if failed:
-            self.exit_code = 1
+        attempts = (
+            (
+                "container_nb_frames",
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=nb_frames",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                10,
+            ),
+            (
+                "decoded_nb_read_frames",
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=nb_read_frames",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                60,
+            ),
+        )
+        errors: list[str] = []
+        for method, command, timeout_s in attempts:
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout_s,
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(f"{method} timed out after {timeout_s}s")
+                continue
+            output = result.stdout.strip()
+            if result.returncode == 0:
+                try:
+                    return {"count": int(output), "method": method, "error": None}
+                except ValueError:
+                    errors.append(f"{method} returned {output or 'no frame count'}")
+                    continue
+            detail = result.stderr.strip() or f"exit code {result.returncode}"
+            errors.append(f"{method} failed: {detail}")
+        return {"count": None, "method": None, "error": "; ".join(errors)}
+
+    @classmethod
+    def _video_frame_count(cls, path: Path) -> int | None:
+        count = cls._video_frame_probe(path).get("count")
+        return int(count) if count is not None else None
 
     def _camera_properties(self, index: int) -> dict[str, object]:
         cfg = self.config
@@ -770,6 +898,7 @@ class ServiceMakerApp:
             "gain": -1.0 if cfg.gain is None else float(cfg.gain),
             "drop-incomplete": False,
             "buffer-handling": "OldestFirst",
+            "stream-buffer-count": max(64, int(cfg.fps) * 2),
             "capture-log-path": str(self.run_dir / f"capture_cam{index}.jsonl"),
             "metadata-profile": "scientific",
             "max-consecutive-timeouts": 0 if cfg.trigger_on else 10,
@@ -804,21 +933,38 @@ class ServiceMakerApp:
         pipeline.add(
             "queue",
             record_queue,
-            {"max-size-buffers": 30, "max-size-bytes": 0, "max-size-time": 0},
+            {
+                "max-size-buffers": max(120, int(cfg.fps) * RECORD_QUEUE_SECONDS),
+                "max-size-bytes": 0,
+                "max-size-time": 0,
+            },
         )
         admission_path = (
             self.run_dir / "record_admission.csv"
             if index == 0 else self.run_dir / f"record_admission_cam{index}.csv"
         )
-        admission = RecordingAdmissionOperator(admission_path, index)
+        diagnostics_dir = self.run_dir / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        telemetry_path = diagnostics_dir / (
+            "recording.csv" if index == 0 else f"recording_cam{index}.csv"
+        )
+        telemetry = RecordingPathTelemetry(
+            telemetry_path,
+            index,
+            warning_depth=max(24, int(cfg.fps) * RECORD_BACKPRESSURE_WARNING_SECONDS),
+            fatal_depth=max(90, int(cfg.fps) * RECORD_BACKPRESSURE_FATAL_SECONDS),
+            on_fatal=self._recording_fault,
+        )
+        self.record_telemetry.append(telemetry)
+        pipeline.attach(
+            source_caps,
+            self.probe_factory(
+                f"record_ingress{index}", RecordingIngressOperator(telemetry)
+            ),
+        )
+        admission = RecordingAdmissionOperator(admission_path, index, telemetry)
         self.record_admissions.append(admission)
         pipeline.attach(record_queue, self.probe_factory(f"record_admission{index}", admission))
-        pipeline.add("videoconvert", f"record_convert{index}")
-        pipeline.add(
-            "capsfilter",
-            f"record_caps{index}",
-            {"caps": f"video/x-raw,format=I420,width={cfg.width},height={cfg.height}"},
-        )
         pipeline.add(
             "x264enc",
             f"record_encoder{index}",
@@ -827,16 +973,25 @@ class ServiceMakerApp:
                 "speed-preset": 1,  # GstX264EncPreset.ULTRAFAST
                 "bitrate": int(cfg.bitrate),
                 "key-int-max": int(cfg.fps),
+                "bframes": 0,
+                "rc-lookahead": 0,
+                "sync-lookahead": 0,
+                "sliced-threads": False,
+                "vbv-buf-capacity": 100,
             },
         )
         pipeline.add("h264parse", f"record_parser{index}")
+        pipeline.attach(
+            f"record_parser{index}",
+            self.probe_factory(
+                f"record_egress{index}", RecordingEgressOperator(telemetry)
+            ),
+        )
         pipeline.add("mp4mux", f"record_muxer{index}")
         pipeline.add("filesink", f"record_sink{index}", {"location": str(raw_path)})
         pipeline.link(
             tee,
             record_queue,
-            f"record_convert{index}",
-            f"record_caps{index}",
             f"record_encoder{index}",
             f"record_parser{index}",
             f"record_muxer{index}",
@@ -853,7 +1008,7 @@ class ServiceMakerApp:
                 "leaky": 2,
             },
         )
-        pipeline.add("nvvideoconvert", f"infer_convert{index}", {"compute-hw": 1, "copy-hw": 2})
+        pipeline.add("nvvideoconvert", f"infer_convert{index}", {"compute-hw": 2, "copy-hw": 2})
         pipeline.add(
             "capsfilter",
             infer_caps,
@@ -887,7 +1042,10 @@ class ServiceMakerApp:
 
         inference_dir = self.run_dir / "inference"
         inference_dir.mkdir(parents=True, exist_ok=True)
-        self.frames = FrameCsvOperator(inference_dir / "frames.csv")
+        self.frames = FrameCsvOperator(
+            inference_dir / "frames.csv",
+            write_audit_sidecars=False,
+        )
         pipeline.attach("mux", self.probe_factory("frames", self.frames))
 
         tail = ["mux"]
@@ -937,14 +1095,14 @@ class ServiceMakerApp:
                 flir_meta_type=self.frames.meta_type,
             )
             pipeline.attach("tracker", self.probe_factory("observations", self.observations))
-        pipeline.add("nvosdbin", "osd")
-        tail.append("osd")
         if not cfg.preview_sockets:
             pipeline.add("fakesink", "sink", {"sync": False})
             tail.append("sink")
             pipeline.link(*tail)
             self._ready_origin = "sink"
         else:
+            pipeline.add("nvosdbin", "osd")
+            tail.append("osd")
             pipeline.add("nvstreamdemux", "preview_demux")
             tail.append("preview_demux")
             pipeline.link(*tail)
@@ -1030,16 +1188,24 @@ class ServiceMakerApp:
             self.observations.close()
         for admission in self.record_admissions:
             admission.close()
+        for telemetry in self.record_telemetry:
+            telemetry.close()
         if self.frames is not None:
             self.frames.close()
         try:
-            payloads = self._finalize_capture_manifest()
-            self._write_inference_admission(payloads)
-            self._validate_recordings(payloads)
+            run_context.write_status(
+                self.run_dir,
+                "capture_closed",
+                capture_exit_code=self.exit_code,
+            )
         except Exception as exc:
             self.exit_code = 1
-            print(f"[{ts()}] [RECORD] ERROR finalizing capture audit: {exc}", flush=True)
+            print(f"[{ts()}] [RECORD] ERROR marking capture closed: {exc}", flush=True)
 
+        print(
+            f"[{ts()}] [CAPTURE] closed; post-run audit is handled independently",
+            flush=True,
+        )
         print(f"[{ts()}] [INFO] done. Files in: {self.run_dir}", flush=True)
 
 def run(config: InferenceConfig) -> int:

@@ -82,6 +82,34 @@ class SerialCsvTests(unittest.TestCase):
         self.assertIn("Permission denied", self.handle.last_error or "")
         self.assertTrue(any("ERROR opening serial" in line for line in self.logs))
 
+    def test_ack_stop_is_persisted_before_wait_releases(self) -> None:
+        self.handle.set_csv_path(self.run_dir)
+
+        class FakeSerialPort:
+            is_open = True
+
+            def __init__(self, handle: serial_util.SerialHandle):
+                self.handle = handle
+                self.reads = 0
+
+            def read(self, _size: int) -> bytes:
+                self.reads += 1
+                if self.reads == 1:
+                    return b"ACK_STOP,1,2,nan,3,4,5,6,Eligible,nan\n"
+                self.handle._stop.set()
+                return b""
+
+        self.handle.ser = FakeSerialPort(self.handle)
+        self.handle._closed = False
+        self.handle._pump()
+
+        self.assertTrue(self.handle.wait_for_stop_ack(timeout_s=0))
+        self.handle.close()
+        rows = self.rows()
+        self.assertEqual(rows[-1]["eventType"], "ACK_STOP")
+        self.assertEqual(rows[-1]["count"], "3")
+        self.assertEqual(self.handle.stop_ack_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

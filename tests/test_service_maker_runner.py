@@ -3,12 +3,16 @@ from __future__ import annotations
 import csv
 import json
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from squeakview.apps.inference import service_maker_runner as runner
+from squeakview.apps.inference import post_run
 from squeakview.apps.inference.pose_pipeline import PoseClass, PoseSchema, decode_yolo26_rows, load_pose_schema
+from squeakview.common import run_context
 
 
 class FakePipeline:
@@ -124,7 +128,14 @@ class ServiceMakerRunnerTests(unittest.TestCase):
             str(app.run_dir / "capture_cam0.jsonl"),
         )
         self.assertNotIn("leaky", pipeline.nodes["record_queue0"][1])
-        self.assertEqual(pipeline.nodes["record_queue0"][1]["max-size-buffers"], 30)
+        self.assertEqual(pipeline.nodes["record_queue0"][1]["max-size-buffers"], 120)
+        self.assertEqual(pipeline.nodes["flirsrc0"][1]["stream-buffer-count"], 64)
+        self.assertNotIn("record_convert0", pipeline.nodes)
+        self.assertNotIn("record_caps0", pipeline.nodes)
+        self.assertEqual(pipeline.nodes["record_encoder0"][0], "x264enc")
+        self.assertFalse(pipeline.nodes["record_encoder0"][1]["sliced-threads"])
+        self.assertEqual(pipeline.nodes["infer_convert0"][1]["compute-hw"], 2)
+        self.assertEqual(pipeline.nodes["infer_convert0"][1]["copy-hw"], 2)
         self.assertEqual(pipeline.nodes["infer_queue0"][1]["leaky"], 2)
         self.assertEqual(pipeline.nodes["infer_queue0"][1]["max-size-buffers"], 32)
         self.assertEqual(pipeline.nodes["mux"][0], "nvstreammux")
@@ -134,6 +145,7 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         self.assertEqual(pipeline.nodes["tracker"][1]["tracking-id-reset-mode"], 3)
         self.assertEqual(pipeline.nodes["record_sink0"][1]["location"], str(app.artifacts.raw_video))
         self.assertEqual(pipeline.nodes["sink"][0], "fakesink")
+        self.assertNotIn("osd", pipeline.nodes)
         self.assertEqual(app.frames.path, app.run_dir / "inference" / "frames.csv")
         self.assertTrue(
             any(link == (("infer_caps0", "mux"), ("", "sink_%u")) for link in pipeline.links)
@@ -151,6 +163,7 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         app, pipeline = self.build(self.config(preview_sockets=(socket_path,)))
 
         self.assertEqual(pipeline.nodes["preview_demux"][0], "nvstreamdemux")
+        self.assertEqual(pipeline.nodes["osd"][0], "nvosdbin")
         self.assertEqual(pipeline.nodes["preview_queue0"][0], "queue")
         self.assertEqual(pipeline.nodes["preview_queue0"][1]["leaky"], 2)
         self.assertEqual(pipeline.nodes["preview_queue0"][1]["max-size-buffers"], 1)
@@ -216,6 +229,79 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         self.assertEqual(rows[0]["record_frame_index"], "0")
         self.assertEqual(rows[0]["pts_ns"], "123456789")
 
+    def test_recording_path_telemetry_is_sampled_and_bounded(self) -> None:
+        output = self.root / "recording_path_telemetry.csv"
+        telemetry = runner.RecordingPathTelemetry(
+            output,
+            stream_id=0,
+            sample_interval_s=3600,
+            warning_depth=2,
+            max_pending=3,
+        )
+        for pts_ns in range(10):
+            telemetry.admit(pts_ns)
+        self.assertEqual(len(telemetry._pending), 3)
+        telemetry.egress(9)
+        telemetry.close()
+
+        with output.open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertTrue(any(row["event"] == "backpressure_enter" for row in rows))
+        self.assertEqual(rows[-1]["event"], "closed")
+        self.assertEqual(rows[-1]["pending_evictions"], "7")
+
+    def test_recording_path_telemetry_uses_fifo_when_egress_timestamp_is_rewritten(self) -> None:
+        output = self.root / "recording_path_fifo.csv"
+        telemetry = runner.RecordingPathTelemetry(
+            output,
+            stream_id=0,
+            sample_interval_s=0,
+            warning_depth=10,
+            max_pending=10,
+        )
+        telemetry.source(100)
+        telemetry.admit(100)
+        telemetry.egress(999)
+        telemetry.source(200)
+        telemetry.admit(200)
+        telemetry.egress(200)
+        self.assertEqual(len(telemetry._pending), 0)
+        telemetry.close()
+
+        with output.open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        fifo = next(row for row in rows if row["encoder_correlation"] == "fifo")
+        exact = next(row for row in rows if row["encoder_correlation"] == "pts")
+        self.assertEqual(fifo["pts_ns"], "100")
+        self.assertEqual(fifo["egress_timestamp_ns"], "999")
+        self.assertNotEqual(fifo["encoder_latency_ms"], "")
+        self.assertEqual(exact["pts_ns"], "200")
+        self.assertEqual(exact["egress_timestamp_ns"], "200")
+        self.assertEqual(rows[-1]["pending_evictions"], "0")
+
+    def test_recording_backpressure_fails_before_non_leaky_queue_is_full(self) -> None:
+        output = self.root / "recording_path_fatal.csv"
+        faults: list[str] = []
+        telemetry = runner.RecordingPathTelemetry(
+            output,
+            stream_id=0,
+            sample_interval_s=3600,
+            warning_depth=1,
+            fatal_depth=3,
+            max_pending=10,
+            on_fatal=faults.append,
+        )
+
+        for pts_ns in range(4):
+            telemetry.source(pts_ns)
+        telemetry.close()
+
+        self.assertEqual(len(faults), 1)
+        self.assertIn("reached 3 frames", faults[0])
+        with output.open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(sum(row["event"] == "backpressure_fatal" for row in rows), 1)
+
     def test_capture_ledger_is_authoritative_and_inference_skips_are_audited(self) -> None:
         app, _pipeline = self.build(self.config())
         first = {
@@ -243,21 +329,145 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         (app.run_dir / "inference" / "frames.csv").write_text(
             "stream_id,source_sequence_index\n0,0\n"
         )
-        payloads = app._finalize_capture_manifest()
-        app._write_inference_admission(payloads)
+        app.artifacts.raw_video.write_bytes(b"mp4")
+        with mock.patch.object(
+            runner.ServiceMakerApp,
+            "_video_frame_probe",
+            return_value={"count": 2, "method": "container_nb_frames", "error": None},
+        ):
+            result = post_run.finalize_run(
+                app.run_dir, camera_count=1, enable_infer=True
+            )
+        self.assertEqual(result.recorded_total, 2)
         with app.artifacts.frames_csv.open(newline="") as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 2)
         self.assertEqual([row["raw_frame_index"] for row in rows], ["0", "1"])
-        with (app.run_dir / "inference_admission.csv").open(newline="") as handle:
-            admission = list(csv.DictReader(handle))
-        self.assertEqual([row["admitted"] for row in admission], ["1", "0"])
-        summary = json.loads((app.run_dir / "inference_admission.json").read_text())
+        self.assertEqual([row["inference_admitted"] for row in rows], ["1", "0"])
+        status = run_context.read_json(app.run_dir / "run_status.json")
+        summary = status["inference_admission"]
         self.assertEqual(summary["inference_skipped_frames"]["0"], 1)
 
         app.observations.close()
-        reconciliation = json.loads((app.run_dir / "capture_reconciliation.json").read_text())
+        for telemetry in app.record_telemetry:
+            telemetry.close()
+        reconciliation = status["capture_reconciliation"]
         self.assertEqual(reconciliation["source_not_recorded_frames"]["0"], 1)
+        app._stopped = True
+
+    def test_post_run_finalizer_memory_does_not_scale_with_rows(self) -> None:
+        run_dir = self.root / "scale_run"
+        run_dir.mkdir()
+        frame_count = 20_000
+        with (
+            (run_dir / "capture_cam0.jsonl").open("w") as capture,
+            (run_dir / "record_admission.csv").open("w", newline="") as admission,
+        ):
+            admission_writer = csv.writer(admission)
+            admission_writer.writerow(runner.RecordingAdmissionOperator.HEADERS)
+            for index in range(frame_count):
+                pts_ns = index * 33_333_333
+                capture.write(
+                    json.dumps(
+                        {
+                            "camera_index": 0,
+                            "source_sequence_index": index,
+                            "camera_frame_id": 1000 + index,
+                            "gst_pts_ns": pts_ns,
+                            "host_received_monotonic_ns": index,
+                            "host_received_unix_ns": index,
+                            "actual_fps": 30.0,
+                        }
+                    )
+                    + "\n"
+                )
+                admission_writer.writerow([0, index, pts_ns, index])
+        (run_dir / "raw.mp4").write_bytes(b"mp4")
+
+        tracemalloc.start()
+        try:
+            with mock.patch.object(
+                runner.ServiceMakerApp,
+                "_video_frame_probe",
+                return_value={
+                    "count": frame_count,
+                    "method": "container_nb_frames",
+                    "error": None,
+                },
+            ):
+                result = post_run.finalize_run(
+                    run_dir, camera_count=1, enable_infer=False
+                )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertTrue(result.validation_passed)
+        self.assertEqual(result.recorded_total, frame_count)
+        self.assertLess(peak, 32 * 1024 * 1024)
+
+    def test_video_frame_probe_prefers_fast_container_count(self) -> None:
+        video = self.root / "raw.mp4"
+        video.write_bytes(b"mp4")
+        result = SimpleNamespace(returncode=0, stdout="3389\n", stderr="")
+
+        with (
+            mock.patch.object(runner.shutil, "which", return_value="/usr/bin/ffprobe"),
+            mock.patch.object(runner.subprocess, "run", return_value=result) as run,
+        ):
+            probe = runner.ServiceMakerApp._video_frame_probe(video)
+
+        self.assertEqual(probe["count"], 3389)
+        self.assertEqual(probe["method"], "container_nb_frames")
+        self.assertNotIn("-count_frames", run.call_args.args[0])
+
+    def test_video_frame_probe_falls_back_to_decoded_count(self) -> None:
+        video = self.root / "raw.mp4"
+        video.write_bytes(b"mp4")
+        no_metadata = SimpleNamespace(returncode=0, stdout="N/A\n", stderr="")
+        decoded = SimpleNamespace(returncode=0, stdout="3389\n", stderr="")
+
+        with (
+            mock.patch.object(runner.shutil, "which", return_value="/usr/bin/ffprobe"),
+            mock.patch.object(
+                runner.subprocess, "run", side_effect=[no_metadata, decoded]
+            ) as run,
+        ):
+            probe = runner.ServiceMakerApp._video_frame_probe(video)
+
+        self.assertEqual(probe["count"], 3389)
+        self.assertEqual(probe["method"], "decoded_nb_read_frames")
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("-count_frames", run.call_args.args[0])
+
+    def test_recording_validation_rejects_unadmitted_source_frame(self) -> None:
+        app, _pipeline = self.build(self.config())
+        app.artifacts.raw_video.write_bytes(b"mp4")
+        with mock.patch.object(
+            runner.ServiceMakerApp,
+            "_video_frame_probe",
+            return_value={"count": 2, "method": "container_nb_frames", "error": None},
+        ):
+            report, passed = post_run._validate_recordings(
+                app.run_dir,
+                1,
+                {0: 3},
+                {0: 2},
+            )
+
+        self.assertFalse(passed)
+        camera = report["cameras"][0]
+        self.assertFalse(report["passed"])
+        self.assertEqual(camera["source_frames"], 3)
+        self.assertEqual(camera["record_admitted_frames"], 2)
+        self.assertFalse(camera["source_count_matches"])
+        self.assertTrue(camera["frame_count_matches"])
+        app.observations.close()
+        for admission in app.record_admissions:
+            admission.close()
+        for telemetry in app.record_telemetry:
+            telemetry.close()
+        app.frames.close()
         app._stopped = True
 
     def test_yolo26_decoder_undoes_symmetric_letterbox_and_filters_confidence(self) -> None:
@@ -343,17 +553,19 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         self.assertEqual(row["missing_frames_before"], "2")
         self.assertEqual(row["pipeline_missing_frames_before"], "0")
         self.assertEqual(row["metadata_status"], "ok")
-        with (self.root / "camera_telemetry.csv").open(newline="") as handle:
+        with (self.root / "camera.csv").open(newline="") as handle:
             telemetry = next(csv.DictReader(handle))
         self.assertEqual(telemetry["host_monotonic_ns"], "1234567890")
         self.assertEqual(telemetry["host_unix_ns"], "1784827864529828000")
         self.assertEqual(telemetry["sensor_temperature_c"], "48.5")
         self.assertEqual(telemetry["stream_delivered_frames"], "8")
-        with (self.root / "drop_events.csv").open(newline="") as handle:
+        with (self.root / "errors.csv").open(newline="") as handle:
             event = next(csv.DictReader(handle))
         self.assertEqual(event["event_type"], "camera_frame_gap")
         self.assertEqual(event["expected_frame_id"], "107")
         self.assertEqual(event["actual_frame_id"], "109")
+        self.assertEqual(event["host_unix_ns"], "1784827864529828000")
+        self.assertEqual(event["host_monotonic_ns"], "1234567890")
         runtime = json.loads((self.root / "camera_runtime.json").read_text())
         self.assertTrue(runtime["cameras"][0]["timestamp_latch_available"])
         self.assertEqual(runtime["cameras"][0]["timestamp_latch_raw"], 123456)
@@ -379,9 +591,53 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         self.assertEqual(row["camera_frame_id"], "")
         self.assertEqual(row["camera_frame_id_available"], "0")
         self.assertEqual(row["metadata_status"], "missing")
-        with (self.root / "drop_events.csv").open(newline="") as handle:
+        with (self.root / "errors.csv").open(newline="") as handle:
             event = next(csv.DictReader(handle))
         self.assertEqual(event["event_type"], "frame_metadata_missing")
+
+    def test_successful_cleanup_removes_only_recovery_artifacts(self) -> None:
+        for name in (
+            "capture_cam0.jsonl",
+            "capture_cam1.jsonl",
+            "record_admission.csv",
+            "record_admission_cam1.csv",
+            post_run.PROGRESS_FILENAME,
+        ):
+            (self.root / name).write_text("temporary\n")
+        inference = self.root / "inference"
+        inference.mkdir()
+        (inference / "frames.csv").write_text("temporary\n")
+        for name in ("frames.csv", "objects.csv", "keypoints.csv", "alignment_summary.json"):
+            (self.root / name).write_text("canonical\n")
+
+        post_run.cleanup_successful_run(self.root, 2)
+
+        self.assertFalse((self.root / "capture_cam0.jsonl").exists())
+        self.assertFalse((self.root / "record_admission_cam1.csv").exists())
+        self.assertFalse(inference.exists())
+        self.assertFalse((self.root / post_run.PROGRESS_FILENAME).exists())
+        for name in ("frames.csv", "objects.csv", "keypoints.csv", "alignment_summary.json"):
+            self.assertEqual((self.root / name).read_text(), "canonical\n")
+
+    def test_failed_alignment_sets_overall_progress_failed(self) -> None:
+        summary = {
+            "frame_alignment": {"validated": False},
+            "counts": {"frame_gaps_detected": 1},
+            "validation": {"video_frame_count_matches_frames_csv": True},
+            "outputs": {},
+        }
+        with mock.patch(
+            "scripts.align_run_outputs_streaming.build_alignment",
+            return_value=summary,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "alignment validation failed"):
+                post_run.align_run(self.root)
+
+        progress = run_context.read_json(self.root / post_run.PROGRESS_FILENAME)
+        self.assertEqual(progress["stage"], "failed")
+        self.assertFalse(progress["alignment_validation_passed"])
+        self.assertFalse(progress["overall_validation_passed"])
+        self.assertEqual(run_context.read_json(self.root / "run_status.json")["state"], "analysis_failed")
 
 
 if __name__ == "__main__":

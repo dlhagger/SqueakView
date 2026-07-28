@@ -25,6 +25,7 @@ def _now() -> str:
 WORKSPACE = squeakview_config.WORKSPACE
 
 INFERENCE_ENTRY = "squeakview.apps.inference.main"
+POST_RUN_ENTRY = "squeakview.apps.inference.post_run"
 
 
 def preview_socket_paths(run_dir: Path, num_cameras: int) -> tuple[Path, ...]:
@@ -120,7 +121,7 @@ def _localize_deepstream_config(config_path: Path, run_dir: Path | None, emit: C
         changed = changed or new_line != line
 
     sidecar_path = config_path.with_name(f"{config_path.stem}.pose.json")
-    localized_dir = Path(run_dir) / "deepstream_config"
+    localized_dir = Path(run_dir) / "config"
     localized_dir.mkdir(parents=True, exist_ok=True)
     localized_config = localized_dir / config_path.name
     localized_config.write_text("\n".join(localized_lines) + "\n")
@@ -322,3 +323,54 @@ def spawn_inference(
         else:
             emit(f"【DS】 WARN: FLIR direct plugin build directory not found: {plugin_dir}")
     return _spawn(INFERENCE_ENTRY, args, emit, "【DS】", extra_env=extra_env, on_exit=on_exit)
+
+
+def spawn_post_run(
+    run_dir: Path,
+    *,
+    camera_count: int,
+    enable_infer: bool,
+    enable_align: bool,
+) -> subprocess.Popen[bytes]:
+    """Start a restart-safe post-run worker in its own process session.
+
+    Output goes directly to the run directory so the worker can continue safely
+    if the GUI exits while finalization is still in progress.
+    """
+
+    args = [
+        sys.executable,
+        "-m",
+        POST_RUN_ENTRY,
+        str(Path(run_dir).resolve()),
+        "--camera-count",
+        str(max(1, int(camera_count))),
+    ]
+    if enable_infer:
+        args.append("--enable-infer")
+    if enable_align:
+        args.append("--align")
+    env = os.environ.copy()
+    env.update(_deepstream_runtime_env())
+    package_root = str(WORKSPACE)
+    current_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{package_root}{os.pathsep}{current_pythonpath}"
+        if current_pythonpath
+        else package_root
+    )
+    env["PYTHONUNBUFFERED"] = "1"
+    log_path = Path(run_dir) / "diagnostics" / "post_run.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("ab", buffering=0)
+    try:
+        return subprocess.Popen(
+            args,
+            cwd=str(WORKSPACE),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    finally:
+        log_handle.close()

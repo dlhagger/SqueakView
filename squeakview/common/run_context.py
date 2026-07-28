@@ -28,6 +28,11 @@ _STATUS_TIMESTAMP_FIELDS = {
     "starting": "starting_at",
     "recording": "started_at",
     "stopping": "stopped_at",
+    "capture_closed": "capture_closed_at",
+    "finalizing": "finalizing_at",
+    "finalization_failed": "finalization_failed_at",
+    "post_run_complete": "post_run_completed_at",
+    "analyzing": "analyzing_at",
     "finalized": "finalized_at",
     "failed": "failed_at",
 }
@@ -162,11 +167,8 @@ class RunArtifacts:
     raw_video: Path
     frames_csv: Path
     drop_events_csv: Path
-    detections_csv: Path
     objects_csv: Path
     keypoints_csv: Path
-    tracks_csv: Path
-    metadata_json: Path
     manifest_json: Path
     status_json: Path
     bottle_setup_json: Path
@@ -179,12 +181,9 @@ def run_artifacts(run_dir: Path, include_serial: bool = True) -> RunArtifacts:
     return RunArtifacts(
         raw_video=run_dir / "raw.mp4",
         frames_csv=run_dir / "frames.csv",
-        drop_events_csv=run_dir / "drop_events.csv",
-        detections_csv=run_dir / "detections.csv",
+        drop_events_csv=run_dir / "diagnostics" / "errors.csv",
         objects_csv=run_dir / "objects.csv",
         keypoints_csv=run_dir / "keypoints.csv",
-        tracks_csv=run_dir / "tracks.csv",
-        metadata_json=run_dir / "camera_settings.json",
         manifest_json=run_dir / RUN_MANIFEST_FILENAME,
         status_json=run_dir / RUN_STATUS_FILENAME,
         bottle_setup_json=run_dir / BOTTLE_SETUP_FILENAME,
@@ -192,15 +191,6 @@ def run_artifacts(run_dir: Path, include_serial: bool = True) -> RunArtifacts:
         bottle_summary_json=run_dir / BOTTLE_SUMMARY_FILENAME,
         serial_csv=(run_dir / "serial.csv") if include_serial else None,
     )
-
-
-def metadata_path(run_dir: Path) -> Path:
-    return run_dir / "camera_settings.json"
-
-
-def write_metadata(run_dir: Path, payload: dict[str, Any]) -> Path:
-    path = metadata_path(run_dir)
-    return atomic_write_json(path, payload)
 
 
 def _optional_float(value: Any) -> float | None:

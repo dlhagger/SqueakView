@@ -57,6 +57,8 @@ class SerialHandle:
         self._thread = None
         self._stop = threading.Event()
         self._ttl_seen = threading.Event()
+        self._stop_ack_seen = threading.Event()
+        self._stop_ack_count: int | None = None
         self._csv_lock = threading.Lock()
         self._csv_writer: csv.writer | None = None
         self._csv_file = None
@@ -157,6 +159,8 @@ class SerialHandle:
             self._closed = False
             self._stop.clear()
             self._ttl_seen.clear()
+            self._stop_ack_seen.clear()
+            self._stop_ack_count = None
             self._thread = threading.Thread(target=self._pump, daemon=True)
             self._thread.start()
             if run_dir is not None:
@@ -195,6 +199,13 @@ class SerialHandle:
                         if s.startswith("CAMERA_"):
                             self._ttl_seen.set()
                         self._write_csv_line(s)
+                        if s == "ACK_STOP" or s.startswith("ACK_STOP,"):
+                            fields = s.split(",")
+                            try:
+                                self._stop_ack_count = int(float(fields[4]))
+                            except (IndexError, TypeError, ValueError):
+                                self._stop_ack_count = None
+                            self._stop_ack_seen.set()
                         self._maybe_send_alert(s)
                 except Exception as exc:
                     if self._stop.is_set():
@@ -249,6 +260,11 @@ class SerialHandle:
             self.emit(f"[{timestamp()}] [SER] cannot send, port not open")
             return
         try:
+            if text.strip().upper() == "STOP":
+                # Clear immediately before writing so a fast controller reply
+                # cannot race ahead of wait_for_stop_ack().
+                self._stop_ack_seen.clear()
+                self._stop_ack_count = None
             self.emit(f"[{timestamp()}] 【SER→】 {text}")
             self.ser.write((text + "\n").encode())
             self.ser.flush()
@@ -262,6 +278,22 @@ class SerialHandle:
             f"[{timestamp()}] [SER] {'TTL detected.' if hit else 'TTL not detected within timeout — continuing anyway.'}"
         )
         return hit
+
+    def wait_for_stop_ack(self, timeout_s: float = 2.0) -> bool:
+        """Wait until ACK_STOP has been persisted to the serial ledger."""
+        self.emit(f"[{timestamp()}] [SER] Waiting for ACK_STOP (timeout {timeout_s:.1f}s) …")
+        hit = self._stop_ack_seen.wait(timeout=timeout_s)
+        self.emit(
+            f"[{timestamp()}] [SER] "
+            f"{'ACK_STOP received.' if hit else 'ACK_STOP not received within timeout — draining anyway.'}"
+        )
+        return hit
+
+    @property
+    def stop_ack_count(self) -> int | None:
+        """Final controller TTL count carried by the latest ACK_STOP row."""
+
+        return self._stop_ack_count
 
     # ---- Alerts -------------------------------------------------------
     def _maybe_send_alert(self, line: str) -> None:

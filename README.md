@@ -272,19 +272,22 @@ The validated single-camera path is:
 
 ```text
 flirspinsrc → GRAY8 caps → tee
-  ├─ record queue (30 frames, non-leaky)
-  │    → videoconvert/I420 → x264enc → h264parse → mp4mux → raw.mp4
+  ├─ record queue (120 frames / 4 s minimum, non-leaky)
+  │    → x264enc (native GRAY8) → h264parse → mp4mux → raw.mp4
   └─ inference queue (32 frames, downstream-leaky)
-       → nvvideoconvert/NVMM-NV12 → nvstreammux
+       → VIC nvvideoconvert/NVMM-NV12 → nvstreammux
        → nvinfer/TensorRT → Python YOLO26 pose decode
-       → CUDA NvDCF → nvosdbin → nvstreamdemux
+       → CUDA NvDCF → [nvosdbin → nvstreamdemux when preview is enabled]
        → preview queue (1 frame, downstream-leaky) → nvunixfdsink
        → Qt nvunixfdsrc preview
 ```
 
-The record queue intentionally backpressures rather than discarding data. If
-CPU encoding cannot sustain acquisition, the run should fail or expose a source
-problem instead of silently producing a plausible but incomplete video.
+The FLIR transport is configured with at least 64 host buffers (two seconds at
+30 FPS), and the record queue intentionally backpressures rather than discarding
+data. Recording backlog is sampled in `diagnostics/recording.csv`; a sustained
+three-second backlog fails the run before the four-second queue can fill. If CPU
+encoding cannot sustain acquisition, the run therefore stops with explicit
+evidence instead of silently producing a plausible but incomplete video.
 
 We've made the choice to explode runs rather than silently fail to preseve 
 precise timing and data integrity. If your camera settings (expsoure, gain, etc.)
@@ -315,30 +318,30 @@ Important outputs include:
 
 ```text
 raw.mp4                         Authoritative compressed camera recording
-capture_cam0.jsonl              Durable pre-tee FLIR source audit
-record_admission.csv            Frames admitted to the non-leaky writer
 frames.csv                      Authoritative recorded-frame ledger
-recording_validation.json       MP4 decoded-frame/admission validation
-capture_reconciliation.json     Source-versus-recording reconciliation
-camera_runtime.json             Camera identity and clock calibration
-camera_telemetry.csv            Temperature and transport health samples
 serial.csv                      RP2040 events, TTLs, markers, and host clocks
-inference/frames.csv            Frames admitted to the inference path
-inference_admission.csv/.json   Captured/admitted/skipped inference audit
-detections.csv                  Detector observations and provenance
 objects.csv                     Detector/tracker object rows
 keypoints.csv                   Normalized pose keypoints
-tracks.csv                      Per-track summaries
-drop_events.csv                 Camera gaps, CRC, and metadata failures
 run_manifest.json               Configuration, model identity, and artifacts
-run_status.json                 Lifecycle history and analysis summary
-analysis/                       Aligned scientific tables and validation
+run_status.json                 Lifecycle, reconciliation, and validation
+alignment_summary.json          Compact frame/video/controller audit
+diagnostics/camera.csv          Temperature and transport health samples
+diagnostics/recording.csv       Recording queue and encoder telemetry
+diagnostics/errors.csv          Camera gaps, CRC, and metadata failures
+diagnostics/camera_runtime.json Camera identity and clock calibration
+diagnostics/post_run.log        Bounded finalizer log
+config/                         Run-local capture/inference configuration
 ```
 
 `frames.csv` is the source of truth for recorded frame identity. It contains
-only source buffers observed at `record_admission.csv`. A buffer acquired during
-shutdown but never admitted to recording remains visible in the source audit and
-is correctly excluded from the recorded-frame ledger.
+one row per recorded buffer and an `inference_admitted` field, so inference
+admission does not require a second frame ledger. `objects.csv` is the single
+object-observation table; track summaries are derived from it when analyzed.
+
+During capture and finalization, recovery ledgers (`capture_cam*.jsonl`,
+`record_admission*.csv`, and `inference/`) exist temporarily. They are removed
+only after video validation, reconciliation, and timing alignment pass. A failed
+finalization retains them for diagnosis.
 
 The FLIR chunk `FrameID` is stored as `camera_frame_id`. It increments for
 every acquired image. The aligner derives a per-run offset between that hardware
@@ -347,7 +350,8 @@ MP4 length, inference mapping, PTS, and camera/controller elapsed-clock agreemen
 
 On stop, SqueakView asks the controller to stop before draining DeepStream,
 keeps the serial reader open for final acknowledgements, validates `raw.mp4`,
-and builds `analysis/` transactionally.
+reconciles the ledgers with bounded memory, and writes one compact alignment
+summary. It does not create expanded copies of the canonical CSVs.
 
 ## Analyze a run
 

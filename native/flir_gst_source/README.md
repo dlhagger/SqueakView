@@ -33,7 +33,7 @@ With a camera connected:
 ```bash
 GST_PLUGIN_PATH=$PWD/native/flir_gst_source/build \
 gst-launch-1.0 -e \
-  flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 exposure-us=10000 trigger=false ! \
+  flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 exposure-us=10000 trigger=false stream-buffer-count=64 ! \
   video/x-raw,format=GRAY8,width=1440,height=1080,framerate=30/1 ! \
   queue ! fakesink sync=false
 ```
@@ -50,7 +50,7 @@ gst-launch-1.0 -e \
     fakesink sync=false \
   flirspinsrc num-buffers=5 camera-index=0 width=640 height=480 fps=30 pixel-format=Mono8 trigger=false exposure-us=10000 ! \
     video/x-raw,format=GRAY8,width=640,height=480,framerate=30/1 ! \
-    nvvideoconvert compute-hw=1 copy-hw=2 ! \
+    nvvideoconvert compute-hw=2 copy-hw=2 ! \
     'video/x-raw(memory:NVMM),format=NV12,width=640,height=480' ! \
     queue ! m.sink_0
 ```
@@ -60,7 +60,7 @@ The eventual SqueakView/DeepStream shape should be:
 ```text
 flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
   video/x-raw,format=GRAY8,width=1440,height=1080,framerate=30/1 !
-  nvvideoconvert compute-hw=1 copy-hw=2 !
+  nvvideoconvert compute-hw=2 copy-hw=2 !
   video/x-raw(memory:NVMM),format=NV12,width=1440,height=1080 !
   m.sink_0
 ```
@@ -71,7 +71,8 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
 - Uses Spinnaker C++ `GetNextImage()`.
 - Supports stable camera serial selection in addition to camera index, width,
   height, fps, pixel format, trigger,
-  trigger activation, exposure, gain, timeout, and stream buffer handling.
+  trigger activation, exposure, gain, timeout, stream buffer handling, and an
+  explicit manual Spinnaker host transport buffer count.
 - Defaults to `buffer-handling=OldestFirst` and `drop-incomplete=false` so
   scientific acquisition fails/logs instead of silently skipping frames.
 - Defaults to `metadata-profile=scientific`, enabling supported FLIR chunks for
@@ -97,7 +98,7 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
   monotonic and Unix clocks, preserving the raw device tick value and its
   reported nanoseconds-per-tick increment.
 - Samples camera temperature and transport-layer health counters about once
-  per second; SqueakView writes these samples to `camera_telemetry.csv` using
+  per second; SqueakView writes these samples to `diagnostics/camera.csv` using
   the frame's acquisition-side host Unix and monotonic clocks. Missing source
   clocks remain empty rather than being replaced with CSV-write time.
 - Uses Spinnaker's typed timeout error and supports a bounded consecutive
@@ -119,11 +120,10 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
 - Width, height, exposure, and gain requests are strict: unsupported values
   fail camera startup with the camera's supported range instead of being
   silently clamped.
-- `record_admission.csv` is written by a `BufferOperator` attached at the
-  non-leaky recording queue and records the buffers admitted to that branch.
-- `frames.csv` is finalized by matching those admissions to the source-side
-  metadata ledger. The separate
-  `inference/frames.csv` describes frames admitted through the downstream-leaky
-  live inference branch.
-- `drop_events.csv` records camera-ID gaps, source-to-mux gaps, CRC failures,
+- `record_admission.csv` is a temporary recovery ledger written at the
+  non-leaky recording queue. It is removed after successful finalization.
+- `frames.csv` is finalized by matching recording admissions to the source-side
+  metadata ledger. Its `inference_admitted` column records whether each frame
+  also entered the downstream-leaky inference branch.
+- `diagnostics/errors.csv` records camera-ID gaps, source-to-mux gaps, CRC failures,
   and missing/invalid metadata; a header-only file means none were observed.
