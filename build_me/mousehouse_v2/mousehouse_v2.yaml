@@ -1,0 +1,49 @@
+path: /home/dlh/Documents/DLH/MouseHouse_Model/datasets/pose
+train: images/train
+val: images/val
+names:
+- mouse
+- landmarks
+kpt_shape:
+- 19
+- 3
+kp_names:
+- nose
+- head
+- left_ear
+- right_ear
+- back
+- tail_base
+- poke_left
+- well
+- poke_right
+- sipper_left
+- sipper_right
+- top_left_corner
+- top_right_corner
+- bottom_left_corner
+- bottom_right_corner
+- upper_back
+- lower_back
+- left_haunch
+- right_haunch
+flip_idx:
+- 0
+- 1
+- 3
+- 2
+- 4
+- 5
+- 8
+- 7
+- 6
+- 10
+- 9
+- 12
+- 11
+- 14
+- 13
+- 15
+- 16
+- 18
+- 17
