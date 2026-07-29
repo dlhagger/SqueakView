@@ -63,6 +63,63 @@ class FakeSerialHandle:
         self.closed = True
 
 
+class ManifestPersistenceTests(unittest.TestCase):
+    def test_post_run_bottle_save_preserves_immutable_manifest_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / "run"
+            run_dir.mkdir()
+            original = {
+                "schema_version": "2.0",
+                "run_id": "run",
+                "created_at": "2026-07-28T17:41:50",
+                "updated_at": "2026-07-29T09:37:57",
+                "git": {"commit": "original", "dirty": False},
+                "storage": {"free_bytes": 123},
+                "capture": {"fps": 30, "width": 1440, "height": 1080},
+                "inference": {
+                    "enabled": True,
+                    "model_package": {"name": "humans", "config": "original-config"},
+                },
+                "bottles": {"complete": False},
+                "actual_outputs": {"has_analysis": True},
+            }
+            run_context.write_manifest(run_dir, original)
+            run_context.atomic_write_json(
+                run_dir / run_context.RUN_STATUS_FILENAME,
+                {"state": "finalized"},
+            )
+            backend = manager.OperatorBackend(lambda _message: None)
+            backend.state.run_dir = run_dir
+
+            summary = backend.save_bottle_measurements(
+                {
+                    "left": {
+                        "fluid": "water",
+                        "initial_weight_g": 10,
+                        "final_weight_g": 9,
+                    },
+                    "right": {
+                        "fluid": "water",
+                        "initial_weight_g": 12,
+                        "final_weight_g": 11,
+                    },
+                },
+                run_dir=run_dir,
+            )
+
+            manifest = run_context.read_json(
+                run_dir / run_context.RUN_MANIFEST_FILENAME
+            )
+            self.assertTrue(summary["complete"])
+            self.assertEqual(manifest["created_at"], original["created_at"])
+            self.assertEqual(manifest["git"], original["git"])
+            self.assertEqual(manifest["storage"], original["storage"])
+            self.assertEqual(manifest["capture"], original["capture"])
+            self.assertEqual(manifest["inference"], original["inference"])
+            self.assertTrue(manifest["bottles"]["complete"])
+            self.assertTrue(manifest["actual_outputs"]["bottle_measurements_complete"])
+
+
 class BackendLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()

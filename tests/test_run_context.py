@@ -86,6 +86,23 @@ class RunContextTests(unittest.TestCase):
         self.assertIsNone(summary["sides"]["right"]["initial_weight_g"])
         self.assertFalse(summary["complete"])
         self.assertIn("right.initial_weight_g", summary["missing_fields"])
+        self.assertEqual(summary["warnings"], [])
+
+    def test_bottle_summary_warns_when_final_weight_exceeds_initial(self) -> None:
+        summary = run_context.build_bottle_summary(
+            {
+                "left": {"fluid": "water", "initial_weight_g": 10, "final_weight_g": 11},
+                "right": {"fluid": "water", "initial_weight_g": 12, "final_weight_g": 11},
+            },
+            updated_at="now",
+        )
+
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["sides"]["left"]["intake_g"], -1)
+        self.assertEqual(
+            summary["warnings"],
+            ["left final weight exceeds initial weight; calculated intake is negative"],
+        )
 
     def test_unchanged_bottle_rows_preserve_entry_timestamps(self) -> None:
         run_dir = self.root / "run"

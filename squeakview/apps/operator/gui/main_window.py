@@ -996,8 +996,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         state = "complete" if summary.get("complete") else "saved; missing one or more weights"
-        self._set_bottle_status(f"Bottle info {state}.")
         self._set_bottle_completion_pending(not bool(summary.get("complete")))
+        warnings = [str(item) for item in summary.get("warnings", []) if str(item)]
+        if warnings:
+            message = "Bottle info saved with a plausibility warning:\n\n" + "\n".join(warnings)
+            self._set_bottle_status("Bottle info saved; check the weight warning.")
+            QtWidgets.QMessageBox.warning(self, "Bottle Weight", message)
+        else:
+            self._set_bottle_status(f"Bottle info {state}.")
 
     def _reload_profiles(self) -> None:
         self._experiments = self._profile_store.list_experiments()

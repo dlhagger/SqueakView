@@ -2100,15 +2100,15 @@ wheels = [
 
 [[package]]
 name = "ultralytics-thop"
-version = "2.1.1"
+version = "2.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d1/bd/c49ab753255d89a375723390ced8e46e01d3c41b863557b8ea2bbc9d497c/ultralytics_thop-2.1.1.tar.gz", hash = "sha256:ae54d59adda9ebedf2202daa85bb5424b4b0ad4836647f83ae36d569e51d9567", size = 31624, upload-time = "2026-07-28T15:01:04.362Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7c/a9/afec62e7a4a0fbda1d2f4f1e5af81b035501ae4da2f289e7cdb6c47c2f02/ultralytics_thop-2.1.2.tar.gz", hash = "sha256:c8b6f6585bf2ec0b2532234a9c705dda03a870a3471e2303f0fee206be37754e", size = 32998, upload-time = "2026-07-28T18:27:03.179Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/be/f7/8ef373ddc7821862c669d4897670fec0897c5df55eda72841e2ce9ef6c91/ultralytics_thop-2.1.1-py3-none-any.whl", hash = "sha256:bcc7cc361aea32bfb629fa46f1a4909605625999b7a77c43d2c8745d0216e4a6", size = 25855, upload-time = "2026-07-28T15:01:03.016Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/19/e22f1ba5edad9ad8c3d0933b70a91444caeccb41b3f6e4741538faa28bb0/ultralytics_thop-2.1.2-py3-none-any.whl", hash = "sha256:d74f650a1ce19b69228a0a92c739f000ebe67228f2aac32fd070c664ae7b7b06", size = 27065, upload-time = "2026-07-28T18:27:01.841Z" },
 ]
 
 [[package]]

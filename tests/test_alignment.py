@@ -166,6 +166,7 @@ class AlignmentIntegrationTests(unittest.TestCase):
         self.assertEqual(summary["frame_alignment"]["clock_elapsed_error_us_max_abs"], 0.0)
         self.assertTrue(summary["frame_alignment"]["clock_within_tolerance"])
         self.assertEqual(summary["frame_alignment"]["clock_tolerance_us"], 16_666.5)
+        self.assertTrue(summary["start_marker_seen"])
         self.assertEqual(summary["counts"]["object_observations"], 1)
         self.assertEqual(summary["validation"]["video_total_nb_frames"], 3)
         self.assertTrue(summary["validation"]["video_frame_count_matches_frames_csv"])
@@ -174,7 +175,7 @@ class AlignmentIntegrationTests(unittest.TestCase):
         self.assertEqual(summary["validation"]["object_pts_mismatch_count"], 0)
         self.assertEqual(summary["validation"]["object_mapping_method_counts"], {"flir_user_meta": 1})
         self.assertEqual(summary["validation"]["video_mapping_source_counts"], {"single_file_frames_csv": 3})
-        self.assertEqual(summary["outputs"], {})
+        self.assertNotIn("outputs", summary)
         self.assertFalse((self.out_dir / "aligned_frames.csv").exists())
         self.assertFalse((self.out_dir / "aligned_detections.csv").exists())
         self.assertEqual(
@@ -266,6 +267,25 @@ class AlignmentFailureTests(unittest.TestCase):
                 summary["frame_alignment"]["source_sequence_mismatch_count"], 0
             )
             self.assertFalse(summary["frame_alignment"]["validated"])
+
+            cli_result = subprocess.run(
+                [
+                    "python3",
+                    str(
+                        Path(__file__).resolve().parents[1]
+                        / "scripts"
+                        / "align_run_outputs.py"
+                    ),
+                    str(run_dir),
+                    "--out-dir",
+                    str(run_dir / "cli_analysis"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(cli_result.returncode, 1, cli_result.stderr)
 
     def test_missing_camera_high_rows_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

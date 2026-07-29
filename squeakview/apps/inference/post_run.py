@@ -449,7 +449,6 @@ def align_run(run_dir: Path) -> dict:
         run_context.write_status(run_dir, "analyzing", stage="streaming_alignment")
         _update_progress(run_dir, stage="alignment", overall_validation_passed=None)
         summary = build_alignment(run_dir, temp_dir)
-        summary["outputs"] = {}
         run_context.atomic_write_json(run_dir / "alignment_summary.json", summary)
         counts = summary.get("counts", {})
         validation = summary.get("validation", {})

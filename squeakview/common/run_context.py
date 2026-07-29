@@ -234,6 +234,7 @@ def build_bottle_summary(bottles: dict[str, Any] | None, *, updated_at: str | No
     sides: dict[str, dict[str, Any]] = {}
     complete = True
     missing_fields: list[str] = []
+    warnings: list[str] = []
     for side, info in normalized.items():
         fluid = str(info["fluid"]).strip()
         initial = info["initial_weight_g"]
@@ -249,6 +250,10 @@ def build_bottle_summary(bottles: dict[str, Any] | None, *, updated_at: str | No
         missing_fields.extend(f"{side}.{field}" for field in side_missing)
         side_complete = not side_missing
         complete = complete and side_complete
+        if intake is not None and intake < 0:
+            warnings.append(
+                f"{side} final weight exceeds initial weight; calculated intake is negative"
+            )
         sides[side] = {
             "fluid": fluid,
             "initial_weight_g": initial,
@@ -262,6 +267,7 @@ def build_bottle_summary(bottles: dict[str, Any] | None, *, updated_at: str | No
         "updated_at": updated_at or _now_iso(),
         "complete": complete,
         "missing_fields": missing_fields,
+        "warnings": warnings,
         "measurements": BOTTLE_MEASUREMENTS_FILENAME,
         "sides": sides,
     }

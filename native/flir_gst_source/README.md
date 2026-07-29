@@ -1,10 +1,9 @@
 # FLIR Spinnaker GStreamer Source
 
-Experimental GStreamer source element for FLIR/Teledyne cameras through the
+Validated GStreamer source element for FLIR/Teledyne cameras through the
 Spinnaker C++ SDK.
 
-The first target is a source element that matches SqueakView's current FLIR
-contract:
+The element implements SqueakView's current FLIR contract:
 
 ```text
 flirspinsrc ! video/x-raw,format=GRAY8,width=1440,height=1080,framerate=30/1
@@ -55,7 +54,7 @@ gst-launch-1.0 -e \
     queue ! m.sink_0
 ```
 
-The eventual SqueakView/DeepStream shape should be:
+The production SqueakView/DeepStream shape is:
 
 ```text
 flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
@@ -87,10 +86,11 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
   first frame, with explicit host-monotonic fallback provenance.
 - Attaches `SQUEAKVIEW.FLIR.FRAME_META.v1` before `nvstreammux`. DeepStream
   transforms it to frame-level `NvDsUserMeta` for inference admission auditing.
-- Writes the same payload to `capture-log-path` as line-delimited JSON
-  before returning each source buffer. This is the durable pre-tee source audit;
-  SqueakView reconciles it with the recording-branch admission ledger to build
-  the authoritative `frames.csv`, even when inference drops.
+- Writes the same payload to `capture-log-path` as line-delimited JSON before
+  returning each source buffer. This temporary recovery ledger is the durable
+  pre-tee audit during capture. SqueakView reconciles it with recording-branch
+  admissions to build authoritative `frames.csv`, then removes it only after
+  successful validation; failed finalization retains it for diagnosis.
 - Captures immediate host receipt clocks, source image layout, actual exposure
   and gain, payload sizes, image status, CRC validation, frame gaps, and source
   health counters.
@@ -127,3 +127,7 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
   also entered the downstream-leaky inference branch.
 - `diagnostics/errors.csv` records camera-ID gaps, source-to-mux gaps, CRC failures,
   and missing/invalid metadata; a header-only file means none were observed.
+
+The direct source and recording path completed a validated 16-hour,
+1,707,205-frame single-camera run at 1440×1080 and 30 FPS with no source gaps,
+transport loss, recording drops, or buffer evictions.

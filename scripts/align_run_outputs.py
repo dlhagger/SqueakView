@@ -74,6 +74,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def validation_passed(summary: dict[str, Any]) -> bool:
+    """Return whether every standalone alignment check passed."""
+    validation = summary.get("validation", {})
+    return (
+        summary.get("frame_alignment", {}).get("validated") is True
+        and validation.get("video_frame_count_matches_frames_csv") is True
+        and all(
+            int(validation.get(field) or 0) == 0
+            for field in (
+                "objects_missing_frame_count",
+                "object_mapping_failed_rows",
+                "object_ts_mismatch_count",
+                "object_pts_mismatch_count",
+            )
+        )
+    )
+
+
 def main() -> int:
     args = parse_args()
     run_dir = args.run_dir or _latest_run_dir()
@@ -90,7 +108,7 @@ def main() -> int:
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
-    return 0
+    return 0 if validation_passed(summary) else 1
 
 
 if __name__ == "__main__":

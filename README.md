@@ -19,11 +19,26 @@ SqueakView treats the compressed camera recording as scientific ground truth:
 - GUI preview is leaky because it is only an operator spot check.
 - Every recorded frame is reconciled against a durable source audit and the
   recording admission ledger.
-- Missed live inference can be recovered later by replaying `raw.mp4` offline.
+- Missed live inference can be recovered later on downstream compute by
+  replaying `raw.mp4`.
 
 `raw.mp4` is H.264-compressed with CPU `x264enc`. It is authoritative, but not
 an uncompressed sensor dump. CPU encoding is intentional because the Orin Nano
 does not provide the hardware encoder used by larger Jetson modules.
+
+## Acquisition and analysis boundary
+
+The Jetson is the acquisition appliance. It records the run and performs only
+the bounded post-run reconciliation and timing audit required to declare the
+capture valid. Exploratory notebooks, production-scale analysis, video
+transcoding, and offline re-inference belong on the DGX Spark.
+
+The current transfer procedure is a manual copy of the complete finalized run
+directory. Keep the Jetson original until the DGX copy has been inspected and
+validated. See [data_viz/README.md](data_viz/README.md) for the run contract,
+manual transfer checklist, DGX directory layout, alignment commands, and
+downstream data-handling rules. Resumable `rsync` transfer is flagged for a
+future release and is not part of the initial workflow.
 
 ## Repository layout
 
@@ -38,6 +53,7 @@ squeakview/apps/operator/         Qt operator GUI and run lifecycle
 squeakview/common/                Run, profile, serial, and dashboard utilities
 scripts/preflight.sh              Device/model readiness checks
 scripts/align_run_outputs.py      Camera, video, inference, and TTL alignment
+data_viz/README.md                Jetson-to-DGX transfer and analysis workflow
 data_viz/analysis_demo_viz.ipynb Scientific run analysis and visualization
 tests/                            Pure-Python and on-device pipeline tests
 ```
@@ -46,8 +62,9 @@ Device-local state is written under `models/`, `profiles/`, and `runs/`. Those
 directories are ignored by Git. `build_me/` is intentionally tracked and its
 source YAML files are treated as read-only ground truth by the builder.
 
-To build and deploy custom models, place .pt and corresponding .yamls in build_me
-and then run the build_engine.ipynb notebook to generate device specific deployments
+To build and deploy a custom model, place its `.pt` checkpoint and corresponding
+dataset YAML under `build_me/`, then run `build_engine/build_engine.ipynb` to
+generate a device-specific package.
 
 ## Platform prerequisites
 
@@ -56,7 +73,8 @@ Install these before setting up the repository:
 - JetPack 7.2 with CUDA/TensorRT
 - NVIDIA DeepStream 9.1 at `/opt/nvidia/deepstream/deepstream`
 - FLIR/Teledyne Spinnaker SDK at `/opt/spinnaker`
-- Spinnaker for JetPack 7.2 is in beta - https://teledyne.app.box.com/s/ccj73r4xu8rusbnu12pytcisbexdchfa
+- [Spinnaker for JetPack 7.2](https://teledyne.app.box.com/s/ccj73r4xu8rusbnu12pytcisbexdchfa)
+  is currently distributed as a beta build by Teledyne.
 - GStreamer runtime and development headers
 - Jetson Orin Nano specific install of ffmpeg (sudo apt install ffmpeg)
 - CMake, a C++ compiler, and `uv`
@@ -85,9 +103,11 @@ export SQUEAKVIEW_DEEPSTREAM_SDK=/opt/nvidia/deepstream/deepstream
 
 ## Python environment
 
-SqueakView targets Python 3.12 on Linux AArch64:
+SqueakView targets Python 3.12 on Linux AArch64. Create the project environment
+with access to the JetPack/DeepStream system packages:
 
 ```bash
+uv venv --python 3.12 --system-site-packages
 uv sync
 source .venv/bin/activate
 ```
@@ -262,9 +282,15 @@ to the controller only after that readiness signal. The default readiness
 timeout is 30 seconds and can be changed with
 `SQUEAKVIEW_INFERENCE_READY_TIMEOUT`.
 
-The 30 second timeout is to prewarm the inference hot path, you can decrease this
-at your own risk, but early frame inference outputs may return blank until the 
-model warms up and reaches at steady state of inferring poses.
+The timeout is a maximum wait for pipeline readiness, not a fixed warm-up delay.
+Reducing it may reject a healthy pipeline that needs longer to load the engine
+and enter `PLAYING`.
+
+The run header and bottom status bar remain concise during normal operation.
+Open **Events** for the full runtime and serial log. The capture-health panel
+shows recording backlog, camera transport health, frame/drop counters, and the
+current stop/finalization stage. Run identity and elapsed state remain visible
+while the independent post-run finalizer is working.
 
 ## Live DeepStream pipeline
 
@@ -289,18 +315,19 @@ three-second backlog fails the run before the four-second queue can fill. If CPU
 encoding cannot sustain acquisition, the run therefore stops with explicit
 evidence instead of silently producing a plausible but incomplete video.
 
-We've made the choice to explode runs rather than silently fail to preseve 
-precise timing and data integrity. If your camera settings (expsoure, gain, etc.)
-are correct, there should be minimal worries about faults in the camera hot path.
-We've achieved multi-day runs without issue.
+SqueakView fails a run explicitly when it cannot preserve timing and data
+integrity. It does not silently continue with an incomplete but plausible video.
+The current production candidate has completed a validated 16-hour,
+1,707,205-frame run at 1440×1080 and 30 FPS with zero recording drops, frame
+gaps, inference skips, or TTL mismatches.
 
 The GUI/runtime can construct multiple camera branches, producing `raw.mp4` for
 camera zero and `raw_camN.mp4` for additional cameras. Multi-camera inference
 also requires a batch-N model package and has not received the same scientific
 validation as the single-camera path. 
 
-We will release future GUI updates to make this easily user configurable in the future
-but currently use this at your own risk.
+Multi-camera operation remains an advanced configuration and should not be used
+for production acquisition until it receives equivalent long-run validation.
 
 SqueakView uses the CUDA NvDCF tracker in `configs/tracker_mouse_nvdcf.yml`.
 Jetson Orin Nano has no PVA hardware, so a PVA/VPI tracker profile is not an
@@ -337,6 +364,9 @@ config/                         Run-local capture/inference configuration
 one row per recorded buffer and an `inference_admitted` field, so inference
 admission does not require a second frame ledger. `objects.csv` is the single
 object-observation table; track summaries are derived from it when analyzed.
+Once a run reaches a terminal state, its acquisition, model, Git, and storage
+provenance in `run_manifest.json` is immutable. Later bottle entry updates only
+the bottle summary, artifact inventory, and manifest update timestamp.
 
 During capture and finalization, recovery ledgers (`capture_cam*.jsonl`,
 `record_admission*.csv`, and `inference/`) exist temporarily. They are removed
@@ -353,44 +383,59 @@ keeps the serial reader open for final acknowledgements, validates `raw.mp4`,
 reconciles the ledgers with bounded memory, and writes one compact alignment
 summary. It does not create expanded copies of the canonical CSVs.
 
-## Analyze a run
+Finalization time scales with ledger length. The validated 16-hour run required
+about 7.5 minutes to reconcile 1.7 million frames and 3.4 million serial rows.
+During this period the run is safely stopped and the GUI reports the active
+finalization stage; do not close the application or move the run directory.
+Bottle intake is calculated as initial minus final weight. A final weight above
+the initial weight is saved but shown as a plausibility warning.
 
-Launch the visualization notebook:
+To rerun the compact validator manually:
 
 ```bash
-uv run jupyter lab data_viz/analysis_demo_viz.ipynb
+uv run python scripts/align_run_outputs.py /path/to/run
 ```
 
-By default it reads `runs/.latest_run`. Set `RUN_DIR` in the first code cell for
-an explicit run. Set `INFERENCE_RESULT` to `"live"`, `"latest_offline"`, or an
-offline result path.
+The command writes `alignment_summary.json` and exits nonzero when frame,
+video, controller, or object mapping validation fails.
+
+## Analyze a run
+
+Copy the complete finalized run directory to the DGX Spark before beginning
+downstream analysis. The source copy should remain unmodified; figures, tables,
+new alignment results, and future re-inference outputs belong in a separate
+analysis-results directory.
+
+The visualization notebook is a short-run example of the current tables and
+their timing relationships, not the production engine for a full-length run.
+Launch it on the DGX from an analysis environment:
+
+```bash
+jupyter lab data_viz/analysis_demo_viz.ipynb
+```
+
+Set `RUN_DIR` in the first code cell to an explicit copied run. Leave
+`INFERENCE_RESULT = "live"` to inspect the acquisition-time objects and
+keypoints.
 
 The notebook reports acquisition and inference health, TTL/PTS timing,
 behavioral events, mapping provenance, NvDCF tracks, keypoint confidence, event-
 locked object data, and an optional exact-frame `raw.mp4` preview with boxes and
 keypoint dots.
 
-## Offline re-inference
+The current notebook loads canonical CSVs into memory and is intended for short
+or sampled demo runs. Do not run it on the acquisition Jetson or point it at a
+complete 16-hour run. See [data_viz/README.md](data_viz/README.md) for the full
+workflow and source-data rules.
 
-Replay the immutable recording through the current TensorRT decoder and tracker:
+## Offline re-inference (downstream only)
 
-```bash
-uv run python -m squeakview.apps.inference.offline /path/to/run
-```
-
-The command defaults to the model recorded in `run_manifest.json`. To evaluate a
-different package:
-
-```bash
-uv run python -m squeakview.apps.inference.offline /path/to/run \
-  --cfg models/<model_name>/configs/<model_name>.txt
-```
-
-Offline replay first requires the decoded `raw.mp4` frame count to match
-`frames.csv`. It maps decoded ordinal back to the authoritative ledger and
-writes a new timestamped directory under `offline_inference/`; live data and
-`raw.mp4` are never overwritten. Offline replay currently supports a
-single-camera run.
+Do not run offline re-inference on the acquisition Jetson. The existing module
+is a development path for short compatible runs, not the production DGX
+workflow. Production downstream replay will require a DGX-specific TensorRT
+engine, long-run ledger handling, and a derived-results destination that never
+overwrites `raw.mp4`, `objects.csv`, or `keypoints.csv`. Those requirements are
+recorded in [data_viz/README.md](data_viz/README.md).
 
 ## Diagnostics
 

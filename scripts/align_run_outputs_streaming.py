@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import csv
-import heapq
 import json
 import shutil
 import sqlite3
@@ -10,58 +9,6 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Iterator
-
-
-FRAME_FIELDS = [
-    "camera_frame_id", "raw_frame_index", "ttl_count", "frame_rp2040_us",
-    "frame_time_s", "controller_unix_us", "camera_timestamp_ns", "frame_pts_ns",
-    "frame_pts_s", "duration_ns", "frame_host_unix_ns", "frame_host_monotonic_ns",
-    "ttl_host_unix_ns", "ttl_host_monotonic_ns", "raw_video_file",
-    "video_frame_index", "video_mapping_source", "status", "has_ttl",
-    "has_detection", "detection_count",
-]
-EVENT_FIELDS = [
-    "serial_index", "eventType", "event_name", "rp2040_time_us", "event_time_s",
-    "controller_unix_us", "side", "count", "duration", "latency", "value",
-    "context", "reason", "previous_ttl_count", "previous_frame_id",
-    "previous_frame_rp2040_us", "offset_from_previous_frame_ms",
-    "nearest_ttl_count", "nearest_frame_id", "nearest_frame_rp2040_us",
-    "offset_from_nearest_frame_ms", "alignment_method", "hostUnixNs",
-    "hostMonotonicNs", "rawLine",
-]
-DETECTION_FIELDS = [
-    "detection_index", "raw_frame_index", "camera_frame_id", "ttl_count",
-    "detection_rp2040_us", "detection_time_s", "frame_pts_ns", "frame_pts_s",
-    "raw_video_file", "video_frame_index", "video_mapping_source",
-    "raw_frame_mapping_method", "raw_frame_mapping_ok", "raw_frame_mapping_pts_ns",
-    "raw_frame_mapping_delta", "source", "class_label", "conf", "x", "y", "w",
-    "h", "original_frame", "original_ts_us", "pose_schema", "kpt_count",
-    "kpt_names_json", "kpt_values_json",
-]
-TIMELINE_FIELDS = [
-    "record_type", "time_rp2040_us", "time_s", "time_source", "camera_frame_id",
-    "raw_frame_index", "ttl_count", "event_type", "event_name", "detection_index",
-    "conf", "x", "y", "w", "h", "context", "reason", "raw_line",
-]
-ALL_FIELDS = [
-    "record_type", "time_rp2040_us", "time_s", "time_source", "event_type",
-    "event_name", "raw_event_rp2040_us", "raw_event_time_s", "trigger_event_type",
-    "frame_trigger_rp2040_us", "frame_trigger_time_s", "offset_from_frame_trigger_ms",
-    "camera_frame_id", "raw_frame_index", "ttl_count", "source", "frame_pts_ns",
-    "frame_pts_s", "duration_ns", "raw_video_file", "video_frame_index",
-    "video_mapping_source", "frame_status", "has_detection", "detection_count",
-    "frame_host_unix_ns", "frame_host_monotonic_ns", "ttl_host_unix_ns",
-    "ttl_host_monotonic_ns", "serial_index", "controller_unix_us", "side",
-    "event_count", "event_duration", "event_latency", "event_value", "event_context",
-    "event_reason", "previous_ttl_count", "previous_frame_id",
-    "previous_frame_rp2040_us", "offset_from_previous_frame_ms", "nearest_ttl_count",
-    "nearest_frame_id", "nearest_frame_rp2040_us", "offset_from_nearest_frame_ms",
-    "alignment_method", "serial_host_unix_ns", "serial_host_monotonic_ns", "raw_line",
-    "detection_index", "raw_frame_mapping_method", "raw_frame_mapping_ok",
-    "raw_frame_mapping_pts_ns", "raw_frame_mapping_delta", "class_label", "conf", "x",
-    "y", "w", "h", "original_frame", "original_ts_us", "pose_schema", "kpt_count",
-    "kpt_names_json", "kpt_values_json",
-]
 
 
 def _to_int(value: Any) -> int | None:
@@ -89,13 +36,6 @@ def _marker(row: dict[str, str]) -> str:
 def _reader(path: Path) -> Iterator[dict[str, str]]:
     with path.open(newline="") as handle:
         yield from csv.DictReader(handle)
-
-
-def _writer(path: Path, fields: list[str]):
-    handle = path.open("w", newline="")
-    writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-    writer.writeheader()
-    return handle, writer
 
 
 def _ffprobe(path: Path) -> dict[str, Any]:
@@ -234,11 +174,8 @@ def _first_frame(path: Path) -> dict[str, str]:
 
 
 def _write_frames(
-    db: sqlite3.Connection, frames_path: Path, output: Path | None, epoch: dict[str, Any],
+    db: sqlite3.Connection, frames_path: Path, epoch: dict[str, Any],
 ) -> dict[str, Any]:
-    handle = writer = None
-    if output is not None:
-        handle, writer = _writer(output, FRAME_FIELDS)
     count = missing_ttl = mismatch_count = clock_pairs = gap_count = 0
     missing_camera_frames = 0
     mismatch_sample: list[dict[str, int]] = []
@@ -286,8 +223,6 @@ def _write_frames(
                 "has_ttl": "1" if high else "0", "has_detection": "1" if detections else "0",
                 "detection_count": detections,
             }
-            if writer is not None:
-                writer.writerow(out)
             if raw_index is not None:
                 insert_batch.append((raw_index, camera_id, ttl, _fmt(rp), out["frame_time_s"],
                                      out["frame_pts_ns"], out["frame_pts_s"], "raw.mp4", str(count),
@@ -334,8 +269,7 @@ def _write_frames(
             with db:
                 db.executemany("INSERT OR REPLACE INTO frame_lookup VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", insert_batch)
     finally:
-        if handle is not None:
-            handle.close()
+        pass
     clock_slope = clock_intercept = clock_residual_max = None
     denominator = clock_pairs * sum_xx - sum_x * sum_x
     if clock_pairs and denominator:
@@ -367,80 +301,13 @@ def _write_frames(
             "first_camera_id": first_camera, "last_camera_id": previous_camera_id}
 
 
-def _high_for_event(db: sqlite3.Connection, rp: int | None, previous_count: int | None):
-    if rp is None:
-        if previous_count is None:
-            return None, None
-        previous = db.execute("SELECT count,rp FROM highs WHERE count=?", (previous_count,)).fetchone()
-        return previous, previous
-    previous = db.execute(
-        "SELECT count,rp FROM highs WHERE rp<=? ORDER BY rp DESC LIMIT 1", (rp,)
-    ).fetchone()
-    before = db.execute(
-        "SELECT count,rp FROM highs WHERE rp>=? ORDER BY rp ASC LIMIT 1", (rp,)
-    ).fetchone()
-    candidates = [item for item in (previous, before) if item]
-    nearest = min(candidates, key=lambda item: abs(int(item[1]) - rp)) if candidates else None
-    return previous, nearest
-
-
-def _write_events(db: sqlite3.Connection, serial_path: Path, output: Path, epoch: dict[str, Any]) -> int:
-    handle, writer = _writer(output, EVENT_FIELDS)
-    previous_count: int | None = None
-    count_rows = 0
-    try:
-        for serial_index, row in enumerate(_reader(serial_path)):
-            event = (row.get("eventType") or "").strip()
-            rp = _to_int(row.get("rp2040Time"))
-            count = _to_int(row.get("count"))
-            if event == "CAMERA_HIGH" and count is not None:
-                previous_count = count
-            previous, nearest = _high_for_event(db, rp, previous_count)
-            prev_count = int(previous[0]) if previous else previous_count
-            prev_rp = int(previous[1]) if previous else None
-            nearest_count = int(nearest[0]) if nearest else None
-            nearest_rp = int(nearest[1]) if nearest else None
-            offset = int(epoch["camera_frame_id_offset"])
-            method = ("camera_high_exact" if event == "CAMERA_HIGH" and count is not None
-                      else "rp2040_previous_camera_high" if rp is not None
-                      else "serial_order_previous_camera_high")
-            writer.writerow({
-                "serial_index": serial_index, "eventType": event,
-                "event_name": _marker(row) if event == "MARKER" else event,
-                "rp2040_time_us": _fmt(rp),
-                "event_time_s": _float((rp - epoch["first_rp2040_time_us"]) / 1_000_000.0 if rp is not None else None),
-                "controller_unix_us": _fmt(_to_int(row.get("unixTime"))), "side": row.get("side", ""),
-                "count": _fmt(count), "duration": row.get("duration", ""), "latency": row.get("latency", ""),
-                "value": row.get("value", ""), "context": row.get("context", ""), "reason": row.get("reason", ""),
-                "previous_ttl_count": _fmt(prev_count),
-                "previous_frame_id": _fmt(prev_count + offset if prev_count is not None else None),
-                "previous_frame_rp2040_us": _fmt(prev_rp),
-                "offset_from_previous_frame_ms": _float((rp - prev_rp) / 1000.0 if rp is not None and prev_rp is not None else None, 6),
-                "nearest_ttl_count": _fmt(nearest_count),
-                "nearest_frame_id": _fmt(nearest_count + offset if nearest_count is not None else None),
-                "nearest_frame_rp2040_us": _fmt(nearest_rp),
-                "offset_from_nearest_frame_ms": _float((rp - nearest_rp) / 1000.0 if rp is not None and nearest_rp is not None else None, 6),
-                "alignment_method": method, "hostUnixNs": row.get("hostUnixNs", ""),
-                "hostMonotonicNs": row.get("hostMonotonicNs", ""), "rawLine": row.get("rawLine", ""),
-            })
-            count_rows += 1
-    finally:
-        handle.close()
-    return count_rows
-
-
 def _write_detections(
-    db: sqlite3.Connection, path: Path, output: Path | None,
+    db: sqlite3.Connection, path: Path,
 ) -> dict[str, Any]:
-    handle = writer = None
-    if output is not None:
-        handle, writer = _writer(output, DETECTION_FIELDS)
     stats = {"count": 0, "missing": 0, "ts_mismatch": 0, "pts_mismatch": 0,
-             "failed": 0, "fallback": 0, "legacy": 0, "methods": {}}
+             "failed": 0, "fallback": 0, "methods": {}}
     samples = {"missing": [], "ts": [], "pts": []}
     if not path.exists():
-        if handle is not None:
-            handle.close()
         stats["samples"] = samples
         return stats
     cached_key: int | None = None
@@ -458,7 +325,6 @@ def _write_detections(
             method = "flir_user_meta" if raw is not None else "unmapped"
             stats["methods"][method] = stats["methods"].get(method, 0) + 1
             stats["fallback"] += int(method.startswith("fallback"))
-            stats["legacy"] += int(method == "legacy_no_provenance")
             mapping_ok = "1" if raw is not None else "0"
             stats["failed"] += int(mapping_ok != "1")
             if frame is None:
@@ -481,108 +347,11 @@ def _write_detections(
                     samples["pts"].append({"detection_index": det_index, "raw_frame_num": raw,
                                            "mapping_pts_ns": mapping_pts, "frame_pts_ns": frame_pts,
                                            "delta_ns": mapping_pts - frame_pts})
-            if writer is not None:
-                writer.writerow({
-                "detection_index": det_index, "raw_frame_index": frame[0] if frame else "",
-                "camera_frame_id": frame[1] if frame else "", "ttl_count": frame[2] if frame else "",
-                "detection_rp2040_us": frame[3] if frame else "", "detection_time_s": frame[4] if frame else "",
-                "frame_pts_ns": frame[5] if frame else "", "frame_pts_s": frame[6] if frame else "",
-                "raw_video_file": frame[7] if frame else "", "video_frame_index": frame[8] if frame else "",
-                "video_mapping_source": frame[9] if frame else "", "raw_frame_mapping_method": method,
-                "raw_frame_mapping_ok": mapping_ok, "raw_frame_mapping_pts_ns": _fmt(mapping_pts),
-                "raw_frame_mapping_delta": "", "source": f"objects:{det.get('stream_id', '')}",
-                "class_label": det.get("class_label", ""), "conf": det.get("detector_confidence", ""),
-                "x": det.get("track_x", ""), "y": det.get("track_y", ""),
-                "w": det.get("track_w", ""), "h": det.get("track_h", ""),
-                "original_frame": det.get("deepstream_frame_number", ""), "original_ts_us": _fmt(det_ts),
-                "pose_schema": det.get("pose_schema", ""), "kpt_count": det.get("kpt_count", ""),
-                "kpt_names_json": det.get("kpt_names_json", ""), "kpt_values_json": det.get("kpt_values_json", ""),
-                })
             stats["count"] += 1
     finally:
-        if handle is not None:
-            handle.close()
+        pass
     stats["samples"] = samples
     return stats
-
-
-def _records(path: Path, kind: str, first_rp: int) -> Iterator[tuple[tuple[int, int, int], dict, dict]]:
-    order = {"FRAME": 0, "SERIAL": 1, "DETECTION": 2}[kind]
-    for row in _reader(path):
-        if kind == "FRAME":
-            rp = _to_int(row.get("frame_rp2040_us")); index = _to_int(row.get("camera_frame_id")) or 0
-            all_row = {"record_type": kind, "time_rp2040_us": _fmt(rp), "time_s": row["frame_time_s"],
-                       "time_source": "camera_high", "event_type": "CAMERA_FRAME", "event_name": "CAMERA_FRAME",
-                       "trigger_event_type": "CAMERA_HIGH", "frame_trigger_rp2040_us": _fmt(rp),
-                       "frame_trigger_time_s": row["frame_time_s"], "offset_from_frame_trigger_ms": "0.000000",
-                       "raw_frame_index": row["raw_frame_index"], "camera_frame_id": row["camera_frame_id"],
-                       "ttl_count": row["ttl_count"], "source": "cam0", "frame_pts_ns": row["frame_pts_ns"],
-                       "frame_pts_s": row["frame_pts_s"], "duration_ns": row["duration_ns"],
-                       "raw_video_file": row["raw_video_file"], "video_frame_index": row["video_frame_index"],
-                       "video_mapping_source": row["video_mapping_source"], "frame_status": row["status"],
-                       "has_detection": row["has_detection"], "detection_count": row["detection_count"],
-                       "frame_host_unix_ns": row["frame_host_unix_ns"], "frame_host_monotonic_ns": row["frame_host_monotonic_ns"],
-                       "ttl_host_unix_ns": row["ttl_host_unix_ns"], "ttl_host_monotonic_ns": row["ttl_host_monotonic_ns"]}
-            timeline = {"record_type": kind, "time_rp2040_us": _fmt(rp), "time_s": row["frame_time_s"],
-                        "time_source": "camera_high", "camera_frame_id": row["camera_frame_id"],
-                        "raw_frame_index": row["raw_frame_index"], "ttl_count": row["ttl_count"],
-                        "event_type": "FRAME", "event_name": "FRAME"}
-        elif kind == "SERIAL":
-            rp = _to_int(row.get("rp2040_time_us")) or _to_int(row.get("previous_frame_rp2040_us")); index = _to_int(row.get("serial_index")) or 0
-            time_source = "rp2040" if row.get("rp2040_time_us") else "serial_order_previous_camera_high"
-            time_s = _float((rp - first_rp) / 1_000_000.0 if rp is not None else None)
-            all_row = {"record_type": kind, "time_rp2040_us": _fmt(rp), "time_s": time_s,
-                       "time_source": time_source, "event_type": row["eventType"], "event_name": row["event_name"],
-                       "raw_event_rp2040_us": row["rp2040_time_us"], "raw_event_time_s": row["event_time_s"],
-                       "trigger_event_type": "CAMERA_HIGH" if row["previous_ttl_count"] else "",
-                       "frame_trigger_rp2040_us": row["previous_frame_rp2040_us"],
-                       "frame_trigger_time_s": _float((_to_int(row["previous_frame_rp2040_us"]) - first_rp) / 1_000_000.0 if _to_int(row["previous_frame_rp2040_us"]) is not None else None),
-                       "offset_from_frame_trigger_ms": row["offset_from_previous_frame_ms"],
-                       "camera_frame_id": row["previous_frame_id"], "ttl_count": row["previous_ttl_count"],
-                       "serial_index": row["serial_index"], "controller_unix_us": row["controller_unix_us"],
-                       "side": row["side"], "event_count": row["count"], "event_duration": row["duration"],
-                       "event_latency": row["latency"], "event_value": row["value"], "event_context": row["context"],
-                       "event_reason": row["reason"], "previous_ttl_count": row["previous_ttl_count"],
-                       "previous_frame_id": row["previous_frame_id"], "previous_frame_rp2040_us": row["previous_frame_rp2040_us"],
-                       "offset_from_previous_frame_ms": row["offset_from_previous_frame_ms"], "nearest_ttl_count": row["nearest_ttl_count"],
-                       "nearest_frame_id": row["nearest_frame_id"], "nearest_frame_rp2040_us": row["nearest_frame_rp2040_us"],
-                       "offset_from_nearest_frame_ms": row["offset_from_nearest_frame_ms"], "alignment_method": row["alignment_method"],
-                       "serial_host_unix_ns": row["hostUnixNs"], "serial_host_monotonic_ns": row["hostMonotonicNs"], "raw_line": row["rawLine"]}
-            timeline = {"record_type": kind, "time_rp2040_us": _fmt(rp), "time_s": time_s, "time_source": time_source,
-                        "camera_frame_id": row["previous_frame_id"], "ttl_count": row["previous_ttl_count"],
-                        "event_type": row["eventType"], "event_name": row["event_name"],
-                        "context": row["context"], "reason": row["reason"], "raw_line": row["rawLine"]}
-        else:
-            rp = _to_int(row.get("detection_rp2040_us")); index = _to_int(row.get("detection_index")) or 0
-            all_row = {"record_type": kind, "time_rp2040_us": _fmt(rp), "time_s": row["detection_time_s"],
-                       "time_source": "detection_frame", "event_type": "DETECTION", "event_name": row["class_label"],
-                       "trigger_event_type": "CAMERA_HIGH", "frame_trigger_rp2040_us": _fmt(rp),
-                       "frame_trigger_time_s": row["detection_time_s"], "offset_from_frame_trigger_ms": "0.000000",
-                       **row}
-            timeline = {"record_type": kind, "time_rp2040_us": _fmt(rp), "time_s": row["detection_time_s"],
-                        "time_source": "detection_frame", "camera_frame_id": row["camera_frame_id"],
-                        "raw_frame_index": row["raw_frame_index"], "ttl_count": row["ttl_count"],
-                        "event_type": "DETECTION", "event_name": row["class_label"],
-                        "detection_index": row["detection_index"], "conf": row["conf"], "x": row["x"],
-                        "y": row["y"], "w": row["w"], "h": row["h"]}
-        yield ((rp if rp is not None else -1, order, index), all_row, timeline)
-
-
-def _write_combined(out_dir: Path, first_rp: int) -> int:
-    streams = [_records(out_dir / "aligned_frames.csv", "FRAME", first_rp),
-               _records(out_dir / "aligned_events.csv", "SERIAL", first_rp),
-               _records(out_dir / "aligned_detections.csv", "DETECTION", first_rp)]
-    all_handle, all_writer = _writer(out_dir / "aligned_all.csv", ALL_FIELDS)
-    timeline_handle, timeline_writer = _writer(out_dir / "aligned_timeline.csv", TIMELINE_FIELDS)
-    count = 0
-    try:
-        for _key, all_row, timeline in heapq.merge(*streams, key=lambda item: item[0]):
-            all_writer.writerow(all_row)
-            timeline_writer.writerow(timeline)
-            count += 1
-    finally:
-        all_handle.close(); timeline_handle.close()
-    return count
 
 
 def _data_rows(path: Path) -> int:
@@ -623,10 +392,8 @@ def build_alignment(
             "first_camera_timestamp_ns": _to_int(first_frame.get("camera_timestamp_ns")),
             "first_rp2040_time_us": first_high_rp,
         }
-        frames = _write_frames(db, frames_path, None, epoch)
-        observations = _write_detections(
-            db, objects_path, None
-        )
+        frames = _write_frames(db, frames_path, epoch)
+        observations = _write_detections(db, objects_path)
         median = serial["median_interval_us"]
         tolerance = max(1000.0, median / 2.0) if median is not None else None
         within = (
@@ -660,7 +427,7 @@ def build_alignment(
             "time_base": "serial.csv CAMERA_HIGH rp2040Time",
             "frame_alignment_rule": "camera_frame_id = CAMERA_HIGH count + dynamic offset",
             "frame_alignment": epoch,
-            "outputs": {},
+            "start_marker_seen": serial["start_marker_seen"],
             "counts": {"recorded_frames": frames["count"], "camera_high_events": serial["camera_high_events"],
                        "serial_rows": serial["serial_rows"], "object_observations": observations["count"],
                        "drop_events": _data_rows(run_dir / "diagnostics" / "errors.csv"),

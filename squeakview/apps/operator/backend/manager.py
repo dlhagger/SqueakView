@@ -368,7 +368,35 @@ class OperatorBackend:
 
     def _write_run_manifest(self, run_dir: Path) -> None:
         try:
-            path = run_context.write_manifest(run_dir, self._build_run_manifest(run_dir))
+            existing = run_context.read_json(
+                run_dir / run_context.RUN_MANIFEST_FILENAME
+            )
+            status = run_context.read_json(
+                run_dir / run_context.RUN_STATUS_FILENAME
+            )
+            terminal_states = {
+                "post_run_complete",
+                "analysis_complete",
+                "finalized",
+                "finalization_failed",
+                "analysis_failed",
+                "failed",
+            }
+            if existing and (
+                self._run_started_at is None
+                or status.get("state") in terminal_states
+            ):
+                # Acquisition configuration and provenance are immutable once a
+                # run has completed. A later GUI session may update bottle
+                # measurements and the artifact inventory, but it does not have
+                # the original in-memory model/configuration snapshot.
+                manifest = dict(existing)
+                manifest["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                manifest["bottles"] = self._bottle_manifest_snapshot(run_dir)
+                manifest["actual_outputs"] = self._run_output_snapshot(run_dir)
+            else:
+                manifest = self._build_run_manifest(run_dir)
+            path = run_context.write_manifest(run_dir, manifest)
             self._log(f"[BACKEND] manifest written → {path}")
         except Exception as exc:
             self._log(f"[BACKEND] manifest write failed: {exc}")
@@ -377,6 +405,8 @@ class OperatorBackend:
         summary = run_context.write_bottle_artifacts(run_dir, bottles)
         state = "complete" if summary.get("complete") else "incomplete"
         self._log(f"[BOTTLES] saved {state} bottle metadata → {run_dir / run_context.BOTTLE_MEASUREMENTS_FILENAME}")
+        for warning in summary.get("warnings", []):
+            self._log(f"[BOTTLES] warning: {warning}")
         return summary
 
     def save_bottle_measurements(
