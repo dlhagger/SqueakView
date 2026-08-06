@@ -87,5 +87,36 @@ class SessionLauncherSubjectScopeTest(unittest.TestCase):
             dialog.close()
 
 
+class BehaviorDashboardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_auto_pellet_mode_detects_arrival_events(self) -> None:
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        dashboard.ingest("PELLET_ARRIVAL")
+        self.assertEqual(dashboard._observed_pellet_mode, "arrival")
+        self.assertEqual(dashboard.counters.get("PELLET"), 1)
+
+    def test_auto_pellet_mode_detects_retrieval_events(self) -> None:
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        dashboard.ingest("PELLET_RETRIEVAL")
+        self.assertEqual(dashboard._observed_pellet_mode, "retrieval")
+        self.assertEqual(dashboard.counters.get("PELLET"), 1)
+
+    def test_auto_pellet_mode_switches_to_both_when_both_events_seen(self) -> None:
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        dashboard.ingest("PELLET_ARRIVAL")
+        dashboard.ingest("PELLET_RETRIEVAL")
+        self.assertEqual(dashboard._observed_pellet_mode, "both")
+        self.assertEqual(dashboard.counters.get("PELLET"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

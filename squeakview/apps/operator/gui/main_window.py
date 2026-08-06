@@ -415,8 +415,8 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(preview_group, 0, 0, 1, 1)
 
         # Dashboard (plots), meters, and task viewer
-        # Count pellets on retrieval events by default (arrival-only counting was confusing)
-        self.dashboard = BehaviorDashboard(window_sec=300.0, pellet_mode="retrieval")
+        # Auto-detect pellet telemetry mode from firmware line events.
+        self.dashboard = BehaviorDashboard(window_sec=300.0, pellet_mode="auto")
         meters_only = self.dashboard.detach_meters()
         task_state_panel = self.dashboard.detach_task_panel()
         meters_group = QtWidgets.QGroupBox("System Load")

@@ -278,10 +278,11 @@ class MetersBar(QtWidgets.QWidget):
 
 
 class BehaviorDashboard(QtWidgets.QWidget):
-    def __init__(self, window_sec: float = 300.0, pellet_mode: str = "arrival", parent=None) -> None:
+    def __init__(self, window_sec: float = 300.0, pellet_mode: str = "auto", parent=None) -> None:
         super().__init__(parent)
         self.window_sec = float(max(30.0, window_sec))
         self.pellet_mode = pellet_mode
+        self._observed_pellet_mode: str | None = None
         self.counters: dict[str, int] = {}
         self.series_x: dict[str, list[float]] = {}
         self.series_y: dict[str, list[int]] = {}
@@ -370,6 +371,36 @@ class BehaviorDashboard(QtWidgets.QWidget):
         if yaml is None:
             raise RuntimeError("PyYAML is not installed; cannot read task config.")
         return yaml.safe_load(raw)
+
+    def _infer_pellet_mode(self, data: dict, event: str) -> None:
+        if self.pellet_mode != "auto":
+            return
+
+        if "PELLET" not in event and "WELL_CHECK" not in event:
+            return
+
+        if "PELLET_RETRIEVAL" in event or ("PELLET" in event and dash_util.is_end_event(data)):
+            if self._observed_pellet_mode == "arrival":
+                self._observed_pellet_mode = "both"
+            else:
+                self._observed_pellet_mode = "retrieval"
+            return
+
+        if "PELLET_ARRIVAL" in event or ("PELLET" in event and dash_util.is_start_event(data)):
+            if self._observed_pellet_mode == "retrieval":
+                self._observed_pellet_mode = "both"
+            else:
+                self._observed_pellet_mode = "arrival"
+            return
+
+        if "WELL_CHECK" in event and dash_util.is_start_event(data):
+            if self._observed_pellet_mode is None:
+                self._observed_pellet_mode = "retrieval"
+
+    def _effective_pellet_mode(self) -> str:
+        if self.pellet_mode != "auto":
+            return self.pellet_mode
+        return self._observed_pellet_mode or "retrieval"
 
     @staticmethod
     def _default_task_config() -> dict:
@@ -617,6 +648,8 @@ class BehaviorDashboard(QtWidgets.QWidget):
             self._update_settings_from_nogo_stage_info(data)
         elif event in ("SIDE_SET", "TRIAL_START"):
             self._update_settings_from_side_set(data)
+
+        self._infer_pellet_mode(data, event)
         tsec = dash_util.choose_event_time(data)
         now = time.time()
         if tsec < (now - 2.0 * self.window_sec) or tsec > (now + 2.0 * self.window_sec):
@@ -647,11 +680,12 @@ class BehaviorDashboard(QtWidgets.QWidget):
             key = "DRINK_R" if data.get("side_uc") == "R" else "DRINK_L"
             self._append_point(key, tsec)
         elif "PELLET" in event:
+            mode = self._effective_pellet_mode()
             ok = (
-                (self.pellet_mode == "arrival" and (dash_util.is_start_event(data) or "ARRIVAL" in event))
-                or (self.pellet_mode == "retrieval" and (dash_util.is_end_event(data) or "RETRIEVAL" in event))
+                (mode == "arrival" and (dash_util.is_start_event(data) or "ARRIVAL" in event))
+                or (mode == "retrieval" and (dash_util.is_end_event(data) or "RETRIEVAL" in event))
                 or (
-                    self.pellet_mode == "both"
+                    mode == "both"
                     and (
                         dash_util.is_start_event(data)
                         or dash_util.is_end_event(data)
@@ -761,9 +795,17 @@ class BehaviorDashboard(QtWidgets.QWidget):
             return False
         phase = str(match.get("phase", "")).strip().lower()
         if phase in ("start", "arrival"):
-            return dash_util.is_start_event(data)
+            if dash_util.is_start_event(data):
+                return True
+            if "PELLET" in event and self._effective_pellet_mode() in ("retrieval", "both") and "RETRIEVAL" in event:
+                return True
+            return False
         if phase in ("end", "retrieval"):
-            return dash_util.is_end_event(data)
+            if dash_util.is_end_event(data):
+                return True
+            if "PELLET" in event and self._effective_pellet_mode() in ("arrival", "both") and "ARRIVAL" in event:
+                return True
+            return False
         return True
 
     def _update_counts_label(self) -> None:
