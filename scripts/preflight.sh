@@ -101,10 +101,6 @@ pass() {
   printf '[PASS] %s\n' "$1"
 }
 
-warn() {
-  printf '[WARN] %s\n' "$1"
-}
-
 info() {
   printf '[INFO] %s\n' "$1"
 }
@@ -132,10 +128,25 @@ check_tegrastats_memory() {
     return 0
   fi
   printf '[INFO] tegrastats: %s\n' "$line"
-  local lfb_mb
-  lfb_mb="$(printf '%s\n' "$line" | sed -n 's/.*lfb [0-9][0-9]*x\([0-9][0-9]*\)MB.*/\1/p')"
-  if [ -n "$lfb_mb" ] && [ "$lfb_mb" -lt 16 ]; then
-    warn "Low contiguous NvMap memory (lfb ${lfb_mb}MB). Close notebooks/other GPU apps or reboot before DeepStream if cuda/NvMap allocation fails."
+}
+
+check_desktop_suspend_policy() {
+  if ! command -v gsettings >/dev/null 2>&1; then
+    info "Desktop suspend policy unavailable (gsettings is not installed)"
+    return 0
+  fi
+  local timeout action
+  timeout="$(gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 2>/dev/null || true)"
+  action="$(gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 2>/dev/null || true)"
+  timeout="${timeout//[^0-9]/}"
+  if [ "$timeout" = "0" ]; then
+    pass "Automatic desktop suspend on AC power is disabled"
+  elif [ -n "$timeout" ] && [[ "$action" == *suspend* ]]; then
+    printf '[FAIL] Automatic desktop suspend is enabled after %s second(s) on AC power.\n' "$timeout"
+    printf '       Disable it before scientific acquisition; Jetson Linux 39.2.1 documents an Orin Nano SC7 resume watchdog risk.\n'
+    fail=1
+  else
+    info "Desktop suspend policy could not be determined"
   fi
 }
 
@@ -176,11 +187,23 @@ for element in $required_elements; do
     fail=1
   fi
 done
-check command -v ffprobe
+if command -v ffprobe >/dev/null 2>&1; then
+  pass "ffprobe is installed ($(command -v ffprobe))"
+else
+  printf '[FAIL] FFmpeg/ffprobe is not installed.\n'
+  printf '       Install it with: sudo apt install ffmpeg\n'
+  fail=1
+fi
 
 if [ "$CAPTURE_BACKEND" = "flir_direct" ]; then
   if gst-inspect-1.0 flirspinsrc >/dev/null 2>&1; then
     pass "GStreamer element 'flirspinsrc' is available"
+    if gst-inspect-1.0 flirspinsrc 2>/dev/null | grep -q 'capture-log-path'; then
+      pass "GStreamer element 'flirspinsrc' supports the source capture ledger"
+    else
+      printf '[FAIL] flirspinsrc is stale: capture-log-path is unavailable\n'
+      fail=1
+    fi
   else
     printf '[FAIL] GStreamer element missing: flirspinsrc\n'
     printf '       Build it with: cmake -S native/flir_gst_source -B native/flir_gst_source/build && cmake --build native/flir_gst_source/build -j\n'
@@ -189,12 +212,6 @@ if [ "$CAPTURE_BACKEND" = "flir_direct" ]; then
 fi
 
 if [ "$INFERENCE_ENABLED" -eq 1 ]; then
-    if gst-inspect-1.0 flirspinsrc 2>/dev/null | grep -q 'capture-log-path'; then
-      pass "GStreamer element 'flirspinsrc' supports the source capture ledger"
-    else
-      printf '[FAIL] flirspinsrc is stale: capture-log-path is unavailable\n'
-      fail=1
-    fi
   TRACKER_LIB="$DEEPSTREAM_SDK/lib/libnvds_nvmultiobjecttracker.so"
   if [ ! -f "$TRACKER_LIB" ]; then
     printf '[FAIL] DeepStream tracker library missing: %s\n' "$TRACKER_LIB"
@@ -216,6 +233,7 @@ if [ "$INFERENCE_ENABLED" -eq 1 ]; then
 fi
 
 check_tegrastats_memory
+check_desktop_suspend_policy
 
 if "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
 import gi
@@ -228,7 +246,8 @@ PY
 then
   pass "Python imports for Gst, PyServiceMaker, and PySide6 resolved"
 else
-  warn "Python imports failed for Gst, PyServiceMaker, or PySide6 in this environment"
+  printf '[FAIL] Python imports failed for Gst, PyServiceMaker, or PySide6 in this environment\n'
+  fail=1
 fi
 
 if [ "$fail" -eq 0 ]; then

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Backend orchestrator for the operator GUI."""
 
+import json
 import os
 import signal
 import subprocess
@@ -15,6 +16,8 @@ from squeakview.apps.operator.backend import process
 from squeakview import config as squeakview_config
 from squeakview import model_package
 from squeakview.common import run_context
+from squeakview.common.capture_policy import capture_buffer_policy
+from squeakview.common.device_context import device_context_snapshot, file_identity
 from squeakview.common import serial as serial_util
 
 
@@ -56,7 +59,9 @@ class OperatorBackend:
         self._finalize_lock = threading.Lock()
         self._run_finalized = True
         self._recording_started = False
+        self._controller_started = False
         self._model_snapshot: dict[str, str] | None = None
+        self._device_context: dict[str, object] | None = None
 
     def _log(self, message: str) -> None:
         self.emit(f"[{_now()}] {message}")
@@ -119,7 +124,12 @@ class OperatorBackend:
         phase = "after readiness" if self._inference_ready.is_set() else "before readiness"
         error = f"inference process exited unexpectedly {phase} (exit code {returncode})"
         self._log(f"[DS] {error}")
-        self._finalize_run(final_state="failed", error=error, terminate_inference=False)
+        self._finalize_run(
+            final_state="failed",
+            error=error,
+            terminate_inference=False,
+            known_inference_returncode=returncode,
+        )
 
     @staticmethod
     def _serial_open_failure_message(handle: serial_util.SerialHandle, port: str, baud: int) -> str:
@@ -266,6 +276,7 @@ class OperatorBackend:
 
     def _build_run_manifest(self, run_dir: Path) -> dict[str, Any]:
         cfg = self.launch_cfg
+        buffer_policy = capture_buffer_policy(cfg.fps)
         artifacts = run_context.run_artifacts(run_dir)
         experiment = (cfg.experiment_name or "").strip() or None
         mouse_id = (cfg.mouse_id or "").strip() or None
@@ -281,6 +292,16 @@ class OperatorBackend:
             "created_at": self._run_started_at,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "workspace": str(process.WORKSPACE),
+            "platform": self._device_context or device_context_snapshot(),
+            "native_plugins": {
+                "flir_gstreamer_source": file_identity(
+                    process.WORKSPACE / "native/flir_gst_source/build/gstflirspinsrc.so"
+                ),
+                "deepstream_yolo_parser": file_identity(
+                    process.WORKSPACE
+                    / "native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
+                ),
+            },
             "git": self._git_snapshot(),
             "storage": self._run_storage_info,
             "experiment_name": experiment,
@@ -325,10 +346,10 @@ class OperatorBackend:
                     "speed_preset": "ultrafast",
                     "sliced_threads": False,
                 },
-                "record_queue_capacity_frames": max(120, int(cfg.fps) * 4),
-                "backpressure_warning_frames": max(24, int(cfg.fps)),
-                "backpressure_failure_frames": max(90, int(cfg.fps) * 3),
-                "source_transport_buffer_count": max(64, int(cfg.fps) * 2),
+                "record_queue_capacity_frames": buffer_policy.record_queue_frames,
+                "backpressure_warning_frames": buffer_policy.record_warning_frames,
+                "backpressure_failure_frames": buffer_policy.record_failure_frames,
+                "source_transport_buffer_count": buffer_policy.source_transport_buffers,
                 "backpressure_telemetry": "diagnostics/recording.csv",
                 "frame_manifest": artifacts.frames_csv.name,
                 "drop_events": "diagnostics/errors.csv",
@@ -459,6 +480,50 @@ class OperatorBackend:
                 sizes.append(-1)
         return tuple(sizes)
 
+    @staticmethod
+    def _last_ledger_line(path: Path) -> str | None:
+        """Read the last complete nonempty ledger line without scanning the run."""
+
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                end = handle.tell()
+                if end <= 0:
+                    return None
+                read_size = min(end, 65_536)
+                handle.seek(end - read_size)
+                lines = handle.read(read_size).decode(errors="replace").splitlines()
+        except OSError:
+            return None
+        return next((line.strip() for line in reversed(lines) if line.strip()), None)
+
+    @classmethod
+    def _capture_drain_counts(
+        cls, run_dir: Path, camera_count: int
+    ) -> tuple[int | None, ...]:
+        """Return source/admission counts inferred from monotonic ledger indices."""
+
+        counts: list[int | None] = []
+        for index in range(max(1, int(camera_count))):
+            capture_line = cls._last_ledger_line(run_dir / f"capture_cam{index}.jsonl")
+            try:
+                capture_count = int(json.loads(capture_line or "")["source_sequence_index"]) + 1
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                capture_count = 0 if capture_line is None else None
+            admission_path = run_dir / (
+                "record_admission.csv"
+                if index == 0
+                else f"record_admission_cam{index}.csv"
+            )
+            admission_line = cls._last_ledger_line(admission_path)
+            try:
+                first_field = (admission_line or "").split(",", 2)[1]
+                admission_count = int(first_field) + 1
+            except (IndexError, TypeError, ValueError):
+                admission_count = 0 if admission_line in (None, "") else None
+            counts.extend((capture_count, admission_count))
+        return tuple(counts)
+
     def _wait_for_capture_drain(
         self, run_dir: Path, *, expected_ttl_count: int | None = None
     ) -> bool:
@@ -487,9 +552,20 @@ class OperatorBackend:
             snapshot = self._capture_drain_snapshot(
                 run_dir, int(getattr(self.launch_cfg, "num_cameras", 1))
             )
+            counts = self._capture_drain_counts(
+                run_dir, int(getattr(self.launch_cfg, "num_cameras", 1))
+            )
             now = time.monotonic()
             ledgers_exist = bool(snapshot) and all(size >= 0 for size in snapshot)
-            if ledgers_exist and snapshot == previous:
+            counts_valid = bool(counts) and all(count is not None for count in counts)
+            pairs_match = counts_valid and all(
+                counts[offset] == counts[offset + 1]
+                for offset in range(0, len(counts), 2)
+            )
+            target_reached = expected_ttl_count is None or (
+                counts_valid and all(int(count) >= expected_ttl_count for count in counts)
+            )
+            if ledgers_exist and pairs_match and target_reached and snapshot == previous:
                 if stable_since is None:
                     stable_since = now
                 if now - stable_since >= quiet_s:
@@ -497,6 +573,7 @@ class OperatorBackend:
                         run_dir,
                         "capture_drained",
                         ledger_sizes=list(snapshot),
+                        ledger_frame_counts=list(counts),
                         expected_ttl_count=expected_ttl_count,
                     )
                     return True
@@ -538,6 +615,7 @@ class OperatorBackend:
         final_state: str,
         error: str | None = None,
         terminate_inference: bool = True,
+        known_inference_returncode: int | None = None,
     ) -> bool:
         notify_failure = False
         with self._finalize_lock:
@@ -547,7 +625,10 @@ class OperatorBackend:
             run_dir = self.state.run_dir
             inference = self.state.inference
             inference_running = bool(inference and inference.is_running())
-            inference_returncode: int | None = None
+            inference_returncode = known_inference_returncode
+            capture_exit_error: str | None = None
+            controller_stop_error: str | None = None
+            capture_drain_error: str | None = None
 
             if final_state == "finalized":
                 self._log("[BACKEND] stopping run")
@@ -559,7 +640,7 @@ class OperatorBackend:
 
             serial_handle = self.state.serial
             stopping_capture = bool(terminate_inference and inference_running and inference is not None)
-            if stopping_capture and serial_handle:
+            if (stopping_capture or self._controller_started) and serial_handle:
                 serial_handle.log_marker("CAPTURE_STOP_REQUESTED")
 
             # Stop the controller first so it cannot generate unrecorded trigger
@@ -568,19 +649,22 @@ class OperatorBackend:
                 try:
                     serial_handle.log_marker("STOP_SENT")
                     serial_handle.send_line("STOP")
-                    if stopping_capture:
+                    if stopping_capture or self._controller_started:
                         stop_acked = serial_handle.wait_for_stop_ack(timeout_s=2.0)
                         serial_handle.log_marker(
                             "CAPTURE_STOP_ACKED" if stop_acked else "CAPTURE_STOP_ACK_TIMEOUT"
                         )
-                except Exception:
-                    pass
+                        if not stop_acked:
+                            controller_stop_error = "controller STOP was not acknowledged"
+                except Exception as exc:
+                    controller_stop_error = f"controller STOP failed: {exc}"
+                    self._log(f"[BACKEND] {controller_stop_error}")
 
             if (
-                stopping_capture
-                and run_dir is not None
+                run_dir is not None
                 and serial_handle is not None
                 and bool(getattr(self.launch_cfg, "trigger_on", False))
+                and self._controller_started
             ):
                 drained = self._wait_for_capture_drain(
                     Path(run_dir),
@@ -592,14 +676,35 @@ class OperatorBackend:
                         if drained
                         else "CAPTURE_SOURCE_DRAIN_TIMEOUT"
                     )
+                if not drained:
+                    capture_drain_error = (
+                        "capture ledgers did not reach the controller TTL count and become quiet"
+                    )
 
             if stopping_capture and inference is not None:
                 # The capture runner now exits after EOS/MP4 closure. Audit and
                 # analysis happen in an independent post-run worker.
                 inference.terminate_group_graceful(signal.SIGINT, 30.0, True)
-                inference_returncode = inference.wait(timeout=2)
-                if serial_handle:
+                try:
+                    inference_returncode = inference.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    capture_exit_error = (
+                        "capture process did not exit after shutdown escalation; "
+                        "recording files were not validated"
+                    )
+                    self._log(f"[BACKEND] {capture_exit_error}")
+                if serial_handle and inference_returncode is not None:
                     serial_handle.log_marker("CAPTURE_STOP_DONE")
+            elif inference is not None and not inference_running:
+                # The output-pump thread may already have observed child exit;
+                # still collect its concrete code before inspecting artifacts.
+                try:
+                    inference_returncode = inference.wait(timeout=0)
+                except subprocess.TimeoutExpired:
+                    capture_exit_error = (
+                        "capture process exit could not be confirmed; "
+                        "recording files were not validated"
+                    )
 
             if serial_handle:
                 try:
@@ -610,24 +715,43 @@ class OperatorBackend:
                 self.state.serial = None
 
             failure_reasons: list[str] = []
+            if controller_stop_error:
+                failure_reasons.append(controller_stop_error)
+            if capture_drain_error:
+                failure_reasons.append(capture_drain_error)
+            if capture_exit_error:
+                failure_reasons.append(capture_exit_error)
             if final_state == "finalized":
-                if inference_returncode not in (None, 0):
-                    failure_reasons.append(f"inference exit code {inference_returncode}")
-                if run_dir:
-                    finalizer_returncode = self._run_capture_finalizer(Path(run_dir))
-                    if finalizer_returncode not in (0,):
+                if inference_returncode is None:
+                    if inference is not None and not capture_exit_error:
                         failure_reasons.append(
-                            f"post-run finalizer exit code {finalizer_returncode}"
+                            "capture process exit was not confirmed; recording files were not validated"
                         )
+                elif inference_returncode != 0:
+                    failure_reasons.append(f"inference exit code {inference_returncode}")
+            if run_dir and inference_returncode is not None:
+                finalizer_returncode = self._run_capture_finalizer(Path(run_dir))
+                if finalizer_returncode not in (0,):
+                    failure_reasons.append(
+                        f"post-run finalizer exit code {finalizer_returncode}"
+                    )
+                if final_state == "finalized":
                     status = run_context.read_json(Path(run_dir) / "run_status.json")
                     validation = status.get("recording_validation")
                     if not isinstance(validation, dict):
                         failure_reasons.append("recording validation was not produced")
                     elif validation.get("passed") is not True:
                         failure_reasons.append("recording frame-count validation failed")
+                    integrity = status.get("acquisition_integrity")
+                    if not isinstance(integrity, dict):
+                        failure_reasons.append("acquisition integrity audit was not produced")
+                    elif integrity.get("passed") is not True:
+                        failure_reasons.append("camera acquisition integrity validation failed")
             if failure_reasons:
                 final_state = "failed"
-                error = "; ".join(failure_reasons)
+                error = "; ".join(
+                    ([error] if error else []) + failure_reasons
+                )
                 self._log(f"[BACKEND] run failed validation: {error}")
 
             self.state.inference = None
@@ -709,6 +833,8 @@ class OperatorBackend:
         self._inference_ready.clear()
         self._stop_requested.clear()
         self._recording_started = False
+        self._controller_started = False
+        self._device_context = device_context_snapshot()
 
         self._set_fan_max()
 
@@ -748,8 +874,17 @@ class OperatorBackend:
         serial_handle: serial_util.SerialHandle | None = None
         if cfg.serial_enabled:
             if not serial_util.have_pyserial():
-                self._log("[SER] pyserial unavailable; disabling serial")
-                cfg.serial_enabled = False
+                error = (
+                    "Serial controller support was requested, but pyserial is not installed. "
+                    "Install the project dependencies before starting a scientific run."
+                )
+                self._log(f"[SER] {error}")
+                self._finalize_run(
+                    final_state="failed",
+                    error=error,
+                    terminate_inference=False,
+                )
+                return False
             else:
                 handle = serial_util.SerialHandle(cfg.serial_port, cfg.serial_baud, self._serial_emit)
                 if not handle.open(run_dir):
@@ -812,9 +947,18 @@ class OperatorBackend:
                 return False
             try:
                 self._log("[BACKEND] inference ready; sending START")
-                serial_handle.log_marker("START_SENT")
                 serial_handle.send_line(f"START,{int(cfg.arduino_fps)}")
-                serial_handle.wait_for_ttl(timeout_s=3.0)
+                serial_handle.log_marker("START_SENT")
+                self._controller_started = True
+                if not serial_handle.wait_for_ttl(timeout_s=3.0):
+                    serial_handle.log_marker("START_TTL_TIMEOUT")
+                    error = (
+                        "controller START was sent, but no camera TTL was detected within "
+                        "3.0s; the run was aborted"
+                    )
+                    self._log(f"[BACKEND] {error}")
+                    self._finalize_run(final_state="failed", error=error)
+                    return False
             except Exception as exc:
                 error = f"failed to start controller: {exc}"
                 self._log(f"[BACKEND] {error}")

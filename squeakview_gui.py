@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
 import time
 from pathlib import Path
+
+from squeakview.common.log_mirror import LineBufferedLogMirror
 
 
 ROOT = Path(__file__).resolve().parent
@@ -15,44 +16,13 @@ LOG_ENV = "SQUEAKVIEW_LOGFILE"
 RUN_ENV = "SQUEAKVIEW_RUN_DIR"
 
 
-class _Tee:
-    """Mirror stdout/stderr to a log file, filtering serial chatter."""
-
-    _SER_PAT = re.compile(r"\bCAMERA_(LOW|HIGH)\b")
-
-    def __init__(self, path: Path, stream):
-        self._stream = stream
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = path.open("a", buffering=1)
-
-    def write(self, data: str) -> None:
-        if self._SER_PAT.search(data):
-            self._stream.write(data)
-            return
-        self._stream.write(data)
-        try:
-            self._fh.write(data)
-        except Exception:
-            pass
-
-    def flush(self) -> None:
-        try:
-            self._fh.flush()
-        except Exception:
-            pass
-        try:
-            self._stream.flush()
-        except Exception:
-            pass
-
-
 def _setup_logging() -> None:
     log_path = os.environ.get(LOG_ENV)
     if not log_path:
         return
     path = Path(log_path)
-    sys.stdout = _Tee(path, sys.stdout)
-    sys.stderr = _Tee(path, sys.stderr)
+    sys.stdout = LineBufferedLogMirror(path, sys.stdout)
+    sys.stderr = LineBufferedLogMirror(path, sys.stderr)
     print(f"[squeakview] Logging to {path}", flush=True)
 
 

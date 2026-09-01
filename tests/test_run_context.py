@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,6 +64,30 @@ class RunContextTests(unittest.TestCase):
         self.assertEqual(status["started_at"], "2026-01-01T00:00:02")
         self.assertEqual(status["updated_at"], "2026-01-01T00:00:03")
         self.assertEqual(len(status["history"]), 4)
+        self.assertFalse(list(run_dir.glob(".*.tmp")))
+
+    def test_concurrent_status_updates_do_not_lose_history(self) -> None:
+        run_dir = self.root / "concurrent"
+        barrier = threading.Barrier(9)
+
+        def update(index: int) -> None:
+            barrier.wait()
+            run_context.write_status(run_dir, f"worker_{index}", worker=index)
+
+        threads = [threading.Thread(target=update, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        status = run_context.read_json(run_dir / run_context.RUN_STATUS_FILENAME)
+        self.assertEqual(len(status["history"]), 8)
+        self.assertEqual(
+            {entry["worker"] for entry in status["history"]},
+            set(range(8)),
+        )
+        self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertFalse(list(run_dir.glob(".*.tmp")))
 
     def test_storage_check_rejects_insufficient_free_space(self) -> None:

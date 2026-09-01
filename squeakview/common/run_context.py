@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import json
 import csv
+import fcntl
 import math
 import os
 import re
 import shutil
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +40,7 @@ _STATUS_TIMESTAMP_FIELDS = {
     "finalized": "finalized_at",
     "failed": "failed_at",
 }
+_METADATA_LOCK = threading.RLock()
 
 
 def _now_iso() -> str:
@@ -62,10 +67,27 @@ def slugify(value: str | None, *, fallback: str) -> str:
 
 
 def atomic_write_text(path: Path, text: str) -> Path:
+    """Atomically replace a text file and make the replacement crash-resistant."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text)
-    tmp.replace(path)
+    descriptor, raw_tmp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -382,6 +404,20 @@ def read_json(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+@contextmanager
+def _metadata_file_lock(path: Path):
+    """Serialize read-modify-replace metadata updates across threads/processes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _METADATA_LOCK, lock_path.open("a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _apply_status_lifecycle_timestamps(payload: dict[str, Any], history: list[Any]) -> None:
     for item in history:
         if not isinstance(item, dict):
@@ -394,35 +430,41 @@ def _apply_status_lifecycle_timestamps(payload: dict[str, Any], history: list[An
 
 def write_status(run_dir: Path, state: str, **updates: Any) -> Path:
     path = status_path(run_dir)
-    payload = read_json(path)
-    history = payload.get("history")
-    if not isinstance(history, list):
-        history = []
-    entry = {"state": state, "timestamp": _now_iso()}
-    entry.update({key: value for key, value in updates.items() if value is not None})
-    history.append(entry)
-    payload.update(updates)
-    payload["state"] = state
-    payload["updated_at"] = entry["timestamp"]
-    payload["history"] = history
-    _apply_status_lifecycle_timestamps(payload, history)
-    return atomic_write_json(path, payload)
+    with _metadata_file_lock(path):
+        payload = read_json(path)
+        history = payload.get("history")
+        if not isinstance(history, list):
+            history = []
+        entry = {"state": state, "timestamp": _now_iso()}
+        entry.update({key: value for key, value in updates.items() if value is not None})
+        history.append(entry)
+        payload.update(updates)
+        payload["state"] = state
+        payload["updated_at"] = entry["timestamp"]
+        payload["history"] = history
+        _apply_status_lifecycle_timestamps(payload, history)
+        return atomic_write_json(path, payload)
 
 
 def update_status(run_dir: Path, **updates: Any) -> Path:
     path = status_path(run_dir)
-    payload = read_json(path)
-    payload.update({key: value for key, value in updates.items() if value is not None})
-    payload["updated_at"] = _now_iso()
-    return atomic_write_json(path, payload)
+    with _metadata_file_lock(path):
+        payload = read_json(path)
+        payload.update({key: value for key, value in updates.items() if value is not None})
+        payload["updated_at"] = _now_iso()
+        return atomic_write_json(path, payload)
 
 
 def write_manifest(run_dir: Path, payload: dict[str, Any]) -> Path:
-    return atomic_write_json(manifest_path(run_dir), payload)
+    path = manifest_path(run_dir)
+    with _metadata_file_lock(path):
+        return atomic_write_json(path, payload)
 
 
 def update_manifest(run_dir: Path, **updates: Any) -> Path:
-    payload = read_json(manifest_path(run_dir))
-    payload.update(updates)
-    payload["updated_at"] = _now_iso()
-    return write_manifest(run_dir, payload)
+    path = manifest_path(run_dir)
+    with _metadata_file_lock(path):
+        payload = read_json(path)
+        payload.update(updates)
+        payload["updated_at"] = _now_iso()
+        return atomic_write_json(path, payload)

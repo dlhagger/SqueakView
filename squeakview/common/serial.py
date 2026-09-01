@@ -256,11 +256,25 @@ class SerialHandle:
             pass
 
     def send_line(self, text: str) -> None:
+        """Write and flush a controller command, or raise if delivery fails.
+
+        Controller commands participate in the scientific run lifecycle.  A
+        caller must never interpret a logged write error as a successful START
+        or STOP command.
+        """
+
         if not self.ser or not self.ser.is_open:
-            self.emit(f"[{timestamp()}] [SER] cannot send, port not open")
-            return
+            message = f"cannot send {text!r}: serial port is not open"
+            self.emit(f"[{timestamp()}] [SER] {message}")
+            raise RuntimeError(message)
         try:
-            if text.strip().upper() == "STOP":
+            command = text.strip().upper()
+            if command.startswith("START"):
+                # Only a TTL observed after this START attempt may satisfy the
+                # startup handshake.  The serial reader can set the event as
+                # soon as the controller responds, before wait_for_ttl runs.
+                self._ttl_seen.clear()
+            if command == "STOP":
                 # Clear immediately before writing so a fast controller reply
                 # cannot race ahead of wait_for_stop_ack().
                 self._stop_ack_seen.clear()
@@ -270,12 +284,14 @@ class SerialHandle:
             self.ser.flush()
         except Exception as exc:
             self.emit(f"[{timestamp()}] [SER] write error: {exc}")
+            raise RuntimeError(f"serial write failed for {text!r}: {exc}") from exc
 
     def wait_for_ttl(self, timeout_s: float = 3.0) -> bool:
         self.emit(f"[{timestamp()}] [SER] Waiting for camera TTL line (timeout {timeout_s:.1f}s) …")
         hit = self._ttl_seen.wait(timeout=timeout_s)
         self.emit(
-            f"[{timestamp()}] [SER] {'TTL detected.' if hit else 'TTL not detected within timeout — continuing anyway.'}"
+            f"[{timestamp()}] [SER] "
+            f"{'TTL detected.' if hit else 'TTL not detected within timeout — startup handshake failed.'}"
         )
         return hit
 

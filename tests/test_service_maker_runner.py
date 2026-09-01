@@ -13,6 +13,7 @@ from squeakview.apps.inference import service_maker_runner as runner
 from squeakview.apps.inference import post_run
 from squeakview.apps.inference.pose_pipeline import PoseClass, PoseSchema, decode_yolo26_rows, load_pose_schema
 from squeakview.common import run_context
+from squeakview.common.capture_policy import capture_buffer_policy
 
 
 class FakePipeline:
@@ -91,6 +92,10 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "version 2 is required"):
             load_pose_schema(self.infer_config, ["mouse", "bottle"])
 
+    def test_safe_print_cannot_break_shutdown_when_parent_pipe_is_closed(self) -> None:
+        with mock.patch("builtins.print", side_effect=BrokenPipeError):
+            runner._safe_print("shutdown")
+
     def test_orin_nano_tracker_uses_stable_cuda_nvdcf(self) -> None:
         tracker_config = Path(runner.__file__).resolve().parents[3] / "configs/tracker_mouse_nvdcf.yml"
         text = tracker_config.read_text()
@@ -127,13 +132,15 @@ class ServiceMakerRunnerTests(unittest.TestCase):
             pipeline.nodes["flirsrc0"][1]["capture-log-path"],
             str(app.run_dir / "capture_cam0.jsonl"),
         )
-        self.assertNotIn("leaky", pipeline.nodes["record_queue0"][1])
+        self.assertEqual(pipeline.nodes["record_queue0"][1]["leaky"], 0)
+        self.assertFalse(pipeline.nodes["record_queue0"][1]["flush-on-eos"])
         self.assertEqual(pipeline.nodes["record_queue0"][1]["max-size-buffers"], 120)
         self.assertEqual(pipeline.nodes["flirsrc0"][1]["stream-buffer-count"], 64)
         self.assertNotIn("record_convert0", pipeline.nodes)
         self.assertNotIn("record_caps0", pipeline.nodes)
         self.assertEqual(pipeline.nodes["record_encoder0"][0], "x264enc")
         self.assertFalse(pipeline.nodes["record_encoder0"][1]["sliced-threads"])
+        self.assertFalse(pipeline.nodes["record_encoder0"][1]["qos"])
         self.assertEqual(pipeline.nodes["infer_convert0"][1]["compute-hw"], 2)
         self.assertEqual(pipeline.nodes["infer_convert0"][1]["copy-hw"], 2)
         self.assertEqual(pipeline.nodes["infer_queue0"][1]["leaky"], 2)
@@ -144,6 +151,7 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         self.assertEqual(pipeline.nodes["tracker"][1]["operate-on-class-ids"], "0")
         self.assertEqual(pipeline.nodes["tracker"][1]["tracking-id-reset-mode"], 3)
         self.assertEqual(pipeline.nodes["record_sink0"][1]["location"], str(app.artifacts.raw_video))
+        self.assertFalse(pipeline.nodes["record_sink0"][1]["qos"])
         self.assertEqual(pipeline.nodes["sink"][0], "fakesink")
         self.assertNotIn("osd", pipeline.nodes)
         self.assertEqual(app.frames.path, app.run_dir / "inference" / "frames.csv")
@@ -157,6 +165,31 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         app.stop()
         self.assertTrue(pipeline.stopped)
         self.assertTrue(pipeline.waited)
+
+    def test_scientific_capture_policy_fails_before_non_leaky_queue_fills(self) -> None:
+        for fps in (1, 30, 60, 120):
+            policy = capture_buffer_policy(fps)
+            self.assertLess(policy.record_warning_frames, policy.record_failure_frames)
+            self.assertLess(policy.record_failure_frames, policy.record_queue_frames)
+
+        _app, pipeline = self.build(self.config(fps=60))
+        record_queue = pipeline.nodes["record_queue0"][1]
+        policy = capture_buffer_policy(60)
+        self.assertEqual(record_queue["leaky"], 0)
+        self.assertEqual(record_queue["max-size-buffers"], policy.record_queue_frames)
+
+    def test_recording_telemetry_schema_matches_every_row(self) -> None:
+        output = self.root / "recording_schema.csv"
+        telemetry = runner.RecordingPathTelemetry(output, stream_id=0)
+        telemetry.source(10)
+        telemetry.admit(10)
+        telemetry.egress(10)
+        telemetry.close()
+
+        with output.open(newline="") as handle:
+            rows = list(csv.reader(handle))
+        self.assertTrue(rows)
+        self.assertTrue(all(len(row) == len(rows[0]) for row in rows[1:]))
 
     def test_builds_non_blocking_ipc_preview_for_each_camera(self) -> None:
         socket_path = self.root / "preview.sock"
@@ -313,6 +346,10 @@ class ServiceMakerRunnerTests(unittest.TestCase):
             "host_received_unix_ns": 2,
             "actual_fps": 30.0,
             "camera_serial": "25187166",
+            "telemetry_sample": True,
+            "stream_incomplete_frames": 0,
+            "stream_lost_frames": 0,
+            "stream_dropped_frames": 0,
         }
         second = dict(first, source_sequence_index=1, camera_frame_id=101, gst_pts_ns=33_333_333)
         third = dict(first, source_sequence_index=2, camera_frame_id=102, gst_pts_ns=66_666_666)
@@ -377,6 +414,10 @@ class ServiceMakerRunnerTests(unittest.TestCase):
                             "host_received_monotonic_ns": index,
                             "host_received_unix_ns": index,
                             "actual_fps": 30.0,
+                            "telemetry_sample": index == 0,
+                            "stream_incomplete_frames": 0,
+                            "stream_lost_frames": 0,
+                            "stream_dropped_frames": 0,
                         }
                     )
                     + "\n"
@@ -469,6 +510,97 @@ class ServiceMakerRunnerTests(unittest.TestCase):
             telemetry.close()
         app.frames.close()
         app._stopped = True
+
+    def test_recording_validation_rejects_zero_frame_run(self) -> None:
+        video = self.root / "raw.mp4"
+        video.write_bytes(b"mp4-header")
+        with mock.patch.object(
+            runner.ServiceMakerApp,
+            "_video_frame_probe",
+            return_value={"count": 0, "method": "container_nb_frames", "error": None},
+        ):
+            report, passed = post_run._validate_recordings(
+                self.root, 1, {0: 0}, {0: 0}
+            )
+
+        self.assertFalse(passed)
+        self.assertFalse(report["cameras"][0]["nonzero_frame_count"])
+
+    def test_acquisition_integrity_rejects_camera_event_and_transport_loss(self) -> None:
+        diagnostics = self.root / "diagnostics"
+        diagnostics.mkdir(exist_ok=True)
+        (diagnostics / "errors.csv").write_text(
+            "host_unix_ns,host_monotonic_ns,event_type,stream_id,"
+            "expected_frame_id,actual_frame_id,details\n"
+            "1,2,payload_crc_failure,0,,3,{}\n"
+        )
+        (diagnostics / "camera.csv").write_text(
+            "stream_lost_frames,stream_dropped_frames,stream_incomplete_frames\n"
+            "1,0,0\n"
+        )
+
+        report, passed = post_run._validate_acquisition_integrity(self.root)
+
+        self.assertFalse(passed)
+        self.assertEqual(report["event_counts"], {"payload_crc_failure": 1})
+        self.assertEqual(report["transport_counter_maxima"]["stream_lost_frames"], 1)
+
+    def test_acquisition_integrity_rejects_header_only_or_malformed_telemetry(self) -> None:
+        diagnostics = self.root / "diagnostics"
+        diagnostics.mkdir(exist_ok=True)
+        (diagnostics / "errors.csv").write_text("event_type\n")
+        (diagnostics / "camera.csv").write_text(
+            "stream_lost_frames,stream_dropped_frames,stream_incomplete_frames\n"
+        )
+
+        report, passed = post_run._validate_acquisition_integrity(self.root)
+
+        self.assertFalse(passed)
+        self.assertTrue(report["camera_telemetry_schema_valid"])
+        self.assertEqual(report["camera_telemetry_sample_rows"], 0)
+
+        (diagnostics / "camera.csv").write_text(
+            "stream_lost_frames,stream_dropped_frames,stream_incomplete_frames\n"
+            "-1,,0\n"
+        )
+        report, passed = post_run._validate_acquisition_integrity(self.root)
+        self.assertFalse(passed)
+        self.assertGreater(report["invalid_diagnostic_rows"], 0)
+        self.assertEqual(report["transport_counter_samples"]["stream_dropped_frames"], 0)
+
+    def test_capture_ledger_must_exist_and_have_contiguous_source_sequence(self) -> None:
+        missing = self.root / "capture_cam0.jsonl"
+        with self.assertRaisesRegex(RuntimeError, "capture ledger is missing"):
+            list(post_run._iter_capture_payloads(missing, 0))
+
+        missing.write_text(
+            json.dumps(
+                {
+                    "camera_index": 0,
+                    "source_sequence_index": 1,
+                    "gst_pts_ns": 0,
+                }
+            )
+            + "\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "source sequence is not contiguous"):
+            list(post_run._iter_capture_payloads(missing, 0))
+
+    def test_recording_admission_validates_stream_and_contiguous_index(self) -> None:
+        admission = self.root / "record_admission.csv"
+        admission.write_text(
+            "stream_id,record_frame_index,pts_ns,observer_monotonic_ns\n"
+            "1,0,0,10\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "stream mismatch"):
+            list(post_run._iter_admission_pts(admission, 0))
+
+        admission.write_text(
+            "stream_id,record_frame_index,pts_ns,observer_monotonic_ns\n"
+            "0,1,0,10\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "index is not contiguous"):
+            list(post_run._iter_admission_pts(admission, 0))
 
     def test_yolo26_decoder_undoes_symmetric_letterbox_and_filters_confidence(self) -> None:
         schema = PoseSchema(
@@ -595,7 +727,7 @@ class ServiceMakerRunnerTests(unittest.TestCase):
             event = next(csv.DictReader(handle))
         self.assertEqual(event["event_type"], "frame_metadata_missing")
 
-    def test_successful_cleanup_removes_only_recovery_artifacts(self) -> None:
+    def test_successful_cleanup_preserves_scientific_provenance(self) -> None:
         for name in (
             "capture_cam0.jsonl",
             "capture_cam1.jsonl",
@@ -612,9 +744,11 @@ class ServiceMakerRunnerTests(unittest.TestCase):
 
         post_run.cleanup_successful_run(self.root, 2)
 
-        self.assertFalse((self.root / "capture_cam0.jsonl").exists())
-        self.assertFalse((self.root / "record_admission_cam1.csv").exists())
-        self.assertFalse(inference.exists())
+        self.assertEqual((self.root / "capture_cam0.jsonl").read_text(), "temporary\n")
+        self.assertEqual(
+            (self.root / "record_admission_cam1.csv").read_text(), "temporary\n"
+        )
+        self.assertEqual((inference / "frames.csv").read_text(), "temporary\n")
         self.assertFalse((self.root / post_run.PROGRESS_FILENAME).exists())
         for name in ("frames.csv", "objects.csv", "keypoints.csv", "alignment_summary.json"):
             self.assertEqual((self.root / name).read_text(), "canonical\n")

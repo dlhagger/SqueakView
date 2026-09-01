@@ -110,6 +110,33 @@ class SerialCsvTests(unittest.TestCase):
         self.assertEqual(rows[-1]["count"], "3")
         self.assertEqual(self.handle.stop_ack_count, 3)
 
+    def test_send_line_raises_when_port_is_not_open(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "serial port is not open"):
+            self.handle.send_line("START,30")
+
+    def test_start_clears_stale_ttl_before_writing_and_flushes(self) -> None:
+        port = mock.Mock()
+        port.is_open = True
+        self.handle.ser = port
+        self.handle._ttl_seen.set()
+
+        self.handle.send_line("START,30")
+
+        self.assertFalse(self.handle._ttl_seen.is_set())
+        port.write.assert_called_once_with(b"START,30\n")
+        port.flush.assert_called_once_with()
+
+    def test_send_line_raises_when_device_write_fails(self) -> None:
+        port = mock.Mock()
+        port.is_open = True
+        port.write.side_effect = OSError("device disconnected")
+        self.handle.ser = port
+
+        with self.assertRaisesRegex(RuntimeError, "device disconnected"):
+            self.handle.send_line("START,30")
+
+        self.assertTrue(any("write error" in line for line in self.logs))
+
 
 if __name__ == "__main__":
     unittest.main()

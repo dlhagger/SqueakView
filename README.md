@@ -2,7 +2,7 @@
 
 SqueakView is a scientific FLIR capture, behavior logging, and YOLO26 pose
 inference application for the NVIDIA Jetson Orin Nano. The current platform is
-JetPack 7.2, CUDA 13.2, TensorRT 10.16, and DeepStream 9.1 using the
+JetPack 7.2.1, CUDA 13.2, TensorRT 10.16, and DeepStream 9.1 using the
 PyServiceMaker Pipeline API.
 
 The primary validated configuration is one FLIR camera at 1440×1080 and 30 FPS,
@@ -66,17 +66,34 @@ To build and deploy a custom model, place its `.pt` checkpoint and corresponding
 dataset YAML under `build_me/`, then run `build_engine/build_engine.ipynb` to
 generate a device-specific package.
 
+## Jetson device setup
+
+Run the device setup once as the desktop user who will launch SqueakView:
+
+```bash
+bash scripts/setup_jetson.sh
+```
+
+The script installs NVIDIA's Jetson FFmpeg package (including `ffprobe`) and
+the native build prerequisites, builds both the FLIR GStreamer source and the
+DeepStream YOLO parser against the installed CUDA toolkit, and adds that user
+to the `dialout` group for RP2040/USB serial access. It can be launched from any
+working directory. Reboot after it completes because a group change cannot
+affect an already-running login session. Do not run the application itself
+with `sudo`.
+
 ## Platform prerequisites
 
 Install these before setting up the repository:
 
-- JetPack 7.2 with CUDA/TensorRT
+- JetPack 7.2.1 with CUDA/TensorRT
 - NVIDIA DeepStream 9.1 at `/opt/nvidia/deepstream/deepstream`
 - FLIR/Teledyne Spinnaker SDK at `/opt/spinnaker`
-- [Spinnaker for JetPack 7.2](https://teledyne.app.box.com/s/ccj73r4xu8rusbnu12pytcisbexdchfa)
-  is currently distributed as a beta build by Teledyne.
+- [Spinnaker for the JetPack 7.2 series](https://teledyne.app.box.com/s/ccj73r4xu8rusbnu12pytcisbexdchfa)
+  is currently distributed as a beta build by Teledyne and is deployed here on
+  JetPack 7.2.1.
 - GStreamer runtime and development headers
-- Jetson Orin Nano specific install of ffmpeg (sudo apt install ffmpeg)
+- Jetson Orin Nano specific install of FFmpeg (`scripts/setup_jetson.sh` installs it)
 - CMake, a C++ compiler, and `uv`
 
 Typical native-build packages:
@@ -249,8 +266,13 @@ Jetson memory state, `ffprobe`, and Python imports.
 
 DeepStream may print plugin-scanner warnings for unused optional plugins when an
 OpenTelemetry library is absent. They do not affect SqueakView if every required
-element passes preflight. Low contiguous NvMap memory is worth addressing before
-a long run by closing Jupyter/GPU processes or rebooting the Jetson.
+element passes preflight. Preflight reports the current `tegrastats` sample for
+diagnosis. NVIDIA documents its LFB field as an allocator statistic whose largest
+normal block is at most 4 MB, so LFB is not treated as a standalone readiness
+threshold.
+
+See [`docs/REFACTOR_PLAN.md`](docs/REFACTOR_PLAN.md) for the staged JetPack 7.2.1
+and DeepStream 9.1 modernization plan and the scientific recording invariants.
 
 Note: clearing memory cache and setting the jetson to "cool" thermal profiles are
 easily achieved by installing jtop.
@@ -258,8 +280,15 @@ easily achieved by installing jtop.
 ## Launch the operator GUI
 
 ```bash
-uv run squeakview_gui.py
+bash scripts/launch_operator.sh
 ```
+
+This detached launcher is the production path. It keeps the GUI alive if the
+invoking terminal or VS Code process exits and writes its operator log under
+`runs/logs/`. Use `uv run squeakview_gui.py` only for foreground debugging.
+Detachment does not make an internal GUI crash safe: the GUI currently owns the
+serial controller, so moving controller/capture supervision into a dedicated
+service remains a planned architecture change.
 
 Create or select an experiment, select the model config explicitly, configure
 the FLIR camera and optional serial controller, and start the run. Serial
@@ -273,7 +302,7 @@ export SQUEAKVIEW_WORKSPACE=/path/to/SqueakView
 export SQUEAKVIEW_DEEPSTREAM_SDK=/opt/nvidia/deepstream/deepstream
 export SQUEAKVIEW_MODEL_ROOT=/path/to/models
 export SQUEAKVIEW_RUNS_DIR=/path/to/runs
-uv run squeakview_gui.py
+bash scripts/launch_operator.sh
 ```
 
 The GUI launches inference first and reports the run as recording only after the
@@ -368,10 +397,11 @@ Once a run reaches a terminal state, its acquisition, model, Git, and storage
 provenance in `run_manifest.json` is immutable. Later bottle entry updates only
 the bottle summary, artifact inventory, and manifest update timestamp.
 
-During capture and finalization, recovery ledgers (`capture_cam*.jsonl`,
-`record_admission*.csv`, and `inference/`) exist temporarily. They are removed
-only after video validation, reconciliation, and timing alignment pass. A failed
-finalization retains them for diagnosis.
+Source, admission, and inference ledgers (`capture_cam*.jsonl`,
+`record_admission*.csv`, and `inference/`) are retained after successful
+validation as primary scientific provenance. Only transient finalizer progress
+state is cleaned up. This costs additional storage but preserves the evidence
+needed to reproduce frame reconciliation and diagnose a later integrity issue.
 
 The FLIR chunk `FrameID` is stored as `camera_frame_id`. It increments for
 every acquired image. The aligner derives a per-run offset between that hardware

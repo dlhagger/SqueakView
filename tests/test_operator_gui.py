@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,12 +16,64 @@ from squeakview.apps.operator.gui.main_window import (
     _elapsed_text,
     _is_serial_log_message,
     _last_csv_row,
+    _preflight_failure_message,
     _tail_text_line,
 )
+from squeakview.common.log_mirror import LineBufferedLogMirror
 from squeakview.common.profiles import ExperimentProfile, SubjectProfile
 
 
 class RuntimeFileHelpersTest(unittest.TestCase):
+    def test_gui_log_mirror_filters_fragmented_camera_lines_without_blanks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "gui.log"
+            console = io.StringIO()
+            mirror = LineBufferedLogMirror(log_path, console)
+
+            mirror.write("[SER] CAMERA_HIGH,1,2")
+            mirror.write("\n")
+            mirror.write("capture started")
+            mirror.write("\n")
+            mirror.write("[SER] CAMERA_LOW,1,2\n")
+            mirror.flush()
+
+            self.assertEqual(log_path.read_text(), "capture started\n")
+            self.assertEqual(
+                console.getvalue(),
+                "[SER] CAMERA_HIGH,1,2\ncapture started\n[SER] CAMERA_LOW,1,2\n",
+            )
+
+    def test_gui_log_mirror_flushes_an_unterminated_normal_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "gui.log"
+            mirror = LineBufferedLogMirror(log_path, io.StringIO())
+
+            mirror.write("partial diagnostic")
+            mirror.flush()
+
+            self.assertEqual(log_path.read_text(), "partial diagnostic")
+
+    def test_gui_log_mirror_flush_does_not_orphan_camera_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "gui.log"
+            mirror = LineBufferedLogMirror(log_path, io.StringIO())
+
+            mirror.write("[SER] CAMERA_HIGH,1,2")
+            mirror.flush()
+            mirror.write("\nnormal\n")
+            mirror.flush()
+
+            self.assertEqual(log_path.read_text(), "normal\n")
+
+    def test_ffprobe_preflight_failure_has_explicit_install_instructions(self) -> None:
+        message = _preflight_failure_message("[FAIL] FFmpeg/ffprobe is not installed.")
+        self.assertIn("FFmpeg is not installed", message)
+        self.assertIn("sudo apt install ffmpeg", message)
+
+    def test_unknown_preflight_failure_uses_generic_message(self) -> None:
+        message = _preflight_failure_message("[FAIL] something else")
+        self.assertIn("Open Operator Events", message)
+
     def test_elapsed_text_supports_long_runs(self) -> None:
         self.assertEqual(_elapsed_text(16 * 3600 + 2 * 60 + 9), "16:02:09")
 

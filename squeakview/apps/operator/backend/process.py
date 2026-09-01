@@ -181,11 +181,15 @@ class ProcessHandle:
     def is_running(self) -> bool:
         return self.p is not None and self.p.poll() is None
 
-    def wait(self, timeout: float | None = None) -> int | None:
-        try:
-            return int(self.p.wait(timeout=timeout))
-        except Exception:
-            return self.p.poll()
+    def wait(self, timeout: float | None = None) -> int:
+        """Wait for a concrete child exit code.
+
+        ``subprocess.TimeoutExpired`` deliberately propagates.  Returning
+        ``None`` here previously let callers validate MP4/ledger files while
+        the capture child could still be writing them.
+        """
+
+        return int(self.p.wait(timeout=timeout))
 
     def send_signal_group(self, sig: signal.Signals) -> bool:
         try:
@@ -220,6 +224,10 @@ class ProcessHandle:
                 os.killpg(os.getpgid(self.p.pid), signal.SIGKILL)
             except Exception as exc:
                 self.emit(f"{self.name} SIGKILL error: {exc}")
+            try:
+                self.p.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self.emit(f"{self.name} did not exit within 5.0s after SIGKILL")
 
 
 def _should_suppress_child_output(line: str) -> bool:
@@ -311,6 +319,18 @@ def spawn_inference(
     if not config.inference_enabled:
         args.append("--disable-infer")
     extra_env = _deepstream_runtime_env()
+    debug_profile = os.environ.get("SQUEAKVIEW_DEEPSTREAM_DEBUG_PROFILE", "0").lower()
+    if debug_profile in {"1", "true", "yes", "on"}:
+        extra_env.update(
+            {
+                "NVDS_ENABLE_LATENCY_MEASUREMENT": "1",
+                "NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT": "1",
+            }
+        )
+        emit(
+            "【DS】 debug latency profiling enabled; use only for qualification "
+            "until acquisition overhead is validated"
+        )
     if backend == "flir_direct":
         plugin_dir = squeakview_config.FLIR_GST_PLUGIN_DIR
         if plugin_dir.exists():

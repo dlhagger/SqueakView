@@ -130,7 +130,10 @@ class BackendLifecycleTests(unittest.TestCase):
         self.run_dir.mkdir()
         run_context.atomic_write_json(
             self.run_dir / "run_status.json",
-            {"recording_validation": {"passed": True}},
+            {
+                "recording_validation": {"passed": True},
+                "acquisition_integrity": {"passed": True},
+            },
         )
         self.logs: list[str] = []
         self.started: list[bool] = []
@@ -204,6 +207,31 @@ class BackendLifecycleTests(unittest.TestCase):
         self.assertIn("failed_at", status)
         self.assertEqual(len(self.failures), 1)
         self.assertIsNone(self.backend.state.inference)
+        self.backend._run_capture_finalizer.assert_called_once_with(self.run_dir)
+
+    def test_unexpected_exit_still_requires_controller_stop_ack(self) -> None:
+        FakeSerialHandle.instances.clear()
+        with (
+            mock.patch.object(manager.serial_util, "have_pyserial", return_value=True),
+            mock.patch.object(manager.serial_util, "SerialHandle", FakeSerialHandle),
+            mock.patch.object(self.backend._inference_ready, "wait", return_value=True),
+        ):
+            self.assertTrue(
+                self.backend.start_run(
+                    self.config(serial_enabled=True, trigger_on=True)
+                )
+            )
+        serial_handle = FakeSerialHandle.instances[-1]
+        serial_handle.wait_for_stop_ack = mock.Mock(return_value=True)
+        self.handle.running = False
+
+        assert self.exit_callback is not None
+        with mock.patch.object(self.backend, "_wait_for_capture_drain", return_value=True):
+            self.exit_callback(7)
+
+        serial_handle.wait_for_stop_ack.assert_called_once_with(timeout_s=2.0)
+        self.assertIn("CAPTURE_STOP_ACKED", serial_handle.markers)
+        self.assertTrue(serial_handle.closed)
 
     def test_spawn_failure_marks_created_run_failed(self) -> None:
         with mock.patch.object(manager.process, "spawn_inference", side_effect=OSError("spawn denied")):
@@ -302,9 +330,27 @@ class BackendLifecycleTests(unittest.TestCase):
         self.assertEqual(status["state"], "failed")
         self.assertIn("inference exit code 9", status["error"])
 
+    def test_stop_skips_validation_when_capture_exit_is_not_confirmed(self) -> None:
+        self.assertTrue(self.backend.start_run(self.config()))
+        self.handle.wait = mock.Mock(
+            side_effect=subprocess.TimeoutExpired("capture", 2.0)
+        )
+
+        with mock.patch.object(self.backend, "_run_capture_finalizer") as finalizer:
+            self.backend.stop_run()
+
+        finalizer.assert_not_called()
+        status = self.status()
+        self.assertEqual(status["state"], "failed")
+        self.assertIn("did not exit", status["error"])
+
     def test_capture_drain_waits_for_quiet_source_and_admission_ledgers(self) -> None:
-        (self.run_dir / "capture_cam0.jsonl").write_text("{}\n")
-        (self.run_dir / "record_admission.csv").write_text("pts_ns\n")
+        (self.run_dir / "capture_cam0.jsonl").write_text(
+            '{"source_sequence_index": 122}\n'
+        )
+        (self.run_dir / "record_admission.csv").write_text(
+            "stream_id,record_frame_index,pts_ns\n0,122,100\n"
+        )
         self.backend.launch_cfg = self.config(num_cameras=1)
 
         with mock.patch.dict(
@@ -322,6 +368,30 @@ class BackendLifecycleTests(unittest.TestCase):
         status = self.status()
         self.assertEqual(status["state"], "capture_drained")
         self.assertEqual(status["expected_ttl_count"], 123)
+        self.assertEqual(status["ledger_frame_counts"], [123, 123])
+
+    def test_capture_drain_does_not_accept_quiet_ledgers_below_ttl_count(self) -> None:
+        (self.run_dir / "capture_cam0.jsonl").write_text(
+            '{"source_sequence_index": 0}\n'
+        )
+        (self.run_dir / "record_admission.csv").write_text(
+            "stream_id,record_frame_index,pts_ns\n0,0,100\n"
+        )
+        self.backend.launch_cfg = self.config(num_cameras=1)
+
+        with mock.patch.dict(
+            manager.os.environ,
+            {
+                "SQUEAKVIEW_CAPTURE_DRAIN_QUIET_S": "0.1",
+                "SQUEAKVIEW_CAPTURE_DRAIN_TIMEOUT_S": "0.2",
+            },
+        ):
+            drained = self.backend._wait_for_capture_drain(
+                self.run_dir, expected_ttl_count=2
+            )
+
+        self.assertFalse(drained)
+        self.assertEqual(self.status()["state"], "capture_drain_timeout")
 
     def test_stop_marks_failed_when_independent_finalizer_fails(self) -> None:
         self.assertTrue(self.backend.start_run(self.config()))
@@ -355,6 +425,87 @@ class BackendLifecycleTests(unittest.TestCase):
         self.assertEqual(self.status()["state"], "failed")
         self.assertIn("controller was not started", self.status()["error"])
 
+    def test_requested_serial_fails_closed_when_pyserial_is_unavailable(self) -> None:
+        with mock.patch.object(manager.serial_util, "have_pyserial", return_value=False):
+            result = self.backend.start_run(self.config(serial_enabled=True))
+
+        self.assertFalse(result)
+        self.assertTrue(self.backend.launch_cfg.serial_enabled)
+        self.assertIsNone(self.backend.state.inference)
+        status = self.status()
+        self.assertEqual(status["state"], "failed")
+        self.assertIn("pyserial is not installed", status["error"])
+        self.assertEqual(self.failures, [status["error"]])
+
+    def test_controller_start_write_failure_aborts_before_start_sent_marker(self) -> None:
+        FakeSerialHandle.instances.clear()
+        serial_handle = FakeSerialHandle("/dev/test", 115200, self.logs.append)
+
+        def send_line(line: str) -> None:
+            if line.startswith("START,"):
+                raise RuntimeError("USB write failed")
+            serial_handle.sent.append(line)
+
+        serial_handle.send_line = send_line
+        with (
+            mock.patch.object(manager.serial_util, "have_pyserial", return_value=True),
+            mock.patch.object(manager.serial_util, "SerialHandle", return_value=serial_handle),
+            mock.patch.object(self.backend._inference_ready, "wait", return_value=True),
+        ):
+            result = self.backend.start_run(
+                self.config(serial_enabled=True, trigger_on=True)
+            )
+
+        self.assertFalse(result)
+        self.assertNotIn("START_SENT", serial_handle.markers)
+        self.assertIn("STOP", serial_handle.sent)
+        self.assertTrue(serial_handle.closed)
+        status = self.status()
+        self.assertEqual(status["state"], "failed")
+        self.assertIn("USB write failed", status["error"])
+
+    def test_missing_first_ttl_aborts_triggered_run(self) -> None:
+        FakeSerialHandle.instances.clear()
+        with (
+            mock.patch.object(manager.serial_util, "have_pyserial", return_value=True),
+            mock.patch.object(manager.serial_util, "SerialHandle", FakeSerialHandle),
+            mock.patch.object(self.backend._inference_ready, "wait", return_value=True),
+            mock.patch.object(FakeSerialHandle, "wait_for_ttl", return_value=False),
+        ):
+            result = self.backend.start_run(
+                self.config(serial_enabled=True, trigger_on=True)
+            )
+
+        self.assertFalse(result)
+        serial_handle = FakeSerialHandle.instances[-1]
+        self.assertTrue(any(line.startswith("START,") for line in serial_handle.sent))
+        self.assertIn("START_SENT", serial_handle.markers)
+        self.assertIn("START_TTL_TIMEOUT", serial_handle.markers)
+        self.assertIn("STOP", serial_handle.sent)
+        self.assertTrue(serial_handle.closed)
+        status = self.status()
+        self.assertEqual(status["state"], "failed")
+        self.assertIn("no camera TTL was detected", status["error"])
+
+    def test_successful_controller_handshake_starts_triggered_run(self) -> None:
+        FakeSerialHandle.instances.clear()
+        with (
+            mock.patch.object(manager.serial_util, "have_pyserial", return_value=True),
+            mock.patch.object(manager.serial_util, "SerialHandle", FakeSerialHandle),
+            mock.patch.object(self.backend._inference_ready, "wait", return_value=True),
+        ):
+            result = self.backend.start_run(
+                self.config(serial_enabled=True, trigger_on=True)
+            )
+
+        self.assertTrue(result)
+        serial_handle = FakeSerialHandle.instances[-1]
+        self.assertIn("START,30", serial_handle.sent)
+        self.assertIn("START_SENT", serial_handle.markers)
+        self.assertNotIn("START_TTL_TIMEOUT", serial_handle.markers)
+        self.assertFalse(serial_handle.closed)
+        self.assertIs(self.backend.state.inference, self.handle)
+
     def test_serial_permission_error_is_preserved_for_gui(self) -> None:
         denied_handle = mock.Mock()
         denied_handle.open.return_value = False
@@ -378,6 +529,14 @@ class BackendLifecycleTests(unittest.TestCase):
 
 
 class ProcessHandleTests(unittest.TestCase):
+    def test_wait_does_not_convert_timeout_into_unknown_success(self) -> None:
+        handle = process.ProcessHandle.__new__(process.ProcessHandle)
+        handle.p = mock.Mock()
+        handle.p.wait.side_effect = subprocess.TimeoutExpired("capture", 1.0)
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            handle.wait(timeout=1.0)
+
     def test_preview_socket_paths_are_short_unique_and_per_camera(self) -> None:
         paths = process.preview_socket_paths(
             Path("/a/very/long/run/directory/that/cannot/be/a/unix/socket/path"),
@@ -408,6 +567,29 @@ class ProcessHandleTests(unittest.TestCase):
         self.assertEqual(args.count("--preview-socket"), 2)
         for socket_path in process.preview_socket_paths(root, 2):
             self.assertIn(str(socket_path), args)
+
+    def test_debug_profile_enables_nvidia_latency_environment(self) -> None:
+        cfg = process.LaunchConfig(
+            ds_cfg=None,
+            inference_enabled=False,
+            run_dir=Path("/tmp/squeakview-profile-test"),
+        )
+        logs: list[str] = []
+        with (
+            mock.patch.dict(
+                process.os.environ,
+                {"SQUEAKVIEW_DEEPSTREAM_DEBUG_PROFILE": "1"},
+            ),
+            mock.patch.object(process, "_spawn", return_value=object()) as spawn,
+        ):
+            process.spawn_inference(cfg, logs.append)
+
+        extra_env = spawn.call_args.kwargs["extra_env"]
+        self.assertEqual(extra_env["NVDS_ENABLE_LATENCY_MEASUREMENT"], "1")
+        self.assertEqual(
+            extra_env["NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT"], "1"
+        )
+        self.assertTrue(any("debug latency profiling enabled" in line for line in logs))
 
     def test_exit_callback_receives_child_return_code(self) -> None:
         exited = threading.Event()

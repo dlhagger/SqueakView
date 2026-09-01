@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import atexit
-from collections import OrderedDict
 import csv
 import ctypes
 import json
@@ -16,7 +15,6 @@ from pathlib import Path
 from typing import Callable
 
 from pyservicemaker import (
-    BufferOperator,
     BatchMetadataOperator,
     EOSMessage,
     Pipeline,
@@ -26,18 +24,26 @@ from pyservicemaker import (
 )
 
 from squeakview.common import run_context
+from squeakview.common.capture_policy import (
+    capture_buffer_policy,
+    leaky_inference_queue_properties,
+    non_leaky_record_queue_properties,
+)
 from .pose_pipeline import (
     FramePoseStore,
     ObservationOperator,
     Yolo26PoseTensorOperator,
     load_pose_schema,
 )
+from .recording import (
+    RecordingAdmissionOperator,
+    RecordingEgressOperator,
+    RecordingIngressOperator,
+    RecordingPathTelemetry,
+)
 
 
 FLIR_FRAME_META_DESCRIPTOR = b"SQUEAKVIEW.FLIR.FRAME_META.v1"
-RECORD_QUEUE_SECONDS = 4
-RECORD_BACKPRESSURE_WARNING_SECONDS = 1
-RECORD_BACKPRESSURE_FATAL_SECONDS = 3
 
 
 def _user_meta_type(descriptor: bytes) -> int:
@@ -66,6 +72,15 @@ def _flir_frame_meta_type() -> int:
 
 def ts() -> str:
     return time.strftime("%H:%M:%S")
+
+
+def _safe_print(message: str) -> None:
+    """Best-effort child logging that cannot break capture shutdown."""
+
+    try:
+        print(message, flush=True)
+    except (BrokenPipeError, OSError):
+        pass
 
 
 @dataclass(slots=True)
@@ -157,277 +172,6 @@ def _validate_config(config: InferenceConfig) -> None:
         )
 
 
-class RecordingAdmissionOperator(BufferOperator):
-    """Durably record buffers that enter the non-leaky recording branch."""
-
-    HEADERS = ["stream_id", "record_frame_index", "pts_ns", "observer_monotonic_ns"]
-
-    def __init__(
-        self,
-        path: Path,
-        stream_id: int,
-        telemetry: "RecordingPathTelemetry | None" = None,
-    ):
-        super().__init__()
-        self.path = path
-        self.stream_id = int(stream_id)
-        self._file = path.open("w", newline="", buffering=1)
-        self._writer = csv.writer(self._file)
-        self._writer.writerow(self.HEADERS)
-        self._count = 0
-        self._lock = threading.Lock()
-        self._closed = False
-        self._telemetry = telemetry
-        atexit.register(self.close)
-
-    def handle_buffer(self, buffer) -> bool:
-        with self._lock:
-            if self._closed:
-                return False
-            self._writer.writerow(
-                [self.stream_id, self._count, int(buffer.timestamp), time.monotonic_ns()]
-            )
-            if self._telemetry is not None:
-                self._telemetry.admit(int(buffer.timestamp))
-            self._count += 1
-        return True
-
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._file.flush()
-            self._file.close()
-
-
-class RecordingPathTelemetry:
-    """Sample recording backlog and encoder latency with bounded state."""
-
-    HEADERS = [
-        "host_unix_ns",
-        "host_monotonic_ns",
-        "stream_id",
-        "event",
-        "pts_ns",
-        "egress_timestamp_ns",
-        "encoder_correlation",
-        "queue_wait_ms",
-        "encoder_latency_ms",
-        "waiting_for_record_admission",
-        "encoder_in_flight",
-        "max_waiting_since_sample",
-        "max_encoder_in_flight_since_sample",
-        "pending_evictions",
-    ]
-
-    def __init__(
-        self,
-        path: Path,
-        stream_id: int,
-        *,
-        sample_interval_s: float = 1.0,
-        warning_depth: int = 24,
-        fatal_depth: int | None = None,
-        max_pending: int = 4096,
-        on_fatal: Callable[[str], None] | None = None,
-    ):
-        self.path = path
-        self.stream_id = int(stream_id)
-        self.sample_interval_ns = max(1, int(sample_interval_s * 1_000_000_000))
-        self.warning_depth = max(1, int(warning_depth))
-        self.fatal_depth = (
-            max(self.warning_depth + 1, int(fatal_depth))
-            if fatal_depth is not None
-            else None
-        )
-        self.max_pending = max(self.warning_depth, int(max_pending))
-        self.on_fatal = on_fatal
-        self._file = path.open("w", newline="", buffering=1)
-        self._writer = csv.writer(self._file)
-        self._writer.writerow(self.HEADERS)
-        self._source_pending: OrderedDict[int, int] = OrderedDict()
-        self._pending: OrderedDict[int, int] = OrderedDict()
-        self._lock = threading.Lock()
-        self._last_sample_ns = time.monotonic_ns()
-        self._max_source_depth = 0
-        self._max_encoder_depth = 0
-        self._evictions = 0
-        self._warning_active = False
-        self._fatal_reported = False
-        self._closed = False
-        atexit.register(self.close)
-
-    def _write(
-        self,
-        event: str,
-        now_ns: int,
-        pts_ns: int | str,
-        egress_timestamp_ns="",
-        encoder_correlation="",
-        queue_wait_ms="",
-        encoder_latency_ms="",
-    ) -> None:
-        self._writer.writerow(
-            [
-                time.time_ns(),
-                now_ns,
-                self.stream_id,
-                event,
-                pts_ns,
-                egress_timestamp_ns,
-                encoder_correlation,
-                queue_wait_ms,
-                encoder_latency_ms,
-                len(self._source_pending),
-                len(self._pending),
-                self._max_source_depth,
-                self._max_encoder_depth,
-                self._evictions,
-            ]
-        )
-
-    def _sample_if_due(
-        self,
-        now_ns: int,
-        pts_ns: int,
-        queue_wait_ms="",
-        encoder_latency_ms="",
-        egress_timestamp_ns="",
-        encoder_correlation="",
-    ) -> str | None:
-        source_depth = len(self._source_pending)
-        encoder_depth = len(self._pending)
-        self._max_source_depth = max(self._max_source_depth, source_depth)
-        self._max_encoder_depth = max(self._max_encoder_depth, encoder_depth)
-        warning = max(source_depth, encoder_depth) >= self.warning_depth
-        if warning != self._warning_active:
-            self._warning_active = warning
-            self._write(
-                "backpressure_enter" if warning else "backpressure_exit",
-                now_ns,
-                pts_ns,
-                egress_timestamp_ns,
-                encoder_correlation,
-                queue_wait_ms,
-                encoder_latency_ms,
-            )
-        fatal_message = None
-        if (
-            self.fatal_depth is not None
-            and source_depth >= self.fatal_depth
-            and not self._fatal_reported
-        ):
-            self._fatal_reported = True
-            fatal_message = (
-                f"recording queue backlog reached {source_depth} frames "
-                f"(fatal threshold {self.fatal_depth}) on stream {self.stream_id}"
-            )
-            self._write("backpressure_fatal", now_ns, pts_ns)
-        if now_ns - self._last_sample_ns >= self.sample_interval_ns:
-            self._write(
-                "sample",
-                now_ns,
-                pts_ns,
-                egress_timestamp_ns,
-                encoder_correlation,
-                queue_wait_ms,
-                encoder_latency_ms,
-            )
-            self._last_sample_ns = now_ns
-            self._max_source_depth = source_depth
-            self._max_encoder_depth = encoder_depth
-        return fatal_message
-
-    def source(self, pts_ns: int) -> None:
-        now_ns = time.monotonic_ns()
-        fatal_message = None
-        with self._lock:
-            if self._closed:
-                return
-            self._source_pending[int(pts_ns)] = now_ns
-            while len(self._source_pending) > self.max_pending:
-                self._source_pending.popitem(last=False)
-                self._evictions += 1
-            fatal_message = self._sample_if_due(now_ns, int(pts_ns))
-        if fatal_message is not None and self.on_fatal is not None:
-            self.on_fatal(fatal_message)
-
-    def admit(self, pts_ns: int) -> None:
-        now_ns = time.monotonic_ns()
-        with self._lock:
-            if self._closed:
-                return
-            source_ns = self._source_pending.pop(int(pts_ns), None)
-            queue_wait_ms = (
-                f"{(now_ns - source_ns) / 1_000_000.0:.6f}"
-                if source_ns is not None
-                else ""
-            )
-            self._pending[int(pts_ns)] = now_ns
-            while len(self._pending) > self.max_pending:
-                self._pending.popitem(last=False)
-                self._evictions += 1
-            self._sample_if_due(now_ns, int(pts_ns), queue_wait_ms=queue_wait_ms)
-
-    def egress(self, egress_timestamp_ns: int) -> None:
-        now_ns = time.monotonic_ns()
-        with self._lock:
-            if self._closed:
-                return
-            output_timestamp = int(egress_timestamp_ns)
-            input_pts_ns = output_timestamp
-            admitted_ns = self._pending.pop(output_timestamp, None)
-            correlation = "pts" if admitted_ns is not None else ""
-            if admitted_ns is None and self._pending:
-                # x264 is configured with bframes=0 and both lookaheads at 0,
-                # so encoded access units retain input order even when the
-                # parser exposes a rewritten timestamp through ServiceMaker.
-                input_pts_ns, admitted_ns = self._pending.popitem(last=False)
-                correlation = "fifo"
-            elif admitted_ns is None:
-                correlation = "unmatched"
-            encoder_latency_ms = (
-                f"{(now_ns - admitted_ns) / 1_000_000.0:.6f}"
-                if admitted_ns is not None
-                else ""
-            )
-            self._sample_if_due(
-                now_ns,
-                input_pts_ns,
-                encoder_latency_ms=encoder_latency_ms,
-                egress_timestamp_ns=output_timestamp,
-                encoder_correlation=correlation,
-            )
-
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._write("closed", time.monotonic_ns(), "")
-            self._file.flush()
-            self._file.close()
-
-
-class RecordingEgressOperator(BufferOperator):
-    def __init__(self, telemetry: RecordingPathTelemetry):
-        super().__init__()
-        self.telemetry = telemetry
-
-    def handle_buffer(self, buffer) -> bool:
-        self.telemetry.egress(int(buffer.timestamp))
-        return True
-
-
-class RecordingIngressOperator(BufferOperator):
-    def __init__(self, telemetry: RecordingPathTelemetry):
-        super().__init__()
-        self.telemetry = telemetry
-
-    def handle_buffer(self, buffer) -> bool:
-        self.telemetry.source(int(buffer.timestamp))
-        return True
 
 
 class FrameCsvOperator(BatchMetadataOperator):
@@ -789,8 +533,8 @@ class ServiceMakerApp:
     def _recording_fault(self, message: str) -> None:
         if self.exit_code == 0:
             self.exit_code = 4
-            print(f"[{ts()}] [RECORD] FATAL: {message}", flush=True)
         self._stop_event.set()
+        _safe_print(f"[{ts()}] [RECORD] FATAL: {message}")
 
     def _prewarm_cuda(self) -> None:
         if not self.config.enable_infer:
@@ -884,6 +628,7 @@ class ServiceMakerApp:
 
     def _camera_properties(self, index: int) -> dict[str, object]:
         cfg = self.config
+        buffer_policy = capture_buffer_policy(cfg.fps)
         properties: dict[str, object] = {
             "camera-index": index,
             "width": int(cfg.width),
@@ -898,7 +643,7 @@ class ServiceMakerApp:
             "gain": -1.0 if cfg.gain is None else float(cfg.gain),
             "drop-incomplete": False,
             "buffer-handling": "OldestFirst",
-            "stream-buffer-count": max(64, int(cfg.fps) * 2),
+            "stream-buffer-count": buffer_policy.source_transport_buffers,
             "capture-log-path": str(self.run_dir / f"capture_cam{index}.jsonl"),
             "metadata-profile": "scientific",
             "max-consecutive-timeouts": 0 if cfg.trigger_on else 10,
@@ -909,6 +654,7 @@ class ServiceMakerApp:
 
     def _add_camera(self, pipeline: Pipeline, index: int) -> None:
         cfg = self.config
+        buffer_policy = capture_buffer_policy(cfg.fps)
         source = f"flirsrc{index}"
         source_caps = f"source_caps{index}"
         tee = f"camera_tee{index}"
@@ -933,11 +679,7 @@ class ServiceMakerApp:
         pipeline.add(
             "queue",
             record_queue,
-            {
-                "max-size-buffers": max(120, int(cfg.fps) * RECORD_QUEUE_SECONDS),
-                "max-size-bytes": 0,
-                "max-size-time": 0,
-            },
+            non_leaky_record_queue_properties(buffer_policy),
         )
         admission_path = (
             self.run_dir / "record_admission.csv"
@@ -951,8 +693,8 @@ class ServiceMakerApp:
         telemetry = RecordingPathTelemetry(
             telemetry_path,
             index,
-            warning_depth=max(24, int(cfg.fps) * RECORD_BACKPRESSURE_WARNING_SECONDS),
-            fatal_depth=max(90, int(cfg.fps) * RECORD_BACKPRESSURE_FATAL_SECONDS),
+            warning_depth=buffer_policy.record_warning_frames,
+            fatal_depth=buffer_policy.record_failure_frames,
             on_fatal=self._recording_fault,
         )
         self.record_telemetry.append(telemetry)
@@ -978,6 +720,7 @@ class ServiceMakerApp:
                 "sync-lookahead": 0,
                 "sliced-threads": False,
                 "vbv-buf-capacity": 100,
+                "qos": False,
             },
         )
         pipeline.add("h264parse", f"record_parser{index}")
@@ -988,7 +731,11 @@ class ServiceMakerApp:
             ),
         )
         pipeline.add("mp4mux", f"record_muxer{index}")
-        pipeline.add("filesink", f"record_sink{index}", {"location": str(raw_path)})
+        pipeline.add(
+            "filesink",
+            f"record_sink{index}",
+            {"location": str(raw_path), "qos": False, "sync": False},
+        )
         pipeline.link(
             tee,
             record_queue,
@@ -1001,12 +748,7 @@ class ServiceMakerApp:
         pipeline.add(
             "queue",
             infer_queue,
-            {
-                "max-size-buffers": 32,
-                "max-size-bytes": 0,
-                "max-size-time": 0,
-                "leaky": 2,
-            },
+            leaky_inference_queue_properties(buffer_policy),
         )
         pipeline.add("nvvideoconvert", f"infer_convert{index}", {"compute-hw": 2, "copy-hw": 2})
         pipeline.add(
@@ -1178,12 +920,18 @@ class ServiceMakerApp:
         if self._stopped:
             return
         self._stopped = True
+        pipeline_close_error: str | None = None
         if self.pipeline is not None:
             try:
                 self.pipeline.stop()
                 self.pipeline.wait()
-            except Exception:
+            except Exception as exc:
                 self.exit_code = 1
+                pipeline_close_error = f"{type(exc).__name__}: {exc}"
+                _safe_print(
+                    f"[{ts()}] [RECORD] ERROR closing capture pipeline: "
+                    f"{pipeline_close_error}"
+                )
         if self.observations is not None:
             self.observations.close()
         for admission in self.record_admissions:
@@ -1197,23 +945,23 @@ class ServiceMakerApp:
                 self.run_dir,
                 "capture_closed",
                 capture_exit_code=self.exit_code,
+                capture_close_error=pipeline_close_error,
             )
         except Exception as exc:
             self.exit_code = 1
-            print(f"[{ts()}] [RECORD] ERROR marking capture closed: {exc}", flush=True)
+            _safe_print(f"[{ts()}] [RECORD] ERROR marking capture closed: {exc}")
 
-        print(
-            f"[{ts()}] [CAPTURE] closed; post-run audit is handled independently",
-            flush=True,
+        _safe_print(
+            f"[{ts()}] [CAPTURE] closed; post-run audit is handled independently"
         )
-        print(f"[{ts()}] [INFO] done. Files in: {self.run_dir}", flush=True)
+        _safe_print(f"[{ts()}] [INFO] done. Files in: {self.run_dir}")
 
 def run(config: InferenceConfig) -> int:
     app = ServiceMakerApp(config)
 
     def _handle_signal(sig_num, _frame) -> None:
-        print(f"[{ts()}] [SIG] {signal.Signals(sig_num).name}; stopping", flush=True)
         app.request_stop()
+        _safe_print(f"[{ts()}] [SIG] {signal.Signals(sig_num).name}; stopping")
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)

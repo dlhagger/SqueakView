@@ -103,6 +103,20 @@ def _is_serial_log_message(message: str) -> bool:
     return any(marker in message for marker in ("【SER】", "【SER→】", "[SER]"))
 
 
+def _preflight_failure_message(output: str) -> str:
+    """Turn known preflight failures into an actionable GUI explanation."""
+    lowered = output.lower()
+    if "ffmpeg/ffprobe is not installed" in lowered or "command -v ffprobe" in lowered:
+        return (
+            "FFmpeg is not installed, so SqueakView cannot validate the recorded video.\n\n"
+            "Open a terminal and run:\n"
+            "sudo apt install ffmpeg\n\n"
+            "Then start the run again. You can also run scripts/setup_jetson.sh to install "
+            "FFmpeg and configure serial-port access together."
+        )
+    return "System preflight failed. Open Operator Events for the failed check."
+
+
 class PreviewWidget(QtWidgets.QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -301,6 +315,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_start_config: process.LaunchConfig | None = None
         self._close_after_start = False
         self._start_failure_reported = False
+        self._preflight_error_message = "System preflight failed. Open Operator Events for the failed check."
         self._stop_in_progress = False
         self._stop_thread: threading.Thread | None = None
         self._close_after_stop = False
@@ -1428,6 +1443,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- Actions --------------------------------------------------------
     def _run_preflight(self) -> bool:
+        self._preflight_error_message = "System preflight failed. Open Operator Events for the failed check."
         if os.environ.get("SQUEAKVIEW_SKIP_PREFLIGHT") == "1":
             self._emit_log("[GUI] Preflight skipped via SQUEAKVIEW_SKIP_PREFLIGHT=1")
             return True
@@ -1477,6 +1493,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if output:
             for line in output.splitlines():
                 self._emit_log(f"[PREFLIGHT] {line}")
+        self._preflight_error_message = _preflight_failure_message(output)
         return False
 
     def _on_configure(self) -> None:
@@ -1550,9 +1567,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def _worker() -> None:
             try:
                 if not self._run_preflight():
-                    self.start_error.emit(
-                        "System preflight failed. Open Operator Events for the failed check."
-                    )
+                    self.start_error.emit(self._preflight_error_message)
                     return
                 if not self.backend.start_run(config):
                     self.start_error.emit("The backend did not start the run. Check Operator Events for details.")
