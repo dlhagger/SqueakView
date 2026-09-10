@@ -84,6 +84,12 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
   records it separately from the device chunk frame ID.
 - Sets `GstBuffer.pts` from the absolute camera timestamp normalized to the
   first frame, with explicit host-monotonic fallback provenance.
+- Only when `NVDS_ENABLE_LATENCY_MEASUREMENT` has a recognized truthy value
+  (`1`, `true`, `yes`, or `on`, case-insensitive), adds NVIDIA reference-timestamp
+  metadata immediately after PTS/DTS using the actual source element name and
+  the acquisition-local `source_sequence_index`. The public NVIDIA API returns
+  no status; debug qualification therefore still requires emitted latency/FPS
+  evidence. With the variable unset or false, no reference metadata is added.
 - Attaches `SQUEAKVIEW.FLIR.FRAME_META.v1` before `nvstreammux`. DeepStream
   transforms it to frame-level `NvDsUserMeta` for inference admission auditing.
 - Writes the same payload to `capture-log-path` as line-delimited JSON before

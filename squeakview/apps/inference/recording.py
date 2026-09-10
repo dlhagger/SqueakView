@@ -4,12 +4,23 @@ from __future__ import annotations
 import atexit
 from collections import OrderedDict
 import csv
+from dataclasses import dataclass
 import threading
 import time
 from pathlib import Path
 from typing import Callable
 
 from pyservicemaker import BufferOperator
+
+
+@dataclass(frozen=True, slots=True)
+class RecordingActivity:
+    source_count: int
+    admission_count: int
+    egress_count: int
+    last_source_monotonic_ns: int | None
+    last_admission_monotonic_ns: int | None
+    last_egress_monotonic_ns: int | None
 
 
 class RecordingAdmissionOperator(BufferOperator):
@@ -26,6 +37,8 @@ class RecordingAdmissionOperator(BufferOperator):
         super().__init__()
         self.path = path
         self.stream_id = int(stream_id)
+        # The operator-side drain coordinator tails this ledger before capture
+        # shutdown, so every completed row must be visible immediately.
         self._file = path.open("w", newline="", buffering=1)
         self._writer = csv.writer(self._file)
         self._writer.writerow(self.HEADERS)
@@ -54,6 +67,29 @@ class RecordingAdmissionOperator(BufferOperator):
             self._closed = True
             self._file.flush()
             self._file.close()
+
+
+class RecordingStallOperator(BufferOperator):
+    """Qualification-only deterministic delay after an exact frame count."""
+
+    def __init__(
+        self,
+        after_frames: int,
+        delay_us: int,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        super().__init__()
+        self.after_frames = max(1, int(after_frames))
+        self.delay_s = max(1, int(delay_us)) / 1_000_000.0
+        self._sleep = sleep
+        self._count = 0
+
+    def handle_buffer(self, _buffer) -> bool:
+        if self._count >= self.after_frames:
+            self._sleep(self.delay_s)
+        self._count += 1
+        return True
 
 
 class RecordingPathTelemetry:
@@ -98,6 +134,8 @@ class RecordingPathTelemetry:
         )
         self.max_pending = max(self.warning_depth, int(max_pending))
         self.on_fatal = on_fatal
+        # The GUI tails this low-rate telemetry during acquisition. Keep rows
+        # visible without waiting for the capture child to close the file.
         self._file = path.open("w", newline="", buffering=1)
         self._writer = csv.writer(self._file)
         self._writer.writerow(self.HEADERS)
@@ -111,7 +149,24 @@ class RecordingPathTelemetry:
         self._warning_active = False
         self._fatal_reported = False
         self._closed = False
+        self._source_count = 0
+        self._admission_count = 0
+        self._egress_count = 0
+        self._last_source_ns: int | None = None
+        self._last_admission_ns: int | None = None
+        self._last_egress_ns: int | None = None
         atexit.register(self.close)
+
+    def activity(self) -> RecordingActivity:
+        with self._lock:
+            return RecordingActivity(
+                source_count=self._source_count,
+                admission_count=self._admission_count,
+                egress_count=self._egress_count,
+                last_source_monotonic_ns=self._last_source_ns,
+                last_admission_monotonic_ns=self._last_admission_ns,
+                last_egress_monotonic_ns=self._last_egress_ns,
+            )
 
     def _write(
         self,
@@ -200,6 +255,8 @@ class RecordingPathTelemetry:
         with self._lock:
             if self._closed:
                 return
+            self._source_count += 1
+            self._last_source_ns = now_ns
             self._source_pending[int(pts_ns)] = now_ns
             while len(self._source_pending) > self.max_pending:
                 self._source_pending.popitem(last=False)
@@ -213,6 +270,8 @@ class RecordingPathTelemetry:
         with self._lock:
             if self._closed:
                 return
+            self._admission_count += 1
+            self._last_admission_ns = now_ns
             source_ns = self._source_pending.pop(int(pts_ns), None)
             queue_wait_ms = (
                 f"{(now_ns - source_ns) / 1_000_000.0:.6f}"
@@ -230,6 +289,8 @@ class RecordingPathTelemetry:
         with self._lock:
             if self._closed:
                 return
+            self._egress_count += 1
+            self._last_egress_ns = now_ns
             output_timestamp = int(egress_timestamp_ns)
             input_pts_ns = output_timestamp
             admitted_ns = self._pending.pop(output_timestamp, None)

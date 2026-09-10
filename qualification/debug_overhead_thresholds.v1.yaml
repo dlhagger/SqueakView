@@ -1,0 +1,31 @@
+schema_version: "1.0"
+profile_id: orin-nano-super-jp721-debug-overhead-measurement-v1
+approved: false
+description: >-
+  Measurement-only template. Populate reviewed finite nonnegative bounds from
+  matched debug-off/debug-on runs, assign a new versioned profile_id, and set
+  approved to true only after scientific review. An approved metric must retain
+  at least one non-null bound.
+
+metrics:
+  recording.queue_wait_ms:
+    max_increase:
+    max_percent_increase:
+  recording.encoder_latency_ms:
+    max_increase:
+    max_percent_increase:
+  recording.encoder_in_flight:
+    max_increase:
+    max_percent_increase:
+  system.cpu_util_mean_pct:
+    max_increase:
+    max_percent_increase:
+  system.gpu_util_pct:
+    max_increase:
+    max_percent_increase:
+  system.temp_max_c:
+    max_increase:
+    max_percent_increase:
+  system.vdd_in_current_mw:
+    max_increase:
+    max_percent_increase:

@@ -30,23 +30,92 @@ flirspinsrc -> GRAY8 -> tee -> non-leaky record queue -> x264enc -> MP4
 - Pipeline changes are accepted only after unit tests, failure-injection tests,
   an on-device short run, and a sustained on-device validation run.
 
-Frame completeness and pixel fidelity are separate requirements. The current
+Frame completeness and pixel fidelity are separate requirements. This project's
+scientific requirement is complete temporal sampling; lossy pixel encoding is
+an accepted, explicit constraint. The current
 bitrate-controlled H.264 recording can contain every camera frame while still
-being lossy at the pixel level. NVIDIA documents `qp=0` as the libx264 lossless
-setting. Do not silently redefine the scientific format: first document whether
-an experiment requires complete temporal sampling, lossless pixels, or both.
-If lossless pixels are required, introduce an explicit lossless/raw profile and
-validate CPU throughput, storage bandwidth, file size, decoding, and ledger
-reconciliation before production use.
+being lossy at the pixel level. Do not silently replace it with a lossless/raw
+profile or segmented recording. Any future change to that decision requires a
+new explicit scientific requirement and a separately qualified format.
 
 ## Stage 0: freeze behavior and evidence
 
-Status: in progress. The shared capture policy, explicit non-leaky queue/QoS
+Status: repository implementation complete; hardware qualification remains in
+progress. The shared capture policy, explicit non-leaky queue/QoS
 contract, strict ledger parsers, nonzero recording validation, retained source
 provenance, controller handshake, process-exit gate, device/native-binary
-identity, and concurrent atomic metadata writes are implemented and covered by
-the automated suite. Failure-injection and sustained hardware qualification
-remain open.
+identity, concurrent atomic metadata writes, fail-closed serial/metadata I/O,
+and restart-safe artifact promotion are implemented. Versioned failure plans
+are rejected unless the explicit qualification gate is enabled, label the run
+non-production, and have been exercised during local development on-device at
+the source, recording
+queue, encoder, muxer, filesink, and physical disk-write boundaries. The source
+fault after 12 frames returned nonzero with exactly 12 source, admission, and
+MP4 frames. Encoder, muxer, and filesink faults returned nonzero and left the
+container explicitly invalid. The immediate-only `/dev/full` sink
+(`filesink/disk_full` with the required `after_frames: 1` sentinel) produced a
+propagated `No space left` error and nonzero close; it does not represent one
+successfully written frame before exhaustion. The 250 ms queue stall reached the
+90-frame fatal backlog threshold with zero telemetry evictions and exited with
+code 4 under application control; native drain is deliberately bypassed after
+this already-invalid integrity failure because the blocked Service Maker stop
+call can retain the Python runtime indefinitely. Explicitly gated serial read,
+write, and ledger-write injection plus controller-ACK, capture-exit, and
+finalizer-timeout shutdown injection are implemented and unit-tested; their
+on-device qualification, hard-power-loss testing, and sustained hardware
+qualification remain open.
+
+Those numerical fault-injection observations are operator-reported development
+notes. Their raw run directories are not committed and do not count as retained
+qualification evidence. Repeat them under the checked-in protocol and retain
+immutable run IDs, report hashes, and archive location for release qualification.
+
+Triggered, serial-enabled acquisition now makes controller/camera alignment mandatory;
+the former `SQUEAKVIEW_AUTO_ALIGN=0` escape hatch cannot turn a run into a
+successful final state without alignment evidence. Model provenance hashes the
+portable manifest, pose sidecar, ONNX source, DeepStream configuration, and
+generated engine independently. Runtime preparation additionally binds the
+exact localized config/pose schema/class labels/keypoint labels plus the
+package ONNX, engine, and selected parser; all seven are rehashed before spawn
+and again at structured model-loaded readiness before a triggered `START`.
+Run-local effective files are included in qualification source evidence, and a
+missing, divergent, or modified effective-runtime identity fails qualification.
+Device provenance records the installed
+JetPack/L4T/DeepStream/CUDA/cuDNN/TensorRT package versions when available.
+
+Qualification requires a clean commit, complete required component package
+versions, and size/SHA-256 identities for the native FLIR and inference plugins.
+The `nvidia-jetpack` convenience meta-package is optional when its component
+packages provide exact evidence. The durable backend owns preflight, so direct
+IPC cannot bypass it; matched hashed status/manifest evidence must prove an
+actual GOP-sized H.264 decode through Jetson's explicit `nvv4l2decoder`
+path, FFmpeg/FFprobe fallback availability, and disabled automatic AC suspend.
+The short hardware-decoder exercise runs before every recording; readiness
+evidence is never reused across scientific runs. The exact FFmpeg package
+version is part of required platform provenance. The selected task YAML is
+copied atomically and boundedly to `config/task.yaml`, with its source path,
+run-relative path, size, and hash.
+
+The checked-in `qualification/HARD_POWER_LOSS_PROTOCOL.md` defines the physical
+test and retained evidence. The evaluator now treats every nonterminal persisted
+run state as a failed qualification gate, so an interrupted acquisition cannot
+be mistaken for an incomplete-but-otherwise-valid matrix cell.
+
+Qualification now fails closed for missing/unsupported run-manifest schemas,
+dirty or failure-injected/non-production provenance, camera FrameID gaps or
+regressions, duplicate/out-of-order inference identities, and orphan inference
+rows. Skipped preflight and the qualification-only DeepStream debug profile are
+explicit production disqualifiers; the latter has a narrow single-run exception
+only for paired overhead measurement and remains forbidden in the production
+matrix. The matrix additionally requires one application commit, one complete
+device/package/native-plugin identity across every cell, and one hashed
+model/engine identity across inference-enabled cells. It binds trigger mode and
+edge, controller rate, exposure, recording bitrate, and serial state/port/baud
+plus controller protocol at startup, then requires the task snapshot and actual camera
+serial/model/firmware/runtime identity to remain identical across the campaign.
+A process-owned acquisition lock
+prevents two GUI instances from competing for the camera/controller and is
+released automatically after a process crash.
 
 1. Turn the pipeline topology and the invariants above into contract tests.
    Assert that the recording queue is non-leaky, all display/inference queues
@@ -60,12 +129,37 @@ remain open.
    package. Build them on an otherwise idle target and reject a plan whose
    recorded TensorRT/device identity does not match the runtime.
 
+   The engine builder now emits schema-3 build identity for TensorRT, CUDA,
+   compute capability, Jetson model, and Jetson Linux. Schema-3 model selection
+   rejects any runtime mismatch before acquisition. Existing schema-2 packages
+   remain readable only as a migration path and must be rebuilt with the
+   updated notebook to gain the strict identity gate.
+
+   On September 8, 2026 this JetPack 7.2.1 Orin Nano Super built the custom
+   `mousehouse_best.pt` source into a separately named
+   `models/mousehouse_jp721` schema-3 candidate. Independent strict validation
+   matched CUDA 13.2, TensorRT 10.16.2.10, compute capability 8.7, device/L4T
+   identity, and every path-bound artifact digest. A bounded `trtexec` check
+   executed the plan successfully with input `1x3x640x640` and output
+   `1x300x63`; its non-truncated execution report is itself hashed by the model
+   manifest. The older `models/mousehouse` schema-2 package was deliberately
+   preserved and remains production-ineligible.
+
+   The same device also completed an operator-observed bounded direct-source
+   FLIR smoke test with
+   10/10 complete Mono8 frames, contiguous camera chunk FrameIDs, contiguous
+   acquisition stream IDs 0 through 9, valid CRCs, and 1,555,360 valid payload
+   bytes per frame. Its raw artifact is not retained in this repository; this
+   is a development note, not a GUI recording run or a sustained qualification
+   cell.
+
 Exit criterion: the existing validated graph can be reconstructed from tests
 and a run can prove its software, model, device, timing, and frame identity.
 
-### Interrupted 88-hour qualification evidence
+### Interrupted 88-hour development observation
 
-The August 27–31, 2026 bench run demonstrated healthy camera/encoder endurance
+The operator-reported August 27–31, 2026 bench run demonstrated healthy
+camera/encoder endurance
 for 88.09 hours: 9,513,447 recording admissions matched 9,513,447 MP4 frames,
 the full 134.78 GB MP4 demuxed without error, frame IDs were contiguous, and
 recording backlog stayed far below its warning threshold. It is not a validated
@@ -73,15 +167,81 @@ scientific run. VS Code died after 45.58 hours and took the GUI-owned serial
 ledger with it, while the independently sessionized capture child continued for
 another 42.51 hours. The eventual reboot left one final source frame outside
 the recording branch and prevented finalization. This is endurance evidence for
-the dirty working-tree build only; it is also direct evidence that terminal
-detachment is insufficient as the final architecture. Serial control, capture
-supervision, and finalization must ultimately share a durable session service.
+the dirty working-tree build only; its raw directory is not retained in this
+repository and it is not release qualification evidence. The GUI remains the required operator
+interface. The production launcher now starts a detached, Qt-free supervisor
+which owns serial control, capture, the acquisition lock, and ordered
+finalization, then launches and monitors the GUI. Loss of the GUI or its
+exclusive local IPC lease cancels startup or fails an active run through the
+same ordered finalizer; acquisition cannot continue headlessly. This boundary
+still requires on-device GUI-crash qualification before scientific collection.
 
 ## Stage 1: separate responsibilities without changing the graph
 
-Status: started. Recording admission and telemetry operators have moved into a
-dedicated module with compatibility re-exports; the remaining runner, backend,
-post-run, and GUI boundaries are still to be decomposed incrementally.
+Status: repository implementation complete; on-device equivalence remains in
+progress. Immutable inference and operator contracts, video probing,
+frame audit, recording operators, complete graph construction, capture,
+inference, video, and acquisition reconciliation, capture drain, versioned
+child/backend events, and pure GUI health/presentation mapping now have
+independent modules. Manifest/provenance, preflight execution, process-group
+supervision, fail-closed startup orchestration, ordered shutdown coordination,
+and bounded post-run finalizer supervision are independent Qt-free services.
+`ServiceMakerApp` owns lifecycle
+rather than graph construction, and the GUI consumes typed backend phases.
+Preview, system meters, finalization presentation, bottle measurements,
+dashboard modeling/presentation, session configuration, configuration form and
+validation policy, main-view construction/theme, and individual profile dialogs
+have been extracted with compatibility façades. `MainWindow` is now an
+integration shell whose run orchestration delegates to `RunPresenter` and pure
+presentation policy. Capture-output interpretation and the drain coordinator
+are independently tested backend services; a human-readable legacy readiness
+line can no longer arm the controller without its validated structured event.
+Recording liveness and pose CSV persistence are independently tested inference
+services.
+
+Pipeline construction is physically separated into source/recording,
+inference/tracking, and preview/output graph modules, with a small mux/resource
+orchestrator retaining the golden element order and properties. The GUI consumes
+a narrow backend protocol and immutable run snapshots instead of mutating or
+reading backend internals. Ordinary child stdout can no longer select an
+ambient latest run; only the prepared directory carried by validated structured
+lifecycle events is accepted.
+
+The streaming callback audit now hard-caps the pose handoff and dashboard
+display history, bounds native metadata inspection, and uses fixed-size
+userspace buffering only for sidecars that are read after orderly close. The
+record-admission ledger remains line-visible because controller shutdown reads
+it before capture closes, and recording telemetry remains line-visible for live
+operator health. Abrupt loss of a buffered sidecar tail cannot silently pass:
+the nonterminal/unreconciled run fails validation.
+
+Camera runtime identity is accumulated in bounded memory and persisted only
+during close, not by atomic JSON replacement on the streaming callback. An
+identity change or an unexpected camera count fails closed. The serial reader
+also bounds individual lines and its pre-ledger queue, actively closes the port
+to unblock shutdown, and promotes reader, port, and ledger-close failures into
+run-integrity failures. GUI close requests now pass through the same backend
+lifecycle gate as the Stop button: startup is allowed to resolve, capture is
+stopped and finalized in order, and the window refuses to disappear when child
+exit or finalization cannot be confirmed.
+
+The production process boundary is now separated as well: a Qt-free supervisor
+owns the backend and launches the mandatory GUI as its sole authenticated lease
+holder. Versioned, bounded Unix-socket messages carry commands and typed events;
+backend callbacks only enqueue bounded work and never write the socket. A full
+recording-critical queue fails closed, while presentation events may be dropped
+with an explicit count. GUI loss is tested before run creation and during
+recording/finalization. Startup cancellation and controller `START` are
+lease-atomic, and the supervisor remains alive until ordered finalization and
+terminal persistence finish.
+
+A bounded lease emitted by a Qt-main-loop timer also makes a frozen GUI fail
+closed; a proxy background thread cannot renew that lease by itself. The
+supervisor validates renewals inline so long startup/finalization commands do
+not create false expiry. The acquisition child additionally arms Linux
+`PR_SET_PDEATHSIG` before executing DeepStream and verifies its expected parent
+PID, preventing a hard supervisor death from leaving the sessionized capture
+process running indefinitely.
 
 1. Split the inference runner into pipeline specification, source/recording,
    inference/tracking, preview, telemetry, lifecycle, and artifact-validation
@@ -103,10 +263,96 @@ artifacts, and on-device frame counts remain identical to the frozen baseline.
 
 ## Stage 2: observability and sustained-operation validation
 
-Status: started. Preflight now reports `tegrastats` without the invalid LFB
+Status: repository tooling complete; empirical qualification remains in
+progress. Preflight reports `tegrastats` without the invalid LFB
 threshold, rejects automatic AC suspend, and an opt-in NVIDIA latency profile
-is available. Bounded long-run system telemetry and the sustained qualification
-matrix remain open.
+is available. The capture child now owns a constant-memory `tegrastats`
+recorder; during acquisition the GUI follows that CSV instead of launching a
+duplicate sampler. `scripts/qualify_run.py` performs bounded-memory evidence
+analysis with a versioned measurement-only limits profile. Empirical limits,
+instrumentation-overhead measurements, and execution of the sustained
+qualification matrix remain open. The versioned 24-cell matrix definition and
+bounded evaluator are checked in; they reject run reuse and verify duration,
+capture, inference, preview, power-mode, clean Git, production eligibility,
+shared commit, and hashed model/engine identity for every inference-enabled
+assigned cell.
+The evaluator also rejects any cross-cell change in the complete acquisition
+protocol or actual camera identity; inference and preview remain deliberate
+matrix dimensions rather than acquisition-identity fields.
+Each leaky preview queue now has source-identity probes immediately before and
+after the queue. Bounded, durable per-camera ledgers reconcile delivered and
+intentionally shed preview frames after capture. Their failure blocks
+preview-enabled qualification but is explicitly excluded from recording
+validity; both probes remain downstream of the recording tee.
+Validated limits are schema-checked as a complete finite threshold set, and
+qualification fails on invalid/unknown recording telemetry or missing
+per-camera recording telemetry coverage.
+
+Limits, matrix, assignment, failure-plan, and debug-threshold inputs must be
+stable regular files; reads are size-bounded, strictly typed, duplicate-key
+rejecting, and fail closed on unknown fields or case IDs.
+Every long-run CSV/JSONL evidence consumer also bounds each physical record,
+requires strict UTF-8, and either fails the scientific gate or reports invalid
+diagnostics on malformed input. Offline replay indexes frame identity in a
+temporary disk-backed database rather than retaining a run-length-sized map in
+memory, and rechecks its input identities after decoding before publishing
+derived results. Replay uses the decoder EOS audit itself for the exact video
+count, avoiding a redundant, fixed-time FFprobe scan of multi-day recordings.
+The CLI runs native Service Maker in an isolated worker process: signals request
+normal stop/drain first, while an external 45-second supervisor boundary kills
+a stuck native teardown and returns failure. Linux parent-death containment
+prevents a hard supervisor death from orphaning the native worker. A replay can
+never publish success without decoder EOS and the exact ledger count.
+System qualification measures per-field and explicit thermal-state coverage so
+unknown samples are not treated as safe. Recording metrics reject negative or
+non-finite rows, and acquisition health requires camera transport-counter
+coverage for every configured stream. Telemetry-recorder loss is persisted as
+soon as observed without interrupting the authoritative recording branch, and
+it independently fails qualification.
+
+Qualification summaries hash every manifest, status, telemetry, and limits
+artifact they consumed. The paired debug comparison rejects stale summaries,
+requires the exact debug-only exception, the same validated limits file, and
+nonnegative finite NVIDIA latency values. Its checked protocol requires
+successfully terminal durable-supervisor runs with the same backend-enforced
+qualification case binding and retains both source-evidence reference sets.
+Matrix cells require an exact labeled
+power mode and one canonical platform/package/native-plugin identity across all
+cells, including inference-off cases.
+
+Campaign execution now has a read-only `--next-case` worksheet that exposes the
+first unassigned case, exact bound factors, duration, progress, environment,
+and terminal launch command without starting acquisition. A strict unapproved
+debug-overhead threshold template enumerates all required metrics without
+turning measurement defaults into acceptance limits. Completed campaigns can
+be inventoried outside their run directories with bounded streaming SHA-256;
+the archive verifier rejects missing, extra, symlinked, special, traversing, or
+modified copied evidence and never copies or bundles large videos itself.
+The recording validator no longer accepts an unverified container-header frame
+count as proof. Routine finalization validates the MP4 sample-size, timing,
+sample-to-chunk, and chunk-offset tables, then sends the complete compressed
+video through `h264parse` and requires clean EOS with an identical access-unit
+count. This avoids pixel reconstruction. Any structural error or ledger-count
+mismatch automatically escalates to a bounded full decode in an isolated child
+with Jetson's `nvv4l2decoder`; the explicit FFmpeg
+`h264_nvv4l2dec`/rawvideo/null path remains a supervised fallback. Qualification
+can require full decode, and an opt-in A/B mode runs both decoders and rejects a
+count disagreement. The validator publishes bounded sample, percentage, rate,
+elapsed-time, and ETA progress and reuses its one authoritative count during
+alignment. It requires that count to reconcile exactly, and
+binds the exact direct-regular MP4/capture-ledger/admission-ledger set by size
+and SHA-256. Qualification rehashes those artifacts, rejects substitutions or
+unexpected files, and carries their identities into paired and campaign
+evidence checks.
+Controller alignment now requires the ordered `START_SENT`,
+`CAPTURE_STOP_REQUESTED`, `STOP_SENT`, and `CAPTURE_STOP_DONE` markers. Its
+trigger epoch starts immediately after `START_SENT` and continues through the
+end of the bounded serial ledger: every `CAMERA_HIGH` in that epoch, including
+the shutdown tail after `CAPTURE_STOP_REQUESTED`, must map bijectively to one
+recorded camera frame. The summary records unmatched epoch and tail counts;
+post-run finalization and later qualification both fail closed unless those
+counts are zero and the video/frame-ledger count also matches. Qualification
+binds the exact alignment-summary bytes it parsed into its source evidence.
 
 1. Add an opt-in debug profile that captures DeepStream frame/component latency
    (`NVDS_ENABLE_LATENCY_MEASUREMENT` and
@@ -116,8 +362,30 @@ matrix remain open.
 
    Initial support is available with
    `SQUEAKVIEW_DEEPSTREAM_DEBUG_PROFILE=1`; it enables both NVIDIA latency
-   variables in the capture subprocess and labels the operator log. It remains
-   qualification-only until its overhead is measured.
+   variables in the capture subprocess and attaches NVIDIA's shipped
+   `measure_latency_probe` and `measure_fps_probe` only downstream of the leaky
+   inference input. Preflight hashes both bounded regular-file modules into the
+   run manifest, and child output is retained in the run-local, 64 MiB-bounded
+   `diagnostics/deepstream.log`. When that profile makes
+   `NVDS_ENABLE_LATENCY_MEASUREMENT` truthy, the raw FLIR source now calls
+   NVIDIA's public `nvds_add_reference_timestamp_meta` immediately after setting
+   buffer timestamps, using its real GStreamer element name and acquisition-local
+   source sequence. The API returns no status, and NVIDIA's header documents
+   decoder names as its standard anchors, so this correct raw-source anchor still
+   does not prove that frame-latency records will be nonempty on this graph. It
+   marks the run non-production and remains qualification-only until both structured frame
+   and component latency plus finite Service Maker FPS evidence is observed
+   without log truncation and its overhead is measured. Only
+   `scripts/qualify_run.py --allow-debug-profile` may waive that single reason
+   for the paired overhead comparison; the sustained production matrix still
+   rejects it. The comparison remains incomplete until explicitly approved,
+   evidence-derived overhead thresholds are supplied.
+
+Acquisition additionally enforces the same free-space reserve used at startup
+through a constant-memory live monitor. A reserve breach or disk-query failure
+emits a structured fatal event and enters normal EOS/container draining; it is
+not converted into an abrupt process kill. The resolved threshold, check
+interval, and fail-closed policy are retained in the run manifest.
 2. Capture `tegrastats` CPU, GPU, EMC, RAM, temperatures, throttling, and power
    rails at a bounded interval. Treat LFB as informational: NVIDIA defines its
    largest block as at most 4 MB, so a 16 MB warning threshold is invalid.
@@ -129,29 +397,107 @@ matrix remain open.
    preflight. Jetson Linux 39.2.1 documents an Orin Nano watchdog-reset risk
    during SC7 suspend/resume.
 5. Establish short, one-hour, and full-duration qualification matrices across
-   inference on/off, preview on/off, supported resolutions/FPS, and power mode.
+   inference on/off, preview on/off, production-supported capture profiles, and
+   power mode. The current production scope is explicitly the matrix's single
+   1440×1080/30 FPS/one-camera profile. Wider GUI validation ranges are for
+   development runs and are not claims of scientific support; any additional
+   resolution, rate, pixel format, or camera count requires a new versioned
+   capture profile and the complete matrix before production use.
 
 Exit criterion: resource saturation, thermal throttling, and latency regressions
 are visible and have defined pass/fail limits derived from validated runs.
 
-## Stage 3: optional performance changes
+## Stage 3: implemented pipeline choices and optional accuracy work
+
+Status: the recording-codec and stream-multiplexer decisions are complete.
+Their on-device sustained qualification is covered by the Stage 2 matrix; they
+are not competing implementation options that remain to be selected.
 
 1. Preserve CPU x264 recording on Orin Nano unless hardware changes. NVIDIA
    confirms that Orin Nano has no NVENC and documents software encoding as the
-   supported path. The current system-memory GRAY8 feed also avoids an
-   unnecessary NVMM-to-CPU round trip.
-2. Tune tracker and inference independently of recording. Orin Nano has no PVA,
-   so retain CUDA NvDCF unless measurement supports a different tracker.
-3. Evaluate the new `nvstreammux` only in an isolated branch. Its scaling and
-   `live-source` semantics differ from the legacy mux, and synchronization can
-   drop late inference buffers. Pin the selected mux behavior and require
-   frame-identity tests before migration.
-4. Consider TensorRT precision or model changes only with accuracy validation
+   supported path. The system-memory GRAY8 feed avoids an unnecessary
+   NVMM-to-CPU round trip. The encoder now explicitly uses one reference frame,
+   disables adaptive quantization, B-frames, and lookahead, and retains the
+   selected lossy bitrate-controlled scientific format.
+2. DeepStream 9.1 Stream multiplexer 2 is now pinned. Because it performs no
+   scaling or color conversion, every live and offline input is explicitly
+   normalized to NV12 in Jetson surface-array NVMM before the mux. Preflight
+   exercises that exact VIC/NVMM path; the physical smoke and sustained matrix
+   must still validate FLIR metadata and frame identity through mux and demux.
+3. Consider TensorRT precision or model changes only with accuracy validation
    against a fixed scientific dataset. Never reuse JetPack 6/TensorRT 8 plans or
    calibration artifacts without rebuilding and revalidation.
+4. Tune tracker and preview accuracy/performance last, independently of the
+   recording branch and only against a fixed annotated dataset.
 
 Exit criterion: each optimization demonstrates equal recording integrity and
 acceptable scientific accuracy under the full sustained-run matrix.
+
+## Remaining acceptance gates
+
+The repository implementation is not the same as scientific qualification.
+The following work intentionally remains open and must not be inferred from a
+green unit-test suite:
+
+1. Select and qualify the device-built `mousehouse_jp721` schema-3 candidate in
+   the real GUI pipeline. Promote it to the canonical deployment name only if
+   that name is operationally required; do not overwrite the preserved
+   schema-2 `models/mousehouse` package merely to rename it. Fresh devices must
+   rebuild their own schema-3 plan because generated model packages are not
+   portable repository content.
+2. Run the short, one-hour, and full-duration on-device matrix with real
+   camera/controller hardware, approve evidence-derived limits, and retain the
+   resulting qualification summaries. Include the physical serial-fault and
+   hard-power-loss protocols.
+3. Run a matched DeepStream debug-off/debug-on pair and confirm that NVIDIA
+   latency records are actually present before accepting the instrumentation;
+   then measure its acquisition overhead with the checked-in comparison tool.
+4. Exercise the durable supervisor on-device by freezing and forcibly
+   terminating the GUI during startup, recording, and each finalization phase,
+   and by terminating the supervisor during capture. Retain evidence that
+   startup never arms after lease loss, active acquisition stops, MP4 EOS/drain
+   completes when possible, serial and frame ledgers close, the acquisition
+   lock releases only after terminal status persistence, and no capture process
+   survives headlessly. A hard supervisor death cannot perform ordered
+   finalization, so its run must remain visibly nonterminal/failed qualification.
+   Use the guarded, dry-run-first procedure in
+   [SUPERVISOR_FAILURE_PROTOCOL.md](SUPERVISOR_FAILURE_PROTOCOL.md) for the
+   active-capture and individual persisted finalization-stage cases; it records
+   and immediately rechecks exact PID/start-time/parent/workload identities and
+   never performs broad process-name signaling. Its supervisor action is a
+   catchable `SIGTERM` test. An uncatchable supervisor-death test remains
+   coupled to the controller watchdog safety gate below.
+
+   Qualification-only bounded barriers now make `pre_capture`,
+   `after_spawn_before_ready`, and the capture-reconciliation,
+   inference-admission, recording-validation, and streaming-alignment stages
+   deterministic. They require the explicit destructive-test gate, mark the run
+   non-production, persist their waiting state, respond to cancellation, and
+   self-release within 60 seconds. The injection helper can wait for the exact
+   barrier while retaining its dry-run and UID/PID/start-time/parent/argv/run
+   identity checks.
+5. Obtain and version the deployed RP2040 firmware, implement its lease/watchdog,
+   and produce durable electrical failsafe evidence. The host side now has an
+   explicitly opt-in, production-disqualified experimental v1 state machine:
+   nonce-bound negotiation and ACKs, bounded startup/disarm waits, monotonic
+   heartbeat renewal from the supervisor, and fatal shutdown after two missed
+   acknowledgements. Legacy behavior remains the default. The current repository
+   has no firmware package or qualified watchdog, so host parent-death containment
+   alone cannot guarantee
+   that an independently powered controller stops pulses after Jetson failure.
+   [CONTROLLER_WATCHDOG_PROTOCOL.md](CONTROLLER_WATCHDOG_PROTOCOL.md) now defines
+   the exact wire/host/electrical contract and opt-in instructions; none of the
+   host-only tests count as controller or electrical safety evidence.
+
+Lossless/raw recording and the legacy stream multiplexer are explicitly not
+remaining acceptance gates. The production architecture is the current lossy,
+bitrate-controlled H.264 recording path and DeepStream 9.1 Streammux 2. Those
+choices must pass the sustained matrix above, but no alternative recording
+format or mux implementation needs to be developed or compared for this
+release. Reversing either decision would require a new scientific requirement,
+an isolated implementation, and a separate qualification campaign. Inference
+precision, tracker, and preview changes remain deferred until fixed-dataset
+accuracy evidence justifies them.
 
 ## NVIDIA references
 

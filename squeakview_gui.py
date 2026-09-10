@@ -41,4 +41,4 @@ from squeakview.apps.operator import main as operator_main  # noqa: E402
 
 
 if __name__ == "__main__":
-    operator_main.main()
+    raise SystemExit(operator_main.main())

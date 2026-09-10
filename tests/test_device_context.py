@@ -16,10 +16,11 @@ class DeviceContextTests(unittest.TestCase):
                 device_context,
                 "_command_output",
                 side_effect=[
-                    "nvidia-l4t-core=39.2.1\ndeepstream-9.1=9.1.0-1\nmissing=",
+                    "nvidia-jetpack=7.2.1-b17\nnvidia-l4t-core=39.2.1\n"
+                    "deepstream-9.1=9.1.0-1\nmissing=",
                     "NV Power Mode: MAXN_SUPER\n2",
                 ],
-            ),
+            ) as command_output,
         ):
             snapshot = device_context.device_context_snapshot()
 
@@ -28,8 +29,15 @@ class DeviceContextTests(unittest.TestCase):
         self.assertEqual(snapshot["deepstream_build"], "9.1")
         self.assertEqual(
             snapshot["packages"],
-            {"nvidia-l4t-core": "39.2.1", "deepstream-9.1": "9.1.0-1"},
+            {
+                "nvidia-jetpack": "7.2.1-b17",
+                "nvidia-l4t-core": "39.2.1",
+                "deepstream-9.1": "9.1.0-1",
+            },
         )
+        package_command = command_output.call_args_list[0].args[0]
+        self.assertIn("nvidia-jetpack", package_command)
+        self.assertIn("ffmpeg", package_command)
         self.assertIn("python", snapshot)
         self.assertIn("MAXN_SUPER", str(snapshot["nvpmodel"]))
 
@@ -43,6 +51,16 @@ class DeviceContextTests(unittest.TestCase):
         self.assertTrue(identity["available"])
         self.assertEqual(identity["size_bytes"], 17)
         self.assertEqual(len(str(identity["sha256"])), 64)
+
+    def test_file_identity_is_size_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "large.so"
+            artifact.write_bytes(b"12345")
+
+            identity = device_context.file_identity(artifact, max_bytes=4)
+
+        self.assertFalse(identity["available"])
+        self.assertIn("byte limit", str(identity["error"]))
 
 
 if __name__ == "__main__":

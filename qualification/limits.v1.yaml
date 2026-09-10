@@ -1,0 +1,38 @@
+schema_version: "1.0"
+profile_id: orin-nano-super-jetpack-7.2.1-measurement-v1
+validated: false
+description: >-
+  Measurement-only Stage 2 profile. Do not treat a run as qualified until
+  sustained baseline runs establish and approve explicit limits.
+  When validated is changed to true, every required telemetry, resource, and
+  recording threshold must contain a finite nonnegative value; coverage must
+  additionally be greater than zero and at most one. max_emc_util_pct may stay
+  blank when the JetPack tegrastats format does not report EMC utilization;
+  max_emc_clock_pct_of_max remains required in that case.
+
+telemetry:
+  expected_interval_ms: 1000
+  min_coverage_ratio:
+  max_gap_s:
+  max_malformed_rows:
+  max_invalid_rows:
+  max_throttle_samples:
+
+resources:
+  max_ram_pct:
+  max_swap_pct:
+  max_cpu_util_mean_pct:
+  max_cpu_util_max_pct:
+  max_gpu_util_pct:
+  max_emc_util_pct:
+  max_emc_clock_pct_of_max:
+  max_temp_max_c:
+  max_vdd_in_current_mw:
+
+recording:
+  max_queue_wait_ms:
+  max_encoder_latency_ms:
+  max_waiting_for_record_admission:
+  max_encoder_in_flight:
+  max_pending_evictions:
+  max_backpressure_fatal_events:

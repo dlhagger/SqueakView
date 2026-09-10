@@ -7,6 +7,8 @@ from pathlib import Path
 from squeakview import config as squeakview_config
 
 from . import service_maker_runner as runner
+from .contracts import InferenceConfig
+from squeakview.common.failure_injection import load_failure_plan
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,16 +40,25 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--disable-infer", action="store_true", help="Disable YOLO inference overlays.")
     ap.add_argument("--run-dir", type=Path, default=None, help="Existing run directory to reuse.")
+    ap.add_argument(
+        "--failure-plan",
+        type=Path,
+        default=None,
+        help=(
+            "qualification-only versioned failure plan; requires "
+            "SQUEAKVIEW_ENABLE_FAILURE_INJECTION=1 and marks the run non-production"
+        ),
+    )
     return ap.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     cfg_path = squeakview_config.resolve_workspace_path(args.cfg) if args.cfg else None
-    config = runner.InferenceConfig(
+    config = InferenceConfig(
         cfg_path=cfg_path,
         capture_backend=args.capture_backend,
-        num_cameras=max(1, int(args.num_cameras)),
+        num_cameras=int(args.num_cameras),
         camera_serials=tuple(str(value).strip() for value in args.camera_serial),
         pixel_format=str(args.pixel_format),
         trigger_on=args.trigger == "on",
@@ -61,6 +72,11 @@ def main() -> int:
         preview_sockets=tuple(args.preview_socket),
         enable_infer=not args.disable_infer,
         run_dir=args.run_dir,
+        failure_plan=(
+            load_failure_plan(args.failure_plan)
+            if getattr(args, "failure_plan", None)
+            else None
+        ),
     )
     return runner.run(config)
 

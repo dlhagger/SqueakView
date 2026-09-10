@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import json
 import re
+from itertools import islice
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from squeakview import config as squeakview_config
+from squeakview.common.bounded_input import read_json_object
+from squeakview.common.run_context import atomic_write_json
+
+
+MAX_PROFILE_BYTES = 1024 * 1024
+MAX_PROFILE_FILES = 1024
 
 
 def slugify(value: str) -> str:
@@ -39,11 +46,24 @@ class ProfileStore:
         self.experiments_dir.mkdir(parents=True, exist_ok=True)
         self.subjects_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _assert_save_capacity(directory: Path, target: Path) -> None:
+        if target.exists():
+            return
+        count = sum(1 for _path in islice(directory.glob("*.json"), MAX_PROFILE_FILES))
+        if count >= MAX_PROFILE_FILES:
+            raise ValueError(
+                f"profile store already contains the {MAX_PROFILE_FILES} file limit"
+            )
+
     def list_experiments(self) -> list[ExperimentProfile]:
         profiles: list[ExperimentProfile] = []
-        for path in sorted(self.experiments_dir.glob("*.json")):
+        paths = sorted(islice(self.experiments_dir.glob("*.json"), MAX_PROFILE_FILES))
+        for path in paths:
             try:
-                data = json.loads(path.read_text())
+                data = read_json_object(
+                    path, max_bytes=MAX_PROFILE_BYTES, label="experiment profile"
+                )
                 profiles.append(
                     ExperimentProfile(
                         name=str(data.get("name") or path.stem),
@@ -58,9 +78,12 @@ class ProfileStore:
 
     def list_subjects(self) -> list[SubjectProfile]:
         profiles: list[SubjectProfile] = []
-        for path in sorted(self.subjects_dir.glob("*.json")):
+        paths = sorted(islice(self.subjects_dir.glob("*.json"), MAX_PROFILE_FILES))
+        for path in paths:
             try:
-                data = json.loads(path.read_text())
+                data = read_json_object(
+                    path, max_bytes=MAX_PROFILE_BYTES, label="subject profile"
+                )
                 profiles.append(
                     SubjectProfile(
                         name=str(data.get("name") or path.stem),
@@ -78,15 +101,21 @@ class ProfileStore:
         payload["slug"] = slug
         payload["config"] = self._normalize_config(payload.get("config") or {})
         path = self.experiments_dir / f"{slug}.json"
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        return path
+        self._assert_save_capacity(self.experiments_dir, path)
+        encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        if len(encoded) > MAX_PROFILE_BYTES:
+            raise ValueError(f"experiment profile exceeds {MAX_PROFILE_BYTES} byte limit")
+        return atomic_write_json(path, payload)
 
     def save_subject(self, profile: SubjectProfile) -> Path:
         slug = slugify(profile.subject_id or profile.name)
         payload = asdict(profile)
         path = self.subjects_dir / f"{slug}.json"
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        return path
+        self._assert_save_capacity(self.subjects_dir, path)
+        encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        if len(encoded) > MAX_PROFILE_BYTES:
+            raise ValueError(f"subject profile exceeds {MAX_PROFILE_BYTES} byte limit")
+        return atomic_write_json(path, payload)
 
     def delete_experiment(self, slug: str) -> None:
         path = self.experiments_dir / f"{slugify(slug)}.json"

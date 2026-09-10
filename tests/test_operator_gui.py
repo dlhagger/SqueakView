@@ -9,14 +9,18 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from squeakview.apps.operator.gui.config_dialog import SessionLauncherDialog
+from squeakview.apps.operator.gui.session_dialog import (
+    SessionLauncherDialog as ExtractedSessionLauncherDialog,
+)
 from squeakview.apps.operator.gui.main_window import (
+    MainWindow,
+    _create_supervisor_heartbeat_timer,
     _elapsed_text,
     _is_serial_log_message,
     _last_csv_row,
-    _preflight_failure_message,
     _tail_text_line,
 )
 from squeakview.common.log_mirror import LineBufferedLogMirror
@@ -24,11 +28,71 @@ from squeakview.common.profiles import ExperimentProfile, SubjectProfile
 
 
 class RuntimeFileHelpersTest(unittest.TestCase):
+    def test_supervisor_heartbeat_originates_on_qt_main_loop_thread(self) -> None:
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        owner = QtCore.QObject()
+        backend = mock.Mock()
+        window = mock.Mock(backend=backend)
+        observed_threads = []
+        loop = QtCore.QEventLoop()
+
+        def heartbeat() -> None:
+            observed_threads.append(QtCore.QThread.currentThread())
+            MainWindow._send_supervisor_heartbeat(window)
+            loop.quit()
+
+        timer = _create_supervisor_heartbeat_timer(owner, heartbeat)
+        timer.setInterval(1)
+        QtCore.QTimer.singleShot(1_000, loop.quit)
+        loop.exec()
+        timer.stop()
+
+        self.assertIsNotNone(app)
+        self.assertEqual(observed_threads, [app.thread()])
+        backend.heartbeat.assert_called_once_with()
+
+    def test_gui_log_mirror_bounds_file_and_partial_line_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gui.log"
+            console = io.StringIO()
+            mirror = LineBufferedLogMirror(
+                path, console, max_bytes=80, max_pending_chars=16
+            )
+            self.addCleanup(mirror.close)
+
+            mirror.write("first line\n")
+            mirror.write("x" * 100)
+            mirror.write("\nlast line\n")
+            mirror.flush()
+
+            self.assertLessEqual(path.stat().st_size, 80)
+            self.assertIn("first line", path.read_text())
+            self.assertIn("line truncated", path.read_text())
+            self.assertIn("x" * 100, console.getvalue())
+
+    def test_gui_log_mirror_stops_file_writes_at_size_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gui.log"
+            console = io.StringIO()
+            mirror = LineBufferedLogMirror(path, console, max_bytes=20)
+            self.addCleanup(mirror.close)
+
+            mirror.write("first\n")
+            mirror.write("this line cannot fit\n")
+            mirror.write("later\n")
+            mirror.flush()
+
+            self.assertLessEqual(path.stat().st_size, 20)
+            self.assertEqual(path.read_text(), "first\n")
+            self.assertIn("file log capped", console.getvalue())
+            self.assertIn("later", console.getvalue())
+
     def test_gui_log_mirror_filters_fragmented_camera_lines_without_blanks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "gui.log"
             console = io.StringIO()
             mirror = LineBufferedLogMirror(log_path, console)
+            self.addCleanup(mirror.close)
 
             mirror.write("[SER] CAMERA_HIGH,1,2")
             mirror.write("\n")
@@ -47,6 +111,7 @@ class RuntimeFileHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "gui.log"
             mirror = LineBufferedLogMirror(log_path, io.StringIO())
+            self.addCleanup(mirror.close)
 
             mirror.write("partial diagnostic")
             mirror.flush()
@@ -57,6 +122,7 @@ class RuntimeFileHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "gui.log"
             mirror = LineBufferedLogMirror(log_path, io.StringIO())
+            self.addCleanup(mirror.close)
 
             mirror.write("[SER] CAMERA_HIGH,1,2")
             mirror.flush()
@@ -65,14 +131,42 @@ class RuntimeFileHelpersTest(unittest.TestCase):
 
             self.assertEqual(log_path.read_text(), "normal\n")
 
-    def test_ffprobe_preflight_failure_has_explicit_install_instructions(self) -> None:
-        message = _preflight_failure_message("[FAIL] FFmpeg/ffprobe is not installed.")
-        self.assertIn("FFmpeg is not installed", message)
-        self.assertIn("sudo apt install ffmpeg", message)
+    def test_gui_log_mirror_keeps_file_log_after_terminal_disconnect(self) -> None:
+        class BrokenTerminal(io.StringIO):
+            def write(self, _data: str) -> int:
+                raise BrokenPipeError("terminal disconnected")
 
-    def test_unknown_preflight_failure_uses_generic_message(self) -> None:
-        message = _preflight_failure_message("[FAIL] something else")
-        self.assertIn("Open Operator Events", message)
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "gui.log"
+            mirror = LineBufferedLogMirror(log_path, BrokenTerminal())
+            self.addCleanup(mirror.close)
+
+            self.assertEqual(mirror.write("shutdown started\n"), 17)
+            mirror.flush()
+
+            self.assertEqual(log_path.read_text(), "shutdown started\n")
+
+    def test_gui_log_mirror_close_is_idempotent_and_does_not_close_console(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "gui.log"
+            console = io.StringIO()
+            with (
+                mock.patch("squeakview.common.log_mirror.atexit.register") as register,
+                mock.patch("squeakview.common.log_mirror.atexit.unregister") as unregister,
+            ):
+                mirror = LineBufferedLogMirror(log_path, console)
+                mirror.write("final partial")
+                mirror.close()
+                mirror.close()
+
+            self.assertTrue(mirror.closed)
+            self.assertFalse(console.closed)
+            self.assertEqual(log_path.read_text(), "final partial")
+            register.assert_called_once_with(mirror.close)
+            unregister.assert_called_once_with(mirror.close)
+            self.assertEqual(mirror.write("console only\n"), 13)
+            self.assertIn("console only", console.getvalue())
+            self.assertEqual(log_path.read_text(), "final partial")
 
     def test_elapsed_text_supports_long_runs(self) -> None:
         self.assertEqual(_elapsed_text(16 * 3600 + 2 * 60 + 9), "16:02:09")
@@ -82,6 +176,17 @@ class RuntimeFileHelpersTest(unittest.TestCase):
         self.assertTrue(_is_serial_log_message("[17:01:37] 【SER→】 STOP"))
         self.assertTrue(_is_serial_log_message("[17:01:37] [SER] ACK_STOP received."))
         self.assertFalse(_is_serial_log_message("[GUI] Run stopped and validation passed"))
+
+    def test_broken_stdout_cannot_abort_gui_lifecycle_logging(self) -> None:
+        window = mock.Mock()
+        window.event_log = mock.Mock()
+        with mock.patch("builtins.print", side_effect=BrokenPipeError("closed")):
+            MainWindow._append_log(window, "[GUI] stopping")
+
+        window.event_log.appendPlainText.assert_called_once_with("[GUI] stopping")
+        window.statusBar.return_value.showMessage.assert_called_once_with(
+            "[GUI] stopping", 5000
+        )
 
     def test_tail_and_csv_reader_return_latest_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -112,13 +217,12 @@ class SessionLauncherSubjectScopeTest(unittest.TestCase):
             SubjectProfile(name="Assigned", subject_id="assigned"),
             SubjectProfile(name="Unassigned", subject_id="unassigned"),
         ]
-        with mock.patch(
-            "squeakview.apps.operator.gui.config_dialog.ProfileStore",
-            return_value=store,
-        ):
-            dialog = SessionLauncherDialog(base_config={})
+        dialog = SessionLauncherDialog(base_config={}, profile_store=store)
         dialog.experiment_combo.setCurrentIndex(1)
         return dialog
+
+    def test_legacy_import_reexports_extracted_launcher(self) -> None:
+        self.assertIs(SessionLauncherDialog, ExtractedSessionLauncherDialog)
 
     def test_empty_assignment_does_not_expose_all_subjects(self) -> None:
         dialog = self._dialog([])

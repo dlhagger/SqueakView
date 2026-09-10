@@ -2,30 +2,64 @@ from __future__ import annotations
 
 """Subprocess helpers for the operator GUI."""
 
+import copy
 import hashlib
 import json
 import os
-import shlex
 import signal
 import subprocess
 import sys
-import threading
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from types import MappingProxyType
+from typing import Callable, Mapping, Sequence
 
 from squeakview import config as squeakview_config
-
-
-def _now() -> str:
-    return time.strftime("%H:%M:%S")
+from squeakview.apps.operator.backend.contracts import LaunchConfig, RunRequest
+from squeakview.apps.operator.backend import supervision
+from squeakview.common.bounded_input import read_json_object, read_stable_regular_file
+from squeakview.common.device_context import file_identity
 
 
 WORKSPACE = squeakview_config.WORKSPACE
 
 INFERENCE_ENTRY = "squeakview.apps.inference.main"
 POST_RUN_ENTRY = "squeakview.apps.inference.post_run"
+MAX_INFERENCE_CONFIG_BYTES = 1024 * 1024
+MAX_POSE_SIDECAR_BYTES = 4 * 1024 * 1024
+MAX_LABEL_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveDeepStreamConfig:
+    """Immutable identities of every model artifact consumed by capture."""
+
+    path: Path
+    artifacts: Mapping[str, Mapping[str, object]]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", Path(self.path).expanduser().resolve())
+        object.__setattr__(
+            self,
+            "artifacts",
+            MappingProxyType(
+                {
+                    name: MappingProxyType(copy.deepcopy(dict(identity)))
+                    for name, identity in self.artifacts.items()
+                }
+            ),
+        )
+
+    @property
+    def config_identity(self) -> Mapping[str, object]:
+        return self.artifacts["deepstream_config"]
+
+    @property
+    def parser_identity(self) -> Mapping[str, object]:
+        return self.artifacts["custom_parser"]
+
+    def manifest_snapshot(self) -> dict[str, object]:
+        return {name: dict(identity) for name, identity in self.artifacts.items()}
 
 
 def preview_socket_paths(run_dir: Path, num_cameras: int) -> tuple[Path, ...]:
@@ -38,34 +72,6 @@ def preview_socket_paths(run_dir: Path, num_cameras: int) -> tuple[Path, ...]:
     )
 
 
-@dataclass(slots=True)
-class LaunchConfig:
-    capture_backend: str = "flir_direct"
-    width: int | None = 1440
-    height: int | None = 1080
-    fps: int | None = None
-    pixel_format: str | None = None
-    trigger_on: bool = False
-    trigger_activation: str = "rising"
-    ds_cfg: Path | None = squeakview_config.DEFAULT_INFER_CONFIG
-    inference_enabled: bool = True
-    num_cameras: int = 1
-    camera_serials: tuple[str, ...] = ()
-    bitrate: int = 4000
-    exposure_us: float | None = 10000.0
-    serial_enabled: bool = True
-    serial_port: str = "/dev/ttyACM0"
-    serial_baud: int = 115200
-    arduino_fps: int = 30
-    preview_window_id: int | None = None
-    preview_socket_paths: tuple[Path, ...] = ()
-    run_dir: Path | None = None
-    mouse_id: str | None = None
-    experiment_name: str | None = None
-    task_cfg: Path | None = None
-    bottles: dict[str, object] = field(default_factory=dict)
-
-
 def _prepend_env_path(env: dict[str, str], key: str, paths: list[Path]) -> None:
     values = [str(path) for path in paths if path.exists()]
     current = os.environ.get(key, "")
@@ -76,7 +82,10 @@ def _prepend_env_path(env: dict[str, str], key: str, paths: list[Path]) -> None:
 
 
 def _deepstream_runtime_env() -> dict[str, str]:
-    env: dict[str, str] = {}
+    # DeepStream 9.1 still selects Stream multiplexer 2 through this
+    # compatibility switch.  Pin it rather than inheriting a login-shell
+    # value so acquisition and post-run replay use the same mux implementation.
+    env: dict[str, str] = {"USE_NEW_NVSTREAMMUX": "yes"}
     sdk = squeakview_config.DEEPSTREAM_SDK_ROOT
     _prepend_env_path(env, "LD_LIBRARY_PATH", [sdk / "lib"])
     _prepend_env_path(env, "GST_PLUGIN_PATH", [sdk / "lib" / "gst-plugins"])
@@ -91,18 +100,38 @@ def _resolve_infer_config_path(raw: str, config_dir: Path) -> Path:
     return (config_dir / path).resolve()
 
 
-def _localize_deepstream_config(config_path: Path, run_dir: Path | None, emit: Callable[[str], None]) -> Path:
+def _localize_deepstream_config(
+    config_path: Path,
+    run_dir: Path | None,
+    emit: Callable[[str], None],
+) -> Path:
     """Write a run-local nvinfer config with paths resolved for this clone."""
     config_path = Path(config_path).expanduser().resolve()
     if run_dir is None:
         return config_path
     try:
-        lines = config_path.read_text().splitlines()
-    except Exception:
-        return config_path
+        config_text = read_stable_regular_file(
+            config_path,
+            max_bytes=MAX_INFERENCE_CONFIG_BYTES,
+            label="DeepStream inference config",
+        ).decode("utf-8", errors="strict")
+        lines = config_text.splitlines()
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(
+            f"could not safely localize DeepStream config {config_path}: {exc}"
+        ) from exc
 
     config_dir = config_path.parent
-    path_keys = {"onnx-file", "model-engine-file", "labelfile-path", "custom-lib-path"}
+    localized_dir = Path(run_dir) / "config"
+    localized_config = localized_dir / config_path.name
+    class_labels_target = localized_dir / f"{config_path.stem}.classes.txt"
+    class_labels_payload: str | None = None
+    path_keys = {
+        "onnx-file",
+        "model-engine-file",
+        "labelfile-path",
+        "custom-lib-path",
+    }
     localized_lines: list[str] = []
     changed = False
     for line in lines:
@@ -116,132 +145,205 @@ def _localize_deepstream_config(config_path: Path, run_dir: Path | None, emit: C
             localized_lines.append(line)
             continue
         resolved = _resolve_infer_config_path(raw_value, config_dir)
+        if key_name == "labelfile-path":
+            try:
+                class_labels_payload = read_stable_regular_file(
+                    resolved,
+                    max_bytes=MAX_LABEL_BYTES,
+                    label="class labels",
+                ).decode("utf-8", errors="strict")
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"could not safely localize class labels {resolved}: {exc}"
+                ) from exc
+            resolved = class_labels_target.resolve()
         new_line = f"{key}={resolved}"
         localized_lines.append(new_line)
         changed = changed or new_line != line
 
     sidecar_path = config_path.with_name(f"{config_path.stem}.pose.json")
-    localized_dir = Path(run_dir) / "config"
-    localized_dir.mkdir(parents=True, exist_ok=True)
-    localized_config = localized_dir / config_path.name
-    localized_config.write_text("\n".join(localized_lines) + "\n")
-
+    localized_sidecar: Path | None = None
+    localized_sidecar_payload: str | None = None
+    keypoint_labels_target = localized_dir / f"{config_path.stem}.keypoints.txt"
+    keypoint_labels_payload: str | None = None
     if sidecar_path.exists():
         try:
-            sidecar = json.loads(sidecar_path.read_text())
-            if isinstance(sidecar, dict) and sidecar.get("keypoint_labels_path"):
-                kp_path = _resolve_infer_config_path(str(sidecar["keypoint_labels_path"]), sidecar_path.parent)
-                sidecar["keypoint_labels_path"] = str(kp_path)
+            sidecar = read_json_object(
+                sidecar_path,
+                max_bytes=MAX_POSE_SIDECAR_BYTES,
+                label="pose sidecar",
+            )
+            if sidecar.get("keypoint_labels_path"):
+                kp_path = _resolve_infer_config_path(
+                    str(sidecar["keypoint_labels_path"]), sidecar_path.parent
+                )
+                keypoint_labels_payload = read_stable_regular_file(
+                    kp_path,
+                    max_bytes=MAX_LABEL_BYTES,
+                    label="keypoint labels",
+                ).decode("utf-8", errors="strict")
+                sidecar["keypoint_labels_path"] = str(
+                    keypoint_labels_target.resolve()
+                )
             localized_sidecar = localized_dir / sidecar_path.name
-            localized_sidecar.write_text(json.dumps(sidecar, indent=2) + "\n")
+            localized_sidecar_payload = json.dumps(sidecar, indent=2) + "\n"
         except Exception as exc:
-            emit(f"【DS】 WARN: could not localize pose sidecar {sidecar_path}: {exc}")
+            raise RuntimeError(
+                f"could not safely localize pose sidecar {sidecar_path}: {exc}"
+            ) from exc
+
+    from squeakview.common import run_context
+
+    localized_dir.mkdir(parents=True, exist_ok=True)
+    run_context.atomic_write_text(localized_config, "\n".join(localized_lines) + "\n")
+    if class_labels_payload is not None:
+        run_context.atomic_write_text(class_labels_target, class_labels_payload)
+    if keypoint_labels_payload is not None:
+        run_context.atomic_write_text(keypoint_labels_target, keypoint_labels_payload)
+    if localized_sidecar is not None and localized_sidecar_payload is not None:
+        run_context.atomic_write_text(localized_sidecar, localized_sidecar_payload)
 
     if changed:
         emit(f"【DS】 localized DeepStream config → {localized_config}")
     return localized_config
 
 
-class ProcessHandle:
-    def __init__(
-        self,
-        name: str,
-        popen: subprocess.Popen[str],
-        emit_fn: Callable[[str], None],
-        on_exit: Callable[[int], None] | None = None,
-    ):
-        self.name = name
-        self.p = popen
-        self.emit = emit_fn
-        self.on_exit = on_exit
-        self._thread = threading.Thread(target=self._pump, daemon=True)
-        self._thread.start()
+def prepare_effective_deepstream_config(
+    config_path: Path,
+    run_dir: Path,
+    emit: Callable[[str], None],
+    *,
+    validated_artifacts: Mapping[str, Path],
+) -> EffectiveDeepStreamConfig:
+    """Validate package paths, localize small files, and bind runtime inputs."""
 
-    def _pump(self) -> None:
-        try:
-            for line in iter(self.p.stdout.readline, ""):
-                if not line:
-                    break
-                clean = line.rstrip()
-                if not clean.strip() or _should_suppress_child_output(clean):
-                    continue
-                self.emit(f"[{_now()}] {self.name} {clean}")
-        except Exception as exc:
-            self.emit(f"{self.name} output error: {exc}")
-        finally:
-            returncode = self.p.wait()
-            if self.p.stdout is not None:
-                self.p.stdout.close()
-            if self.on_exit is not None:
-                try:
-                    self.on_exit(int(returncode))
-                except Exception as exc:
-                    self.emit(f"{self.name} exit callback error: {exc}")
+    from squeakview.apps.inference.contracts import read_config_value_strict
 
-    def is_running(self) -> bool:
-        return self.p is not None and self.p.poll() is None
-
-    def wait(self, timeout: float | None = None) -> int:
-        """Wait for a concrete child exit code.
-
-        ``subprocess.TimeoutExpired`` deliberately propagates.  Returning
-        ``None`` here previously let callers validate MP4/ledger files while
-        the capture child could still be writing them.
-        """
-
-        return int(self.p.wait(timeout=timeout))
-
-    def send_signal_group(self, sig: signal.Signals) -> bool:
-        try:
-            pgid = os.getpgid(self.p.pid)
-            os.killpg(pgid, sig)
-            return True
-        except Exception as exc:
-            self.emit(f"{self.name} signal error: {exc}")
-            return False
-
-    def terminate_group_graceful(
-        self, first_sig: signal.Signals = signal.SIGINT, wait_s: float = 8.0, escalate: bool = True
-    ) -> None:
-        if not self.is_running():
-            return
-        self.emit(f"{self.name} → send {first_sig.name}")
-        self.send_signal_group(first_sig)
-        t0 = time.time()
-        while self.is_running() and (time.time() - t0) < wait_s:
-            time.sleep(0.1)
-        if not self.is_running() or not escalate:
-            return
-        if self.is_running():
-            self.emit(f"{self.name} still running — SIGTERM")
-            self.send_signal_group(signal.SIGTERM)
-        t1 = time.time()
-        while self.is_running() and (time.time() - t1) < 5.0:
-            time.sleep(0.1)
-        if self.is_running():
-            self.emit(f"{self.name} still running — SIGKILL")
-            try:
-                os.killpg(os.getpgid(self.p.pid), signal.SIGKILL)
-            except Exception as exc:
-                self.emit(f"{self.name} SIGKILL error: {exc}")
-            try:
-                self.p.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                self.emit(f"{self.name} did not exit within 5.0s after SIGKILL")
-
-
-def _should_suppress_child_output(line: str) -> bool:
-    if os.environ.get("SQUEAKVIEW_SHOW_PLUGIN_WARNINGS") == "1":
-        return False
-    return (
-        "gst-plugin-scanner" in line
-        and (
-            "libnvdsgst_inferserver.so" in line
-            or "libnvdsgst_udp.so" in line
-            or "libtritonserver.so" in line
-            or "librivermax.so" in line
+    required = {
+        "deepstream_config",
+        "pose_sidecar",
+        "class_labels",
+        "keypoint_labels",
+        "onnx",
+        "engine",
+        "custom_parser",
+    }
+    if set(validated_artifacts) != required:
+        raise RuntimeError(
+            "validated model artifact set is incomplete or contains unknown keys"
         )
+    expected = {
+        name: Path(path).expanduser().resolve()
+        for name, path in validated_artifacts.items()
+    }
+    source_config = Path(config_path).expanduser().resolve()
+    if source_config != expected["deepstream_config"]:
+        raise RuntimeError(
+            "selected DeepStream config does not match the validated model package"
+        )
+    config_keys = {
+        "onnx": "onnx-file",
+        "engine": "model-engine-file",
+        "class_labels": "labelfile-path",
+        "custom_parser": "custom-lib-path",
+    }
+    for artifact, key in config_keys.items():
+        raw = read_config_value_strict(source_config, key)
+        if not raw or _resolve_infer_config_path(
+            raw, source_config.parent
+        ) != expected[artifact]:
+            raise RuntimeError(
+                f"DeepStream {artifact} path does not match the validated model package"
+            )
+    source_sidecar = source_config.with_name(f"{source_config.stem}.pose.json")
+    if source_sidecar != expected["pose_sidecar"]:
+        raise RuntimeError("pose sidecar path does not match the validated model package")
+    sidecar = read_json_object(
+        source_sidecar,
+        max_bytes=MAX_POSE_SIDECAR_BYTES,
+        label="pose sidecar",
     )
+    raw_keypoints = sidecar.get("keypoint_labels_path")
+    if not raw_keypoints or _resolve_infer_config_path(
+        str(raw_keypoints), source_sidecar.parent
+    ) != expected["keypoint_labels"]:
+        raise RuntimeError("keypoint labels path does not match the validated model package")
+
+    localized = _localize_deepstream_config(source_config, run_dir, emit)
+    localized_sidecar = localized.with_name(f"{localized.stem}.pose.json")
+    localized_sidecar_data = read_json_object(
+        localized_sidecar,
+        max_bytes=MAX_POSE_SIDECAR_BYTES,
+        label="localized pose sidecar",
+    )
+    localized_refs = {
+        artifact: _resolve_infer_config_path(
+            read_config_value_strict(localized, key) or "",
+            localized.parent,
+        )
+        for artifact, key in config_keys.items()
+    }
+    for artifact in ("onnx", "engine", "custom_parser"):
+        if localized_refs[artifact] != expected[artifact]:
+            raise RuntimeError(
+                f"localized DeepStream {artifact} path diverged from the validated package"
+            )
+    effective_paths = {
+        "deepstream_config": localized,
+        "pose_sidecar": localized_sidecar,
+        "class_labels": localized_refs["class_labels"],
+        "keypoint_labels": _resolve_infer_config_path(
+            str(localized_sidecar_data.get("keypoint_labels_path") or ""),
+            localized_sidecar.parent,
+        ),
+        "onnx": localized_refs["onnx"],
+        "engine": localized_refs["engine"],
+        "custom_parser": localized_refs["custom_parser"],
+    }
+    limits = {
+        "deepstream_config": MAX_INFERENCE_CONFIG_BYTES,
+        "pose_sidecar": MAX_POSE_SIDECAR_BYTES,
+        "class_labels": MAX_LABEL_BYTES,
+        "keypoint_labels": MAX_LABEL_BYTES,
+        "onnx": 4 * 1024 * 1024 * 1024,
+        "engine": 4 * 1024 * 1024 * 1024,
+        "custom_parser": 512 * 1024 * 1024,
+    }
+    identities = {
+        name: file_identity(path, max_bytes=limits[name])
+        for name, path in effective_paths.items()
+    }
+    for label, identity in identities.items():
+        if identity.get("available") is not True:
+            raise RuntimeError(
+                f"could not identify {label}: "
+                f"{identity.get('error', 'unknown error')}"
+            )
+    return EffectiveDeepStreamConfig(localized, identities)
+
+
+def verify_effective_deepstream_config(
+    prepared: EffectiveDeepStreamConfig,
+) -> None:
+    """Fail closed if any prepared runtime artifact changed before spawn."""
+
+    limits = {
+        "deepstream_config": MAX_INFERENCE_CONFIG_BYTES,
+        "pose_sidecar": MAX_POSE_SIDECAR_BYTES,
+        "class_labels": MAX_LABEL_BYTES,
+        "keypoint_labels": MAX_LABEL_BYTES,
+        "onnx": 4 * 1024 * 1024 * 1024,
+        "engine": 4 * 1024 * 1024 * 1024,
+        "custom_parser": 512 * 1024 * 1024,
+    }
+    for name, expected in prepared.artifacts.items():
+        current = file_identity(Path(str(expected["path"])), max_bytes=limits[name])
+        if current != dict(expected):
+            raise RuntimeError(f"effective DeepStream artifact changed before capture launch: {name}")
+
+
+ProcessHandle = supervision.ProcessHandle
+_should_suppress_child_output = supervision.should_suppress_child_output
 
 
 def _spawn(
@@ -251,35 +353,28 @@ def _spawn(
     name: str,
     extra_env: dict[str, str] | None = None,
     on_exit: Callable[[int], None] | None = None,
+    output_log_path: Path | None = None,
+    parent_death_signal: signal.Signals | None = None,
 ) -> ProcessHandle:
-    cmd = [sys.executable, "-m", module, *args]
-    emit(f"{name} CMD: {' '.join(shlex.quote(c) for c in cmd)}")
-    env = os.environ.copy()
-    pkg_root = str(WORKSPACE)
-    if env.get("PYTHONPATH"):
-        env["PYTHONPATH"] = f"{pkg_root}{os.pathsep}{env['PYTHONPATH']}"
-    else:
-        env["PYTHONPATH"] = pkg_root
-    env["PYTHONUNBUFFERED"] = "1"
-    if extra_env:
-        env.update(extra_env)
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(WORKSPACE),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        preexec_fn=os.setsid,
-        env=env,
+    return supervision.spawn(
+        module,
+        args,
+        emit,
+        name,
+        workspace=WORKSPACE,
+        extra_env=extra_env,
+        on_exit=on_exit,
+        output_log_path=output_log_path,
+        parent_death_signal=parent_death_signal,
     )
-    return ProcessHandle(name, proc, emit, on_exit=on_exit)
 
 
 def spawn_inference(
     config: LaunchConfig,
     emit: Callable[[str], None],
     on_exit: Callable[[int], None] | None = None,
+    *,
+    effective_config: EffectiveDeepStreamConfig | None = None,
 ) -> ProcessHandle:
     backend = str(getattr(config, "capture_backend", "flir_direct") or "flir_direct").lower().strip()
     if backend != "flir_direct":
@@ -287,10 +382,15 @@ def spawn_inference(
 
     args: list[str] = []
     if config.ds_cfg is not None:
-        ds_cfg = squeakview_config.resolve_workspace_path(config.ds_cfg)
-        if ds_cfg is not None:
-            ds_cfg = _localize_deepstream_config(ds_cfg, config.run_dir, emit)
-            config.ds_cfg = ds_cfg
+        if effective_config is not None:
+            verify_effective_deepstream_config(effective_config)
+            ds_cfg = effective_config.path
+            if Path(config.ds_cfg).expanduser().resolve() != ds_cfg.resolve():
+                raise RuntimeError("capture config does not match prepared DeepStream config")
+        else:
+            ds_cfg = squeakview_config.resolve_workspace_path(config.ds_cfg)
+            if ds_cfg is not None:
+                ds_cfg = _localize_deepstream_config(ds_cfg, config.run_dir, emit)
         args += ["--cfg", str(ds_cfg)]
     args += ["--capture-backend", backend]
     args += ["--num-cameras", str(max(1, int(getattr(config, "num_cameras", 1))))]
@@ -310,14 +410,20 @@ def spawn_inference(
     if config.fps:
         args += ["--fps", str(config.fps)]
     args += ["--bitrate", str(config.bitrate)]
+    configured_preview_sockets = config.preview_socket_paths
     if config.run_dir is not None:
         args += ["--run-dir", str(config.run_dir)]
-        if not config.preview_socket_paths:
-            config.preview_socket_paths = preview_socket_paths(config.run_dir, config.num_cameras)
-    for socket_path in config.preview_socket_paths:
-        args += ["--preview-socket", str(socket_path)]
+        if config.preview_enabled and not configured_preview_sockets:
+            configured_preview_sockets = preview_socket_paths(
+                config.run_dir, config.num_cameras
+            )
+    for socket_path in configured_preview_sockets:
+        if config.preview_enabled:
+            args += ["--preview-socket", str(socket_path)]
     if not config.inference_enabled:
         args.append("--disable-infer")
+    if config.failure_plan is not None:
+        args += ["--failure-plan", str(config.failure_plan)]
     extra_env = _deepstream_runtime_env()
     debug_profile = os.environ.get("SQUEAKVIEW_DEEPSTREAM_DEBUG_PROFILE", "0").lower()
     if debug_profile in {"1", "true", "yes", "on"}:
@@ -342,7 +448,21 @@ def spawn_inference(
             emit(f"【DS】 GST_PLUGIN_PATH includes {plugin_dir}")
         else:
             emit(f"【DS】 WARN: FLIR direct plugin build directory not found: {plugin_dir}")
-    return _spawn(INFERENCE_ENTRY, args, emit, "【DS】", extra_env=extra_env, on_exit=on_exit)
+    output_log_path = (
+        Path(config.run_dir) / "diagnostics" / "deepstream.log"
+        if config.run_dir is not None
+        else None
+    )
+    return _spawn(
+        INFERENCE_ENTRY,
+        args,
+        emit,
+        "【DS】",
+        extra_env=extra_env,
+        on_exit=on_exit,
+        output_log_path=output_log_path,
+        parent_death_signal=signal.SIGINT,
+    )
 
 
 def spawn_post_run(

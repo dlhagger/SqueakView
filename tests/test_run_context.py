@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import threading
 import tempfile
 import unittest
@@ -65,6 +66,67 @@ class RunContextTests(unittest.TestCase):
         self.assertEqual(status["updated_at"], "2026-01-01T00:00:03")
         self.assertEqual(len(status["history"]), 4)
         self.assertFalse(list(run_dir.glob(".*.tmp")))
+
+    def test_finalized_status_clears_active_stage_but_preserves_history(self) -> None:
+        run_dir = self.root / "finalized"
+        run_context.write_status(
+            run_dir, "finalizing", stage="recording_validation"
+        )
+
+        run_context.write_status(run_dir, "finalized")
+
+        status = run_context.read_json(run_dir / run_context.RUN_STATUS_FILENAME)
+        self.assertEqual(status["state"], "finalized")
+        self.assertNotIn("stage", status)
+        self.assertEqual(
+            status["history"][0]["stage"], "recording_validation"
+        )
+
+    def test_required_metadata_rejects_duplicates_and_updates_do_not_replace_it(self) -> None:
+        run_dir = self.root / "corrupt"
+        run_dir.mkdir(parents=True)
+        status = run_dir / run_context.RUN_STATUS_FILENAME
+        original = b'{"state":"recording","state":"failed"}'
+        status.write_bytes(original)
+
+        with self.assertRaisesRegex(ValueError, "duplicate key 'state'"):
+            run_context.read_json_required(status)
+        self.assertEqual(run_context.read_json(status), {})
+        with self.assertRaisesRegex(ValueError, "duplicate key 'state'"):
+            run_context.update_status(run_dir, note="must not overwrite")
+        self.assertEqual(status.read_bytes(), original)
+
+    def test_run_metadata_reads_are_bounded(self) -> None:
+        run_dir = self.root / "oversized"
+        run_dir.mkdir(parents=True)
+        status = run_dir / run_context.RUN_STATUS_FILENAME
+        status.write_bytes(b" " * (run_context.MAX_RUN_METADATA_BYTES + 1))
+
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            run_context.read_json_required(status)
+        self.assertEqual(run_context.read_json(status), {})
+
+    def test_required_metadata_identity_hashes_the_bytes_that_were_parsed(self) -> None:
+        path = self.root / "identified" / run_context.RUN_STATUS_FILENAME
+        path.parent.mkdir(parents=True)
+        encoded = b'{"state":"finalized"}\n'
+        path.write_bytes(encoded)
+
+        payload, identity = run_context.read_json_required_with_identity(path)
+
+        self.assertEqual(payload, {"state": "finalized"})
+        self.assertEqual(identity["sha256"], hashlib.sha256(encoded).hexdigest())
+
+    def test_atomic_json_rejects_nonfinite_values_without_replacing_file(self) -> None:
+        path = self.root / "metadata.json"
+        path.parent.mkdir(parents=True)
+        path.write_text('{"state":"original"}\n')
+
+        with self.assertRaisesRegex(ValueError, "JSON compliant"):
+            run_context.atomic_write_json(path, {"temperature": float("nan")})
+
+        self.assertEqual(path.read_text(), '{"state":"original"}\n')
+        self.assertFalse(list(path.parent.glob(".*.tmp")))
 
     def test_concurrent_status_updates_do_not_lose_history(self) -> None:
         run_dir = self.root / "concurrent"

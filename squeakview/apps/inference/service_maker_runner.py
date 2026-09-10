@@ -1,21 +1,15 @@
 """DeepStream 9.1 inference runner built on the PyServiceMaker Pipeline API."""
 from __future__ import annotations
 
-import atexit
-import csv
-import ctypes
-import json
 import signal
-import shutil
-import subprocess
+import os
 import threading
 import time
-from dataclasses import dataclass, field
+import sys
 from pathlib import Path
 from typing import Callable
 
 from pyservicemaker import (
-    BatchMetadataOperator,
     EOSMessage,
     Pipeline,
     PipelineState,
@@ -24,50 +18,39 @@ from pyservicemaker import (
 )
 
 from squeakview.common import run_context
-from squeakview.common.capture_policy import (
-    capture_buffer_policy,
-    leaky_inference_queue_properties,
-    non_leaky_record_queue_properties,
+from squeakview.common.child_events import encode_child_event
+from squeakview.common.diagnostics.system_telemetry import SystemTelemetryRecorder
+from .contracts import (
+    InferenceConfig,
+    _load_class_names,
+    _read_config_value,
+    _validate_config,
 )
-from .pose_pipeline import (
-    FramePoseStore,
-    ObservationOperator,
-    Yolo26PoseTensorOperator,
-    load_pose_schema,
+from .frame_audit import (
+    FLIR_FRAME_META_DESCRIPTOR,
+    FrameCsvOperator,
+    _flir_frame_meta_type,
+    _user_meta_type,
+)
+from .pose_pipeline import ObservationOperator
+from .pipeline_builder import (
+    build_pipeline,
+    camera_source_properties,
+    flir_pixel_format,
 )
 from .recording import (
     RecordingAdmissionOperator,
-    RecordingEgressOperator,
-    RecordingIngressOperator,
     RecordingPathTelemetry,
 )
-
-
-FLIR_FRAME_META_DESCRIPTOR = b"SQUEAKVIEW.FLIR.FRAME_META.v1"
-
-
-def _user_meta_type(descriptor: bytes) -> int:
-    """Resolve a process-local NvDs user-meta type without depending on pyds."""
-
-    candidates = (
-        "/opt/nvidia/deepstream/deepstream/lib/libnvds_meta.so",
-        "libnvds_meta.so",
-    )
-    last_error: OSError | None = None
-    for candidate in candidates:
-        try:
-            library = ctypes.CDLL(candidate)
-            function = library.nvds_get_user_meta_type
-            function.argtypes = [ctypes.c_char_p]
-            function.restype = ctypes.c_int
-            return int(function(descriptor))
-        except OSError as exc:
-            last_error = exc
-    raise RuntimeError(f"DeepStream metadata library is unavailable: {last_error}")
-
-
-def _flir_frame_meta_type() -> int:
-    return _user_meta_type(FLIR_FRAME_META_DESCRIPTOR)
+from .recording_liveness import (
+    RecordingLivenessMonitor,
+    resolve_recording_liveness_policy,
+)
+from .storage_reserve import (
+    StorageReserveMonitor,
+    resolve_storage_reserve_policy,
+)
+from .video_probe import probe_video_frames
 
 
 def ts() -> str:
@@ -83,421 +66,10 @@ def _safe_print(message: str) -> None:
         pass
 
 
-@dataclass(slots=True)
-class InferenceConfig:
-    """CLI-compatible configuration shared with the operator subprocess."""
-
-    cfg_path: Path | None = field(default_factory=lambda: Path.cwd() / "config_infer_primary_11m.txt")
-    capture_backend: str = "flir_direct"
-    num_cameras: int = 1
-    camera_serials: tuple[str, ...] = ()
-    pixel_format: str = "Mono8"
-    trigger_on: bool = False
-    trigger_activation: str = "rising"
-    exposure_us: float | None = 10000.0
-    gain: float | None = -1.0
-    width: int = 1280
-    height: int = 720
-    fps: int = 30
-    bitrate: int = 4000
-    preview_sockets: tuple[Path, ...] = ()
-    enable_infer: bool = True
-    run_dir: Path | None = None
-
-
 def _flir_pixel_format(value: str | None) -> str:
-    pixel_format = str(value or "Mono8").strip()
-    return "Mono8" if pixel_format.upper() == "GRAY8" else pixel_format or "Mono8"
+    """Compatibility wrapper for callers importing the legacy helper."""
 
-
-def _read_config_value(config_path: Path | None, key: str) -> str | None:
-    if config_path is None:
-        return None
-    try:
-        lines = config_path.read_text().splitlines()
-    except OSError:
-        return None
-    prefix = key.lower()
-    for line in lines:
-        raw = line.strip()
-        if not raw or raw.startswith("#") or "=" not in raw:
-            continue
-        name, value = raw.split("=", 1)
-        if name.strip().lower() == prefix:
-            return value.strip().strip('"')
-    return None
-
-
-def _load_class_names(config_path: Path | None) -> list[str]:
-    raw_path = _read_config_value(config_path, "labelfile-path")
-    if not raw_path or config_path is None:
-        return []
-    path = Path(raw_path).expanduser()
-    if not path.is_absolute():
-        path = config_path.parent / path
-    try:
-        return [line.strip() for line in path.read_text().splitlines() if line.strip()]
-    except OSError:
-        return []
-
-
-def _validate_config(config: InferenceConfig) -> None:
-    backend = str(config.capture_backend or "").lower().strip()
-    if backend != "flir_direct":
-        raise ValueError(f"SqueakView only supports capture_backend='flir_direct' (got {backend!r})")
-    if config.num_cameras < 1:
-        raise ValueError("num_cameras must be at least 1")
-    if config.camera_serials and len(config.camera_serials) != config.num_cameras:
-        raise ValueError("camera serial count must match camera count")
-    if len(set(config.camera_serials)) != len(config.camera_serials):
-        raise ValueError("camera serials must be unique")
-    for name in ("width", "height", "fps", "bitrate"):
-        if int(getattr(config, name)) <= 0:
-            raise ValueError(f"{name} must be greater than zero")
-    if config.enable_infer:
-        if config.cfg_path is None:
-            raise ValueError("DeepStream config (--cfg) is required when inference is enabled")
-        if not Path(config.cfg_path).is_file():
-            raise FileNotFoundError(f"DeepStream config does not exist: {config.cfg_path}")
-        batch_size = _read_config_value(Path(config.cfg_path), "batch-size")
-        if batch_size is not None and int(batch_size) != int(config.num_cameras):
-            raise ValueError(
-                f"nvinfer config batch-size ({batch_size}) does not match camera count "
-                f"({config.num_cameras})"
-            )
-    if config.preview_sockets and len(config.preview_sockets) != config.num_cameras:
-        raise ValueError(
-            "preview socket count "
-            f"({len(config.preview_sockets)}) does not match camera count ({config.num_cameras})"
-        )
-
-
-
-
-class FrameCsvOperator(BatchMetadataOperator):
-    """Write scientific frame metadata from a DeepStream batch or reconciled source ledger."""
-
-    HEADERS = [
-        "stream_id",
-        "camera_serial",
-        "deepstream_frame_number",
-        "source_sequence_index",
-        "source",
-        "raw_frame_index",
-        "pts_ns",
-        "dts_ns",
-        "duration_ns",
-        "host_monotonic_ns",
-        "host_unix_ns",
-        "status",
-        "camera_frame_id",
-        "camera_frame_id_available",
-        "stream_frame_id",
-        "chunk_frame_id",
-        "frame_id_delta_consistent",
-        "missing_frames_before",
-        "pipeline_missing_frames_before",
-        "camera_timestamp_ns",
-        "chunk_timestamp_raw",
-        "timestamp_increment_ns",
-        "gst_pts_ns",
-        "timestamp_origin",
-        "host_received_monotonic_ns",
-        "host_received_unix_ns",
-        "copy_complete_monotonic_ns",
-        "observer_monotonic_ns",
-        "exposure_us",
-        "gain_db",
-        "black_level",
-        "payload_crc_valid",
-        "image_status",
-        "source_width",
-        "source_height",
-        "source_pixel_format",
-        "metadata_status",
-        "inference_admitted",
-    ]
-    TELEMETRY_HEADERS = [
-        "host_unix_ns", "host_monotonic_ns", "stream_id", "camera_serial",
-        "source_sequence_index", "camera_frame_id", "sensor_temperature_c",
-        "mainboard_temperature_c", "stream_started_frames", "stream_delivered_frames",
-        "stream_incomplete_frames", "stream_lost_frames", "stream_dropped_frames",
-        "stream_input_buffers", "stream_output_buffers",
-    ]
-    EVENT_HEADERS = [
-        "host_unix_ns", "host_monotonic_ns", "event_type", "stream_id",
-        "expected_frame_id", "actual_frame_id", "details",
-    ]
-
-    def __init__(
-        self,
-        path: Path,
-        *,
-        meta_type: int | None = None,
-        audit_dir: Path | None = None,
-        write_audit_sidecars: bool = True,
-    ):
-        super().__init__()
-        self.path = path
-        self.meta_type = _flir_frame_meta_type() if meta_type is None else int(meta_type)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = path.open("w", newline="", buffering=1)
-        self._writer = csv.writer(self._file)
-        self._writer.writerow(self.HEADERS)
-        self._lock = threading.Lock()
-        self._closed = False
-        self._audit_dir = Path(audit_dir) if audit_dir is not None else path.parent
-        self._write_audit_sidecars = bool(write_audit_sidecars)
-        if self._write_audit_sidecars:
-            self._audit_dir.mkdir(parents=True, exist_ok=True)
-        self._runtime_path = (
-            self._audit_dir / "camera_runtime.json"
-            if self._write_audit_sidecars
-            else None
-        )
-        self._camera_runtime: dict[str, dict] = {}
-        self._last_source_sequence: dict[int, int] = {}
-        self._telemetry_file = None
-        self._telemetry_writer = None
-        self._events_file = None
-        self._events_writer = None
-        if self._write_audit_sidecars:
-            self._telemetry_file = (self._audit_dir / "camera.csv").open(
-                "w", newline="", buffering=1
-            )
-            self._telemetry_writer = csv.writer(self._telemetry_file)
-            self._telemetry_writer.writerow(self.TELEMETRY_HEADERS)
-            self._events_file = (self._audit_dir / "errors.csv").open(
-                "w", newline="", buffering=1
-            )
-            self._events_writer = csv.writer(self._events_file)
-            self._events_writer.writerow(self.EVENT_HEADERS)
-        atexit.register(self.close)
-
-    @staticmethod
-    def _frame_pts(frame_meta) -> int:
-        return int(
-            getattr(frame_meta, "buffer_pts", None)
-            or getattr(frame_meta, "buf_pts", None)
-            or 0
-        )
-
-    def _metadata(self, frame_meta) -> tuple[dict, str]:
-        try:
-            items = list(frame_meta.user_meta_items(self.meta_type))
-        except Exception as exc:
-            return {}, f"user_meta_error:{type(exc).__name__}"
-        if not items:
-            return {}, "missing"
-        for item in items:
-            try:
-                payload = item.get_user_data_json()
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-                if isinstance(payload, dict):
-                    return payload, "ok" if len(items) == 1 else "ok_multiple"
-            except Exception:
-                continue
-        return {}, "invalid_json"
-
-    @staticmethod
-    def _value(payload: dict, name: str):
-        value = payload.get(name)
-        return "" if value is None else value
-
-    def _remember_camera(self, payload: dict) -> None:
-        serial = str(payload.get("camera_serial") or f"index:{payload.get('camera_index', '')}")
-        if self._runtime_path is None or not payload or serial in self._camera_runtime:
-            return
-        self._camera_runtime[serial] = {
-            "camera_index": payload.get("camera_index"),
-            "camera_serial": payload.get("camera_serial"),
-            "device_model": payload.get("device_model"),
-            "firmware_version": payload.get("firmware_version"),
-            "source_width": payload.get("source_width"),
-            "source_height": payload.get("source_height"),
-            "source_pixel_format": payload.get("source_pixel_format"),
-            "actual_fps": payload.get("actual_fps"),
-            "configured_exposure_us": payload.get("configured_exposure_us"),
-            "configured_gain_db": payload.get("configured_gain_db"),
-            "configured_stream_buffer_count": payload.get("configured_stream_buffer_count"),
-            "timestamp_increment_ns": payload.get("timestamp_increment_ns"),
-            "timestamp_latch_available": payload.get("timestamp_latch_available"),
-            "timestamp_latch_raw": payload.get("timestamp_latch_raw"),
-            "timestamp_latch_host_monotonic_before_ns": payload.get("timestamp_latch_host_monotonic_before_ns"),
-            "timestamp_latch_host_monotonic_after_ns": payload.get("timestamp_latch_host_monotonic_after_ns"),
-            "timestamp_latch_host_unix_before_ns": payload.get("timestamp_latch_host_unix_before_ns"),
-            "timestamp_latch_host_unix_after_ns": payload.get("timestamp_latch_host_unix_after_ns"),
-            "enabled_chunks": payload.get("enabled_chunks"),
-        }
-        run_context.atomic_write_json(
-            self._runtime_path,
-            {
-                "schema_version": "1.0",
-                "metadata_type": FLIR_FRAME_META_DESCRIPTOR.decode(),
-                "cameras": list(self._camera_runtime.values()),
-            },
-        )
-
-    def _event(
-        self,
-        event_type: str,
-        *,
-        stream_id: int,
-        expected_frame_id="",
-        actual_frame_id="",
-        details: dict | None = None,
-        host_unix_ns: int | None = None,
-        host_monotonic_ns: int | None = None,
-    ) -> None:
-        if self._events_writer is None:
-            return
-        self._events_writer.writerow(
-            [
-                host_unix_ns if host_unix_ns is not None else time.time_ns(),
-                host_monotonic_ns if host_monotonic_ns is not None else time.monotonic_ns(),
-                event_type, stream_id,
-                expected_frame_id, actual_frame_id,
-                json.dumps(details or {}, sort_keys=True, separators=(",", ":")),
-            ]
-        )
-
-    def _write_audit_rows(
-        self, payload: dict, status: str, stream_id: int, pipeline_missing
-    ) -> None:
-        event_clocks = {
-            "host_unix_ns": payload.get("host_received_unix_ns"),
-            "host_monotonic_ns": payload.get("host_received_monotonic_ns"),
-        }
-        if payload.get("telemetry_sample") and self._telemetry_writer is not None:
-            self._telemetry_writer.writerow(
-                [
-                    self._value(payload, "host_received_unix_ns"),
-                    self._value(payload, "host_received_monotonic_ns"),
-                    stream_id,
-                    self._value(payload, "camera_serial"),
-                    self._value(payload, "source_sequence_index"),
-                    self._value(payload, "camera_frame_id"),
-                    self._value(payload, "sensor_temperature_c"),
-                    self._value(payload, "mainboard_temperature_c"),
-                    self._value(payload, "stream_started_frames"),
-                    self._value(payload, "stream_delivered_frames"),
-                    self._value(payload, "stream_incomplete_frames"),
-                    self._value(payload, "stream_lost_frames"),
-                    self._value(payload, "stream_dropped_frames"),
-                    self._value(payload, "stream_input_buffers"),
-                    self._value(payload, "stream_output_buffers"),
-                ]
-            )
-        camera_missing = payload.get("missing_frames_before")
-        camera_frame_id = payload.get("camera_frame_id")
-        if isinstance(camera_missing, int) and camera_missing > 0 and isinstance(camera_frame_id, int):
-            self._event(
-                "camera_frame_gap",
-                stream_id=stream_id,
-                expected_frame_id=camera_frame_id - camera_missing,
-                actual_frame_id=camera_frame_id,
-                details={"missing_frames": camera_missing},
-                **event_clocks,
-            )
-        if isinstance(pipeline_missing, int) and pipeline_missing > 0:
-            source_sequence = payload.get("source_sequence_index")
-            self._event(
-                "pipeline_frame_gap",
-                stream_id=stream_id,
-                expected_frame_id=(source_sequence - pipeline_missing) if isinstance(source_sequence, int) else "",
-                actual_frame_id=source_sequence if isinstance(source_sequence, int) else "",
-                details={"missing_frames": pipeline_missing},
-                **event_clocks,
-            )
-        if payload.get("crc_valid") is False:
-            self._event(
-                "payload_crc_failure",
-                stream_id=stream_id,
-                actual_frame_id=camera_frame_id if isinstance(camera_frame_id, int) else "",
-                **event_clocks,
-            )
-        if not status.startswith("ok"):
-            self._event("frame_metadata_" + status, stream_id=stream_id, **event_clocks)
-
-    def handle_metadata(self, batch_meta) -> None:
-        with self._lock:
-            for frame_meta in batch_meta.frame_items:
-                payload, status = self._metadata(frame_meta)
-                self._remember_camera(payload)
-                stream_id = int(getattr(frame_meta, "source_id", frame_meta.pad_index))
-                pts_ns = self._frame_pts(frame_meta)
-                camera_timestamp = payload.get("transport_timestamp_ns")
-                camera_frame_id = payload.get("camera_frame_id")
-                source_sequence = payload.get("source_sequence_index")
-                pipeline_missing = ""
-                if isinstance(source_sequence, int):
-                    previous_sequence = self._last_source_sequence.get(stream_id)
-                    pipeline_missing = (
-                        max(0, source_sequence - previous_sequence - 1)
-                        if previous_sequence is not None else 0
-                    )
-                    self._last_source_sequence[stream_id] = source_sequence
-                self._write_audit_rows(payload, status, stream_id, pipeline_missing)
-                self._writer.writerow(
-                    [
-                        stream_id,
-                        self._value(payload, "camera_serial"),
-                        int(frame_meta.frame_number),
-                        self._value(payload, "source_sequence_index"),
-                        f"flirspinsrc:{stream_id}",
-                        self._value(payload, "source_sequence_index"),
-                        pts_ns or self._value(payload, "gst_pts_ns"),
-                        pts_ns or self._value(payload, "gst_pts_ns"),
-                        (
-                            int(round(1_000_000_000 / float(payload["actual_fps"])))
-                            if payload.get("actual_fps") else ""
-                        ),
-                        self._value(payload, "host_received_monotonic_ns"),
-                        self._value(payload, "host_received_unix_ns"),
-                        "ok" if status.startswith("ok") else status,
-                        "" if camera_frame_id is None else camera_frame_id,
-                        int(camera_frame_id is not None),
-                        self._value(payload, "stream_frame_id"),
-                        self._value(payload, "chunk_frame_id"),
-                        self._value(payload, "frame_id_delta_consistent"),
-                        self._value(payload, "missing_frames_before"),
-                        pipeline_missing,
-                        "" if camera_timestamp is None else camera_timestamp,
-                        self._value(payload, "chunk_timestamp_raw"),
-                        self._value(payload, "timestamp_increment_ns"),
-                        pts_ns or self._value(payload, "gst_pts_ns"),
-                        self._value(payload, "timestamp_origin"),
-                        self._value(payload, "host_received_monotonic_ns"),
-                        self._value(payload, "host_received_unix_ns"),
-                        self._value(payload, "copy_complete_monotonic_ns"),
-                        time.monotonic_ns(),
-                        self._value(payload, "chunk_exposure_us"),
-                        self._value(payload, "chunk_gain_db"),
-                        self._value(payload, "chunk_black_level"),
-                        self._value(payload, "crc_valid"),
-                        self._value(payload, "image_status"),
-                        self._value(payload, "source_width"),
-                        self._value(payload, "source_height"),
-                        self._value(payload, "source_pixel_format"),
-                        status,
-                        self._value(payload, "inference_admitted"),
-                    ]
-                )
-
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._file.flush()
-            self._file.close()
-            if self._telemetry_file is not None:
-                self._telemetry_file.flush()
-                self._telemetry_file.close()
-            if self._events_file is not None:
-                self._events_file.flush()
-                self._events_file.close()
+    return flir_pixel_format(value)
 
 
 class ServiceMakerApp:
@@ -509,6 +81,7 @@ class ServiceMakerApp:
         *,
         pipeline_factory: Callable[[str], Pipeline] = Pipeline,
         probe_factory: Callable[[str, object], Probe] = Probe,
+        system_telemetry_factory: Callable[..., SystemTelemetryRecorder] = SystemTelemetryRecorder,
     ):
         _validate_config(config)
         self.config = config
@@ -520,21 +93,74 @@ class ServiceMakerApp:
             self.run_dir = Path(config.run_dir).expanduser()
             self.run_dir.mkdir(parents=True, exist_ok=True)
         self.artifacts = run_context.run_artifacts(self.run_dir)
+        if config.failure_plan is not None:
+            run_context.update_status(
+                self.run_dir,
+                failure_injection=config.failure_plan.as_manifest(),
+                production_eligible=False,
+            )
         self.pipeline: Pipeline | None = None
         self.observations: ObservationOperator | None = None
         self.frames: FrameCsvOperator | None = None
         self.record_admissions: list[RecordingAdmissionOperator] = []
         self.record_telemetry: list[RecordingPathTelemetry] = []
+        self.preview_boundaries = []
+        self._stop_event = threading.Event()
+        self.system_telemetry = system_telemetry_factory(
+            self.run_dir / "diagnostics" / "system.csv",
+            on_error=self._system_telemetry_fault,
+            shutdown_requested=self._stop_event.is_set,
+        )
         self._ready = False
         self._stopped = False
         self.exit_code = 0
-        self._stop_event = threading.Event()
+        self._explicit_stop_requested = False
+        self._pipeline_wait_thread: threading.Thread | None = None
+        self._pipeline_wait_error: str | None = None
+        self._recording_liveness_thread: threading.Thread | None = None
+        self._recording_liveness_monitor: RecordingLivenessMonitor | None = None
+        self._storage_reserve_thread: threading.Thread | None = None
+        self._storage_reserve_monitor: StorageReserveMonitor | None = None
+        self._force_process_exit = False
+        self._recording_integrity_failed = False
+
+    def _system_telemetry_fault(self, message: str) -> None:
+        """Persist observability loss immediately without aborting recording."""
+
+        detail = str(message).strip() or "unknown system telemetry failure"
+        _safe_print(f"[{ts()}] [SYSTEM] WARN: {detail}")
+        try:
+            run_context.update_status(
+                self.run_dir,
+                system_telemetry_degraded=True,
+                system_telemetry_error=detail,
+            )
+        except Exception as exc:
+            _safe_print(
+                f"[{ts()}] [SYSTEM] WARN: could not persist telemetry failure: {exc}"
+            )
 
     def _recording_fault(self, message: str) -> None:
+        self._recording_integrity_failed = True
         if self.exit_code == 0:
             self.exit_code = 4
         self._stop_event.set()
         _safe_print(f"[{ts()}] [RECORD] FATAL: {message}")
+
+    def _storage_reserve_fault(self, message: str) -> None:
+        """Stop through normal EOS drain while enough reserve remains to finalize."""
+
+        if self.exit_code == 0:
+            self.exit_code = 5
+        self._stop_event.set()
+        _safe_print(
+            encode_child_event(
+                "fatal",
+                run_dir=str(self.run_dir),
+                error=message,
+            )
+        )
+        _safe_print(f"[{ts()}] [STORAGE] FATAL: {message}")
 
     def _prewarm_cuda(self) -> None:
         if not self.config.enable_infer:
@@ -557,69 +183,7 @@ class ServiceMakerApp:
 
     @staticmethod
     def _video_frame_probe(path: Path) -> dict[str, object]:
-        ffprobe = shutil.which("ffprobe")
-        if ffprobe is None or not path.is_file():
-            reason = "ffprobe is unavailable" if ffprobe is None else "video file is missing"
-            return {"count": None, "method": None, "error": reason}
-
-        attempts = (
-            (
-                "container_nb_frames",
-                [
-                    ffprobe,
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=nb_frames",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    str(path),
-                ],
-                10,
-            ),
-            (
-                "decoded_nb_read_frames",
-                [
-                    ffprobe,
-                    "-v",
-                    "error",
-                    "-count_frames",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=nb_read_frames",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    str(path),
-                ],
-                60,
-            ),
-        )
-        errors: list[str] = []
-        for method, command, timeout_s in attempts:
-            try:
-                result = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=timeout_s,
-                )
-            except subprocess.TimeoutExpired:
-                errors.append(f"{method} timed out after {timeout_s}s")
-                continue
-            output = result.stdout.strip()
-            if result.returncode == 0:
-                try:
-                    return {"count": int(output), "method": method, "error": None}
-                except ValueError:
-                    errors.append(f"{method} returned {output or 'no frame count'}")
-                    continue
-            detail = result.stderr.strip() or f"exit code {result.returncode}"
-            errors.append(f"{method} failed: {detail}")
-        return {"count": None, "method": None, "error": "; ".join(errors)}
+        return probe_video_frames(path)
 
     @classmethod
     def _video_frame_count(cls, path: Path) -> int | None:
@@ -627,261 +191,33 @@ class ServiceMakerApp:
         return int(count) if count is not None else None
 
     def _camera_properties(self, index: int) -> dict[str, object]:
-        cfg = self.config
-        buffer_policy = capture_buffer_policy(cfg.fps)
-        properties: dict[str, object] = {
-            "camera-index": index,
-            "width": int(cfg.width),
-            "height": int(cfg.height),
-            "fps": int(cfg.fps),
-            "pixel-format": _flir_pixel_format(cfg.pixel_format),
-            "trigger": bool(cfg.trigger_on),
-            "trigger-activation": (
-                "falling" if str(cfg.trigger_activation).lower().startswith("fall") else "rising"
-            ),
-            "exposure-us": -1.0 if cfg.exposure_us is None else float(cfg.exposure_us),
-            "gain": -1.0 if cfg.gain is None else float(cfg.gain),
-            "drop-incomplete": False,
-            "buffer-handling": "OldestFirst",
-            "stream-buffer-count": buffer_policy.source_transport_buffers,
-            "capture-log-path": str(self.run_dir / f"capture_cam{index}.jsonl"),
-            "metadata-profile": "scientific",
-            "max-consecutive-timeouts": 0 if cfg.trigger_on else 10,
-        }
-        if cfg.camera_serials:
-            properties["camera-serial"] = cfg.camera_serials[index]
-        return properties
+        """Compatibility wrapper around the extracted source builder."""
 
-    def _add_camera(self, pipeline: Pipeline, index: int) -> None:
-        cfg = self.config
-        buffer_policy = capture_buffer_policy(cfg.fps)
-        source = f"flirsrc{index}"
-        source_caps = f"source_caps{index}"
-        tee = f"camera_tee{index}"
-        record_queue = f"record_queue{index}"
-        infer_queue = f"infer_queue{index}"
-        infer_caps = f"infer_caps{index}"
-        raw_path = self.artifacts.raw_video if index == 0 else self.run_dir / f"raw_cam{index}.mp4"
-
-        pipeline.add("flirspinsrc", source, self._camera_properties(index))
-        pipeline.add(
-            "capsfilter",
-            source_caps,
-            {
-                "caps": (
-                    f"video/x-raw,format=GRAY8,width={cfg.width},height={cfg.height},"
-                    f"framerate={cfg.fps}/1"
-                )
-            },
-        )
-        pipeline.add("tee", tee).link(source, source_caps, tee)
-
-        pipeline.add(
-            "queue",
-            record_queue,
-            non_leaky_record_queue_properties(buffer_policy),
-        )
-        admission_path = (
-            self.run_dir / "record_admission.csv"
-            if index == 0 else self.run_dir / f"record_admission_cam{index}.csv"
-        )
-        diagnostics_dir = self.run_dir / "diagnostics"
-        diagnostics_dir.mkdir(parents=True, exist_ok=True)
-        telemetry_path = diagnostics_dir / (
-            "recording.csv" if index == 0 else f"recording_cam{index}.csv"
-        )
-        telemetry = RecordingPathTelemetry(
-            telemetry_path,
-            index,
-            warning_depth=buffer_policy.record_warning_frames,
-            fatal_depth=buffer_policy.record_failure_frames,
-            on_fatal=self._recording_fault,
-        )
-        self.record_telemetry.append(telemetry)
-        pipeline.attach(
-            source_caps,
-            self.probe_factory(
-                f"record_ingress{index}", RecordingIngressOperator(telemetry)
-            ),
-        )
-        admission = RecordingAdmissionOperator(admission_path, index, telemetry)
-        self.record_admissions.append(admission)
-        pipeline.attach(record_queue, self.probe_factory(f"record_admission{index}", admission))
-        pipeline.add(
-            "x264enc",
-            f"record_encoder{index}",
-            {
-                "tune": 4,  # GstX264EncTune.ZEROLATENCY
-                "speed-preset": 1,  # GstX264EncPreset.ULTRAFAST
-                "bitrate": int(cfg.bitrate),
-                "key-int-max": int(cfg.fps),
-                "bframes": 0,
-                "rc-lookahead": 0,
-                "sync-lookahead": 0,
-                "sliced-threads": False,
-                "vbv-buf-capacity": 100,
-                "qos": False,
-            },
-        )
-        pipeline.add("h264parse", f"record_parser{index}")
-        pipeline.attach(
-            f"record_parser{index}",
-            self.probe_factory(
-                f"record_egress{index}", RecordingEgressOperator(telemetry)
-            ),
-        )
-        pipeline.add("mp4mux", f"record_muxer{index}")
-        pipeline.add(
-            "filesink",
-            f"record_sink{index}",
-            {"location": str(raw_path), "qos": False, "sync": False},
-        )
-        pipeline.link(
-            tee,
-            record_queue,
-            f"record_encoder{index}",
-            f"record_parser{index}",
-            f"record_muxer{index}",
-            f"record_sink{index}",
-        )
-
-        pipeline.add(
-            "queue",
-            infer_queue,
-            leaky_inference_queue_properties(buffer_policy),
-        )
-        pipeline.add("nvvideoconvert", f"infer_convert{index}", {"compute-hw": 2, "copy-hw": 2})
-        pipeline.add(
-            "capsfilter",
-            infer_caps,
-            {
-                "caps": (
-                    f"video/x-raw(memory:NVMM),format=NV12,width={cfg.width},"
-                    f"height={cfg.height}"
-                )
-            },
-        )
-        pipeline.link(tee, infer_queue, f"infer_convert{index}", infer_caps)
-        pipeline.link((infer_caps, "mux"), ("", "sink_%u"))
+        return camera_source_properties(self.config, self.run_dir, index)
 
     def build(self) -> Pipeline:
-        cfg = self.config
-        pipeline = self.pipeline_factory("squeakview")
-        pipeline.add(
-            "nvstreammux",
-            "mux",
-            {
-                "batch-size": int(cfg.num_cameras),
-                "width": int(cfg.width),
-                "height": int(cfg.height),
-                "live-source": True,
-                "batched-push-timeout": max(10_000, int(1_000_000 / int(cfg.fps))),
-                "sync-inputs": bool(cfg.num_cameras > 1),
-            },
+        resources = build_pipeline(
+            self.config,
+            self.run_dir,
+            self.artifacts.raw_video,
+            pipeline_factory=self.pipeline_factory,
+            probe_factory=self.probe_factory,
+            on_recording_fault=self._recording_fault,
         )
-        for index in range(cfg.num_cameras):
-            self._add_camera(pipeline, index)
-
-        inference_dir = self.run_dir / "inference"
-        inference_dir.mkdir(parents=True, exist_ok=True)
-        self.frames = FrameCsvOperator(
-            inference_dir / "frames.csv",
-            write_audit_sidecars=False,
-        )
-        pipeline.attach("mux", self.probe_factory("frames", self.frames))
-
-        tail = ["mux"]
-        if cfg.enable_infer:
-            class_names = _load_class_names(Path(cfg.cfg_path))
-            pose_schema = load_pose_schema(Path(cfg.cfg_path), class_names)
-            pose_store = FramePoseStore()
-            pipeline.add(
-                "nvinfer",
-                "infer",
-                {
-                    "config-file-path": str(Path(cfg.cfg_path).resolve()),
-                    "batch-size": cfg.num_cameras,
-                    "filter-out-class-ids": ";".join(
-                        str(item.class_id) for item in pose_schema.classes
-                    ),
-                },
-            )
-            tail.append("infer")
-            tensor_operator = Yolo26PoseTensorOperator(pose_schema, pose_store)
-            pipeline.attach("infer", self.probe_factory("yolo26_pose", tensor_operator))
-
-            tracker_config = Path(__file__).resolve().parents[3] / "configs" / "tracker_mouse_nvdcf.yml"
-            pipeline.add(
-                "nvtracker",
-                "tracker",
-                {
-                    "tracker-width": 640,
-                    "tracker-height": 480,
-                    "ll-lib-file": (
-                        "/opt/nvidia/deepstream/deepstream/lib/"
-                        "libnvds_nvmultiobjecttracker.so"
-                    ),
-                    "ll-config-file": str(tracker_config),
-                    "operate-on-class-ids": ";".join(
-                        str(item.class_id) for item in pose_schema.classes if item.track
-                    ),
-                    "display-tracking-id": False,
-                    "tracking-id-reset-mode": 3,
-                },
-            )
-            tail.append("tracker")
-            self.observations = ObservationOperator(
-                self.run_dir,
-                pose_schema,
-                store=pose_store,
-                flir_meta_type=self.frames.meta_type,
-            )
-            pipeline.attach("tracker", self.probe_factory("observations", self.observations))
-        if not cfg.preview_sockets:
-            pipeline.add("fakesink", "sink", {"sync": False})
-            tail.append("sink")
-            pipeline.link(*tail)
-            self._ready_origin = "sink"
-        else:
-            pipeline.add("nvosdbin", "osd")
-            tail.append("osd")
-            pipeline.add("nvstreamdemux", "preview_demux")
-            tail.append("preview_demux")
-            pipeline.link(*tail)
-            for index, socket_path in enumerate(cfg.preview_sockets):
-                queue_name = f"preview_queue{index}"
-                sink_name = f"preview_sink{index}"
-                pipeline.add(
-                    "queue",
-                    queue_name,
-                    {
-                        "leaky": 2,
-                        "max-size-buffers": 1,
-                        "max-size-bytes": 0,
-                        "max-size-time": 0,
-                    },
-                )
-                pipeline.add(
-                    "nvunixfdsink",
-                    sink_name,
-                    {
-                        "socket-path": str(socket_path),
-                        "sync": False,
-                        "async": False,
-                        "buffer-timestamp-copy": True,
-                        "qos": False,
-                    },
-                )
-                pipeline.link(("preview_demux", queue_name), (f"src_{index}", ""))
-                pipeline.link(queue_name, sink_name)
-            self._ready_origin = "preview_sink0"
-        self.pipeline = pipeline
+        self.pipeline = resources.pipeline
+        self._ready_origin = resources.ready_origin
+        self.frames = resources.frames
+        self.observations = resources.observations
+        self.record_admissions = list(resources.admissions)
+        self.record_telemetry = list(resources.recording_telemetry)
+        self.preview_boundaries = list(resources.preview_boundaries)
         print(
-            f"[{ts()}] [INFO] PyServiceMaker pipeline built: cameras={cfg.num_cameras} "
-            f"inference={'on' if cfg.enable_infer else 'off'} run_dir={self.run_dir}",
+            f"[{ts()}] [INFO] PyServiceMaker pipeline built: cameras={self.config.num_cameras} "
+            f"inference={'on' if self.config.enable_infer else 'off'} "
+            f"run_dir={self.run_dir}",
             flush=True,
         )
-        return pipeline
+        return resources.pipeline
 
     def _on_message(self, message) -> None:
         if (
@@ -891,8 +227,47 @@ class ServiceMakerApp:
             and not self._ready
         ):
             self._ready = True
-            print(f"[{ts()}] [READY] inference playing", flush=True)
+            _safe_print(
+                encode_child_event(
+                    "pipeline_ready",
+                    run_dir=str(self.run_dir),
+                    ready_origin=self._ready_origin,
+                )
+            )
+            _safe_print(f"[{ts()}] [READY] inference playing")
         elif isinstance(message, EOSMessage):
+            if not self._explicit_stop_requested and self.exit_code == 0:
+                self.exit_code = 1
+                detail = "live capture reached EOS without an explicit stop request"
+                _safe_print(
+                    encode_child_event(
+                        "fatal",
+                        run_dir=str(self.run_dir),
+                        error=detail,
+                    )
+                )
+                _safe_print(f"[{ts()}] [FATAL] {detail}")
+            self._stop_event.set()
+
+    def _watch_pipeline_end(self) -> None:
+        """Wake the lifecycle owner if Service Maker ends without an EOS event."""
+
+        assert self.pipeline is not None
+        try:
+            self.pipeline.wait()
+        except Exception as exc:
+            self._pipeline_wait_error = f"{type(exc).__name__}: {exc}"
+        if not self._stop_event.is_set() and not self._stopped:
+            self.exit_code = 1
+            detail = self._pipeline_wait_error or "pipeline ended without EOS"
+            _safe_print(
+                encode_child_event(
+                    "fatal",
+                    run_dir=str(self.run_dir),
+                    error=detail,
+                )
+            )
+            _safe_print(f"[{ts()}] [FATAL] capture pipeline ended unexpectedly: {detail}")
             self._stop_event.set()
 
     def run(self) -> int:
@@ -900,57 +275,215 @@ class ServiceMakerApp:
             self.build()
         assert self.pipeline is not None
         try:
+            if not self.system_telemetry.start():
+                _safe_print(
+                    f"[{ts()}] [SYSTEM] WARN: system telemetry is unavailable; "
+                    "capture may continue but this run cannot satisfy telemetry qualification"
+                )
             self._prewarm_cuda()
             self.pipeline.start(self._on_message)
+            self._pipeline_wait_thread = threading.Thread(
+                target=self._watch_pipeline_end,
+                daemon=True,
+                name="squeakview-pipeline-wait",
+            )
+            self._pipeline_wait_thread.start()
+            self._recording_liveness_monitor = RecordingLivenessMonitor(
+                self.record_telemetry,
+                self._stop_event,
+                self._recording_fault,
+                resolve_recording_liveness_policy(
+                    self.config.fps,
+                    failure_injection=self.config.failure_plan is not None,
+                ),
+            )
+            self._recording_liveness_thread = threading.Thread(
+                target=self._recording_liveness_monitor.run,
+                daemon=True,
+                name="squeakview-recording-liveness",
+            )
+            self._recording_liveness_thread.start()
+            self._storage_reserve_monitor = StorageReserveMonitor(
+                self.run_dir,
+                self._stop_event,
+                self._storage_reserve_fault,
+                resolve_storage_reserve_policy(),
+            )
+            self._storage_reserve_thread = threading.Thread(
+                target=self._storage_reserve_monitor.run,
+                daemon=True,
+                name="squeakview-storage-reserve",
+            )
+            self._storage_reserve_thread.start()
             while not self._stop_event.wait(0.2):
                 pass
         except KeyboardInterrupt:
             print(f"[{ts()}] [INFO] Ctrl-C; stopping PyServiceMaker pipeline", flush=True)
         except Exception as exc:
             self.exit_code = 1
-            print(f"[{ts()}] [FATAL] PyServiceMaker pipeline failed: {exc}", flush=True)
+            _safe_print(
+                encode_child_event(
+                    "fatal",
+                    run_dir=str(self.run_dir),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            )
+            _safe_print(f"[{ts()}] [FATAL] PyServiceMaker pipeline failed: {exc}")
         finally:
             self.stop()
         return self.exit_code
 
     def request_stop(self) -> None:
+        self._explicit_stop_requested = True
         self._stop_event.set()
 
     def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
-        pipeline_close_error: str | None = None
-        if self.pipeline is not None:
+        # Wake every capture-owned monitor even when pipeline.start() or a
+        # lifecycle callback raised before the normal stop request path.
+        self._stop_event.set()
+        close_errors: list[str] = []
+
+        try:
+            shutdown_timeout_s = float(
+                os.environ.get("SQUEAKVIEW_PIPELINE_SHUTDOWN_TIMEOUT_S", "")
+                or (5.0 if self.config.failure_plan is not None else 20.0)
+            )
+        except ValueError:
+            shutdown_timeout_s = 20.0
+        shutdown_timeout_s = max(0.1, shutdown_timeout_s)
+
+        def close_resource(name: str, close_fn: Callable[[], object]) -> None:
             try:
-                self.pipeline.stop()
-                self.pipeline.wait()
+                close_fn()
             except Exception as exc:
                 self.exit_code = 1
-                pipeline_close_error = f"{type(exc).__name__}: {exc}"
-                _safe_print(
-                    f"[{ts()}] [RECORD] ERROR closing capture pipeline: "
-                    f"{pipeline_close_error}"
+                detail = f"{name}: {type(exc).__name__}: {exc}"
+                close_errors.append(detail)
+                _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
+
+        def close_pipeline_with_timeout(
+            name: str, close_fn: Callable[[], object]
+        ) -> bool:
+            completed = threading.Event()
+            failure: list[BaseException] = []
+
+            def invoke() -> None:
+                try:
+                    close_fn()
+                except BaseException as exc:  # preserve native binding failures
+                    failure.append(exc)
+                finally:
+                    completed.set()
+
+            threading.Thread(
+                target=invoke,
+                daemon=True,
+                name=f"squeakview-{name.replace(' ', '-')}",
+            ).start()
+            if not completed.wait(shutdown_timeout_s):
+                if self.exit_code == 0:
+                    self.exit_code = 1
+                self._force_process_exit = True
+                detail = (
+                    f"{name}: timed out after {shutdown_timeout_s:.1f}s; "
+                    "capture is not valid"
                 )
+                close_errors.append(detail)
+                _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
+                return False
+            if failure:
+                self.exit_code = 1
+                exc = failure[0]
+                detail = f"{name}: {type(exc).__name__}: {exc}"
+                close_errors.append(detail)
+                _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
+                return False
+            return True
+
+        if self.pipeline is not None and self._recording_integrity_failed:
+            # A blocked or failed loss-intolerant recording branch may make the
+            # native Service Maker stop call retain the GIL indefinitely.  The
+            # run is already invalid at this point, so flush the Python-owned
+            # scientific ledgers/status below and terminate without entering
+            # an unsafe native drain.  ``run`` uses os._exit only after those
+            # resources have been closed.
+            self._force_process_exit = True
+            detail = (
+                "capture pipeline native shutdown bypassed after a fatal "
+                "recording-integrity failure; capture is not valid"
+            )
+            close_errors.append(detail)
+            _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
+        elif self.pipeline is not None:
+            close_pipeline_with_timeout("capture pipeline stop", self.pipeline.stop)
+            if self._pipeline_wait_thread is not None:
+                self._pipeline_wait_thread.join(timeout=shutdown_timeout_s)
+                if self._pipeline_wait_thread.is_alive():
+                    if self.exit_code == 0:
+                        self.exit_code = 1
+                    self._force_process_exit = True
+                    detail = (
+                        "capture pipeline wait: timed out after "
+                        f"{shutdown_timeout_s:.1f}s; capture is not valid"
+                    )
+                    close_errors.append(detail)
+                    _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
+                if self._pipeline_wait_error is not None:
+                    self.exit_code = 1
+                    close_errors.append(
+                        f"capture pipeline wait: {self._pipeline_wait_error}"
+                    )
+            else:
+                close_pipeline_with_timeout("capture pipeline wait", self.pipeline.wait)
+        if self._recording_liveness_thread is not None:
+            close_resource(
+                "recording liveness monitor",
+                self._recording_liveness_thread.join,
+            )
+        if self._storage_reserve_thread is not None:
+            close_resource(
+                "storage reserve monitor",
+                self._storage_reserve_thread.join,
+            )
         if self.observations is not None:
-            self.observations.close()
-        for admission in self.record_admissions:
-            admission.close()
-        for telemetry in self.record_telemetry:
-            telemetry.close()
+            close_resource("observations", self.observations.close)
+        for index, admission in enumerate(self.record_admissions):
+            close_resource(f"record admission {index}", admission.close)
+        for index, telemetry in enumerate(self.record_telemetry):
+            close_resource(f"record telemetry {index}", telemetry.close)
+        for index, boundary in enumerate(self.preview_boundaries):
+            close_resource(f"preview boundary {index}", boundary.close)
         if self.frames is not None:
-            self.frames.close()
+            close_resource("frame ledger", self.frames.close)
+        close_resource("system telemetry", self.system_telemetry.stop)
         try:
             run_context.write_status(
                 self.run_dir,
                 "capture_closed",
                 capture_exit_code=self.exit_code,
-                capture_close_error=pipeline_close_error,
+                capture_close_error=close_errors[0] if close_errors else None,
+                capture_close_errors=close_errors,
+                system_telemetry={
+                    "path": str(self.system_telemetry.path),
+                    "sample_count": self.system_telemetry.sample_count,
+                    "error": self.system_telemetry.last_error,
+                },
             )
         except Exception as exc:
             self.exit_code = 1
             _safe_print(f"[{ts()}] [RECORD] ERROR marking capture closed: {exc}")
 
+        _safe_print(
+            encode_child_event(
+                "capture_closed",
+                run_dir=str(self.run_dir),
+                exit_code=self.exit_code,
+                close_errors=close_errors,
+            )
+        )
         _safe_print(
             f"[{ts()}] [CAPTURE] closed; post-run audit is handled independently"
         )
@@ -966,4 +499,11 @@ def run(config: InferenceConfig) -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
     app.build()
-    return app.run()
+    result = app.run()
+    if app._force_process_exit:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(result if result != 0 else 1)
+    return result

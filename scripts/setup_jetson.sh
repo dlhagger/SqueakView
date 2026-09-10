@@ -32,6 +32,10 @@ printf 'Configuring this Jetson for SqueakView (desktop user: %s)\n' "$TARGET_US
   build-essential \
   cmake \
   pkg-config \
+  gstreamer1.0-tools \
+  gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad \
+  gstreamer1.0-plugins-ugly \
   libgstreamer1.0-dev \
   libgstreamer-plugins-base1.0-dev
 
@@ -66,8 +70,36 @@ make \
   "CUDA_VER=$CUDA_VER" \
   -j"$BUILD_JOBS"
 
-GST_PLUGIN_PATH="$ROOT/native/flir_gst_source/build:/opt/nvidia/deepstream/deepstream/lib/gst-plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
-  gst-inspect-1.0 flirspinsrc >/dev/null
+FLIR_PLUGIN="$ROOT/native/flir_gst_source/build/gstflirspinsrc.so"
+YOLO_PARSER="$ROOT/native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
+for output in "$FLIR_PLUGIN" "$YOLO_PARSER"; do
+  if [ ! -s "$output" ]; then
+    printf '[FAIL] Required native build output is missing or empty: %s\n' "$output" >&2
+    exit 1
+  fi
+  if ldd "$output" 2>/dev/null | grep -q 'not found'; then
+    printf '[FAIL] Native build output has unresolved runtime dependencies: %s\n' "$output" >&2
+    ldd "$output" 2>/dev/null | grep 'not found' >&2 || true
+    exit 1
+  fi
+done
+
+if ! nm -D "$YOLO_PARSER" 2>/dev/null | grep -Eq '[[:space:]]NvDsInferParseYolo26Pose$'; then
+  printf '[FAIL] DeepStream parser is missing required symbol NvDsInferParseYolo26Pose: %s\n' "$YOLO_PARSER" >&2
+  exit 1
+fi
+
+FLIR_INSPECT="$(
+  GST_PLUGIN_PATH="$ROOT/native/flir_gst_source/build:/opt/nvidia/deepstream/deepstream/lib/gst-plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
+    gst-inspect-1.0 flirspinsrc
+)"
+case "$FLIR_INSPECT" in
+  *capture-log-path*) ;;
+  *)
+    printf '[FAIL] Built flirspinsrc is stale: capture-log-path is unavailable.\n' >&2
+    exit 1
+    ;;
+esac
 printf '[PASS] Native FLIR and DeepStream components built successfully.\n'
 
 if ! getent group dialout >/dev/null; then

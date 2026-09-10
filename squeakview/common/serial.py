@@ -15,6 +15,13 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Callable, Iterable
 
+from squeakview.common.failure_injection import FailurePlan
+from squeakview.common.controller_watchdog import (
+    ControllerCapabilities,
+    ControllerWatchdogSession,
+    parse_capabilities as parse_controller_capabilities,
+)
+
 try:
     import serial  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -35,6 +42,8 @@ SERIAL_HEADER = [
     "hostMonotonicNs",
     "rawLine",
 ]
+MAX_SERIAL_LINE_BYTES = 64 * 1024
+MAX_BUFFERED_SERIAL_ROWS = 1024
 
 
 def have_pyserial() -> bool:
@@ -48,12 +57,33 @@ def timestamp() -> str:
 class SerialHandle:
     """Threaded serial reader/writer for Arduino telemetry."""
 
-    def __init__(self, port: str, baud: int, emit_fn: Callable[[str], None]):
+    def __init__(
+        self,
+        port: str,
+        baud: int,
+        emit_fn: Callable[[str], None],
+        on_fatal: Callable[[str], None] | None = None,
+        failure_plan: FailurePlan | None = None,
+    ):
         self.emit = emit_fn
+        self.on_fatal = on_fatal
+        self.failure_plan = (
+            failure_plan
+            if failure_plan is not None
+            and failure_plan.target == "serial_controller"
+            else None
+        )
         self.port = port
         self.baud = baud
         self.ser = None
         self.last_error: str | None = None
+        self._fatal_error: str | None = None
+        self._fatal_lock = threading.Lock()
+        self._capabilities_lock = threading.Lock()
+        self._controller_capabilities: ControllerCapabilities | None = None
+        self._watchdog_session: ControllerWatchdogSession | None = None
+        self._write_lock = threading.Lock()
+        self._ttl_lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
         self._ttl_seen = threading.Event()
@@ -63,18 +93,89 @@ class SerialHandle:
         self._csv_writer: csv.writer | None = None
         self._csv_file = None
         self._buffer_rows: list[list[str]] = []
+        self._max_buffered_rows = MAX_BUFFERED_SERIAL_ROWS
+        self._max_line_bytes = MAX_SERIAL_LINE_BYTES
         self._csv_ready = False
         self._tmp_csv_path: str | None = None
         self._tmp_opened = False
         self._flush_every = 25
         self._row_count = 0
+        self._read_count = 0
+        self._write_count = 0
         self._closed = True
         # Allow silencing serial logs in the terminal; still record CSV.
         self._emit_serial_logs = os.environ.get("SQUEAKVIEW_SERIAL_LOG", "1") != "0"
         # Alert phrase and state for optional email notifications.
         self._alert_phrase = (os.environ.get("SQUEAKVIEW_SERIAL_ALERT_PHRASE") or "Feeder jammed").strip()
         self._alert_warned = False
+        self._alert_lock = threading.Lock()
+        self._alert_inflight = False
+        self._alert_suppressed = 0
+        self._atexit_registered = False
+        self._register_atexit()
+
+    def _register_atexit(self) -> None:
+        if self._atexit_registered:
+            return
         atexit.register(self.close)
+        self._atexit_registered = True
+
+    def _unregister_atexit(self) -> None:
+        if not self._atexit_registered:
+            return
+        atexit.unregister(self.close)
+        self._atexit_registered = False
+
+    @property
+    def fatal_error(self) -> str | None:
+        """Return the first runtime integrity failure, if one occurred."""
+
+        with self._fatal_lock:
+            return self._fatal_error
+
+    @property
+    def controller_capabilities(self) -> ControllerCapabilities | None:
+        """Latest valid passive capability advertisement, if one was observed."""
+
+        with self._capabilities_lock:
+            return self._controller_capabilities
+
+    def _report_fatal(self, message: str) -> None:
+        """Latch and publish one fatal serial-integrity failure.
+
+        The callback runs outside all serial and CSV locks so a lifecycle owner
+        may safely initiate shutdown.  Later errors remain secondary and cannot
+        replace the first causal failure.
+        """
+
+        self._latch_fatal(message, stop_reader=True)
+
+    def _report_watchdog_fatal(self, message: str) -> None:
+        """Fail the run while preserving the reader for an ordered DISARM.
+
+        Protocol/heartbeat failure is not itself proof that reads are broken.
+        Keeping the reader alive gives finalization a chance to persist the
+        DISARM acknowledgement and inactive-state evidence.  A concrete reader
+        failure still uses ``_report_fatal`` and stops the pump immediately.
+        """
+
+        self._latch_fatal(message, stop_reader=False)
+
+    def _latch_fatal(self, message: str, *, stop_reader: bool) -> None:
+        detail = str(message).strip() or "unknown serial integrity failure"
+        with self._fatal_lock:
+            if self._fatal_error is not None:
+                return
+            self._fatal_error = detail
+            self.last_error = detail
+        if stop_reader:
+            self._stop.set()
+        self.emit(f"[{timestamp()}] [SER] FATAL: {detail}")
+        if self.on_fatal is not None:
+            try:
+                self.on_fatal(detail)
+            except Exception as exc:
+                self.emit(f"[{timestamp()}] [SER] fatal callback error: {exc}")
 
     def _open_csv(self, path: Path) -> None:
         """Open CSV at the given path and flush any buffered lines."""
@@ -85,26 +186,17 @@ class SerialHandle:
         f = open(path, "a", newline="", buffering=1)
         writer = csv.writer(f)
         if is_empty:
-            try:
-                writer.writerow(SERIAL_HEADER)
-            except Exception:
-                pass
+            writer.writerow(SERIAL_HEADER)
         with self._csv_lock:
             self._row_count = 0
             self._csv_file = f
             self._csv_writer = writer
             self._csv_ready = True
             if self._buffer_rows:
-                try:
-                    self._csv_writer.writerows(self._buffer_rows)
-                    self._row_count += len(self._buffer_rows)
-                except Exception as exc:
-                    self.emit(f"[{timestamp()}] [SER] CSV buffer replay error: {exc}")
+                self._csv_writer.writerows(self._buffer_rows)
+                self._row_count += len(self._buffer_rows)
                 self._buffer_rows.clear()
-            try:
-                self._csv_file.flush()
-            except Exception:
-                pass
+            self._csv_file.flush()
 
     def _open_temp_csv(self) -> None:
         basename = f"serial_{int(time.time())}_{uuid.uuid4().hex[:6]}.csv"
@@ -113,7 +205,7 @@ class SerialHandle:
         self._open_csv(Path(self._tmp_csv_path))
         self._tmp_opened = True
 
-    def set_csv_path(self, run_dir: Path) -> None:
+    def set_csv_path(self, run_dir: Path) -> bool:
         """Adopt the temp CSV into the official run dir by atomic rename."""
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -121,14 +213,8 @@ class SerialHandle:
 
             with self._csv_lock:
                 if self._csv_file:
-                    try:
-                        self._csv_file.flush()
-                    except Exception:
-                        pass
-                    try:
-                        self._csv_file.close()
-                    except Exception:
-                        pass
+                    self._csv_file.flush()
+                    self._csv_file.close()
                 self._csv_file = None
                 self._csv_writer = None
                 self._csv_ready = False
@@ -144,42 +230,69 @@ class SerialHandle:
 
             self._tmp_opened = False
             self._tmp_csv_path = None
+            return True
         except Exception as exc:  # pragma: no cover - filesystem edge cases
-            self.emit(f"[{timestamp()}] [SER] Could not adopt CSV into run dir: {exc}")
+            self._report_fatal(f"serial CSV setup failed for {run_dir}: {exc}")
+            return False
 
     def open(self, run_dir: Path | None = None) -> bool:
+        # A handle may be closed and deliberately reused.  Keep emergency
+        # interpreter cleanup active only while the object owns resources;
+        # otherwise every completed run remains strongly held by ``atexit``.
+        self._register_atexit()
         self.last_error = None
+        with self._fatal_lock:
+            self._fatal_error = None
+        with self._capabilities_lock:
+            self._controller_capabilities = None
         if serial is None:
             self.last_error = "pyserial is not installed"
             self.emit(f"[{timestamp()}] [SER] pyserial not installed.")
+            self._unregister_atexit()
             return False
         try:
             self.emit(f"[{timestamp()}] [SER] Opening {self.port} @ {self.baud} …")
-            self.ser = serial.Serial(self.port, self.baud, timeout=0.05)
+            self.ser = serial.Serial(
+                self.port,
+                self.baud,
+                timeout=0.05,
+                write_timeout=1.0,
+            )
             self._closed = False
             self._stop.clear()
-            self._ttl_seen.clear()
+            with self._ttl_lock:
+                self._ttl_seen.clear()
             self._stop_ack_seen.clear()
             self._stop_ack_count = None
-            self._thread = threading.Thread(target=self._pump, daemon=True)
-            self._thread.start()
             if run_dir is not None:
-                self.set_csv_path(run_dir)
+                if not self.set_csv_path(run_dir):
+                    raise OSError(self.fatal_error or "serial CSV setup failed")
             else:
                 self._open_temp_csv()
+            self._thread = threading.Thread(target=self._pump, daemon=True)
+            self._thread.start()
             return True
         except Exception as exc:
             self.last_error = str(exc) or type(exc).__name__
             self.emit(f"[{timestamp()}] [SER] ERROR opening serial: {exc}")
+            try:
+                if self.ser and getattr(self.ser, "is_open", False):
+                    self.ser.close()
+            except Exception:
+                pass
             self.ser = None
+            self._closed = True
+            self._unregister_atexit()
             return False
 
     def _pump(self) -> None:
+        failure: str | None = None
         try:
             buf = b""
             while not self._stop.is_set():
                 ser = self.ser
                 if ser is None or not getattr(ser, "is_open", False):
+                    failure = "serial reader stopped because the port closed unexpectedly"
                     break
                 try:
                     chunk = ser.read(256)
@@ -188,17 +301,52 @@ class SerialHandle:
                     buf += chunk
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
+                        if len(line) > self._max_line_bytes:
+                            raise ValueError(
+                                "serial line exceeded bounded size of "
+                                f"{self._max_line_bytes} bytes"
+                            )
                         try:
                             s = line.decode(errors="replace").strip()
                         except Exception:
                             s = str(line)
                         if not s:
                             continue
+                        if (
+                            self.failure_plan is not None
+                            and self.failure_plan.kind == "read_error"
+                            and self._read_count >= self.failure_plan.after_frames
+                        ):
+                            raise OSError(
+                                "qualification-injected serial reader failure"
+                            )
+                        self._read_count += 1
                         if self._emit_serial_logs:
                             self.emit(f"[{timestamp()}] 【SER】 {s}")
-                        if s.startswith("CAMERA_"):
-                            self._ttl_seen.set()
+                        # Recording readiness requires evidence of an actual
+                        # rising trigger edge, not arbitrary CAMERA_* status or
+                        # configuration telemetry.
+                        if s == "CAMERA_HIGH" or s.startswith("CAMERA_HIGH,"):
+                            with self._ttl_lock:
+                                self._ttl_seen.set()
                         self._write_csv_line(s)
+                        if self._stop.is_set():
+                            break
+                        try:
+                            session = self._watchdog_session
+                            consumed = session.ingest(s) if session is not None else False
+                            capabilities = (
+                                None if consumed else parse_controller_capabilities(s)
+                            )
+                        except ValueError as exc:
+                            self.emit(
+                                f"[{timestamp()}] [SER] WARN: ignored malformed "
+                                f"controller capability advertisement: {exc}"
+                            )
+                        else:
+                            if capabilities is not None:
+                                with self._capabilities_lock:
+                                    self._controller_capabilities = capabilities
                         if s == "ACK_STOP" or s.startswith("ACK_STOP,"):
                             fields = s.split(",")
                             try:
@@ -207,14 +355,21 @@ class SerialHandle:
                                 self._stop_ack_count = None
                             self._stop_ack_seen.set()
                         self._maybe_send_alert(s)
+                    if len(buf) > self._max_line_bytes:
+                        raise ValueError(
+                            "serial input without a newline exceeded bounded size of "
+                            f"{self._max_line_bytes} bytes"
+                        )
                 except Exception as exc:
                     if self._stop.is_set():
                         break
-                    if "Bad file descriptor" in str(exc):
-                        break
-                    self.emit(f"[{timestamp()}] [SER] read error: {exc}")
-                    time.sleep(0.05)
+                    failure = f"serial reader failed on {self.port}: {exc}"
+                    break
         finally:
+            if failure is not None:
+                self._report_fatal(failure)
+            elif not self._stop.is_set():
+                self._report_fatal("serial reader exited unexpectedly")
             self.emit(f"[{timestamp()}] [SER] reader thread exit")
 
     def _write_csv_line(self, line: str) -> None:
@@ -228,20 +383,34 @@ class SerialHandle:
         elif len(row) > serial_field_count:
             row = row[: serial_field_count - 1] + [",".join(row[serial_field_count - 1 :])]
         row.extend([str(time.time_ns()), str(time.monotonic_ns()), raw_line])
+        failure: str | None = None
         with self._csv_lock:
             if self._csv_ready and self._csv_writer:
                 try:
+                    if (
+                        self.failure_plan is not None
+                        and self.failure_plan.kind == "ledger_write_error"
+                        and self._row_count >= self.failure_plan.after_frames
+                    ):
+                        raise OSError(
+                            "qualification-injected serial ledger write failure"
+                        )
                     self._csv_writer.writerow(row)
                     self._row_count += 1
                     if self._row_count % self._flush_every == 0 and self._csv_file:
-                        try:
-                            self._csv_file.flush()
-                        except Exception:
-                            pass
+                        self._csv_file.flush()
                 except Exception as exc:
-                    self.emit(f"[{timestamp()}] [SER] CSV write error: {exc}")
+                    failure = f"serial CSV write/flush failed: {exc}"
             else:
-                self._buffer_rows.append(row)
+                if len(self._buffer_rows) >= self._max_buffered_rows:
+                    failure = (
+                        "serial CSV was unavailable and its bounded pre-ledger "
+                        f"buffer reached {self._max_buffered_rows} rows"
+                    )
+                else:
+                    self._buffer_rows.append(row)
+        if failure is not None:
+            self._report_fatal(failure)
 
     def log_marker(self, marker: str) -> None:
         """Write a non-serial marker row into the CSV for later alignment."""
@@ -255,7 +424,7 @@ class SerialHandle:
         except Exception:
             pass
 
-    def send_line(self, text: str) -> None:
+    def _send_line(self, text: str, *, marker_before: str | None = None) -> None:
         """Write and flush a controller command, or raise if delivery fails.
 
         Controller commands participate in the scientific run lifecycle.  A
@@ -269,22 +438,49 @@ class SerialHandle:
             raise RuntimeError(message)
         try:
             command = text.strip().upper()
-            if command.startswith("START"):
-                # Only a TTL observed after this START attempt may satisfy the
-                # startup handshake.  The serial reader can set the event as
-                # soon as the controller responds, before wait_for_ttl runs.
-                self._ttl_seen.clear()
+            if (
+                self.failure_plan is not None
+                and self.failure_plan.kind == "write_error"
+                and self._write_count >= self.failure_plan.after_frames
+            ):
+                raise OSError("qualification-injected serial command write failure")
             if command == "STOP":
                 # Clear immediately before writing so a fast controller reply
                 # cannot race ahead of wait_for_stop_ack().
                 self._stop_ack_seen.clear()
                 self._stop_ack_count = None
-            self.emit(f"[{timestamp()}] 【SER→】 {text}")
-            self.ser.write((text + "\n").encode())
-            self.ser.flush()
+            with self._write_lock:
+                starts_trigger = command.startswith("START") or command.startswith(
+                    "ARM,"
+                )
+                # Serialize the clear/write boundary with CAMERA_HIGH ingest.
+                # A delayed pre-command edge therefore cannot race between the
+                # clear and the command write and falsely satisfy readiness.
+                with self._ttl_lock:
+                    if starts_trigger:
+                        self._ttl_seen.clear()
+                    if marker_before is not None:
+                        # The marker and controller write share the same edge-ingest
+                        # lock. A fast controller response therefore cannot be
+                        # persisted ahead of the marker that defines its epoch.
+                        self.log_marker(marker_before)
+                    self.emit(f"[{timestamp()}] 【SER→】 {text}")
+                    self.ser.write((text + "\n").encode())
+                    self.ser.flush()
+                    self._write_count += 1
         except Exception as exc:
             self.emit(f"[{timestamp()}] [SER] write error: {exc}")
             raise RuntimeError(f"serial write failed for {text!r}: {exc}") from exc
+
+    def send_line(self, text: str) -> None:
+        self._send_line(text)
+
+    def send_start(self, fps: int) -> None:
+        """Persist the legacy START epoch boundary before the atomic write."""
+
+        if type(fps) is not int or fps <= 0:
+            raise ValueError("controller FPS must be a positive integer")
+        self._send_line(f"START,{fps}", marker_before="START_SENT")
 
     def wait_for_ttl(self, timeout_s: float = 3.0) -> bool:
         self.emit(f"[{timestamp()}] [SER] Waiting for camera TTL line (timeout {timeout_s:.1f}s) …")
@@ -305,21 +501,91 @@ class SerialHandle:
         )
         return hit
 
+    def negotiate_watchdog_v1(
+        self, *, requested_lease_ms: int, timeout_s: float = 2.0
+    ) -> ControllerCapabilities:
+        """Negotiate one experimental nonce-bound session, or raise fail closed."""
+
+        if self._watchdog_session is not None:
+            raise RuntimeError("controller watchdog negotiation was already attempted")
+        session = ControllerWatchdogSession(
+            self.send_line,
+            self._report_watchdog_fatal,
+            requested_lease_ms=requested_lease_ms,
+        )
+        self._watchdog_session = session
+        capabilities = session.negotiate(timeout_s=timeout_s)
+        with self._capabilities_lock:
+            self._controller_capabilities = capabilities
+        return capabilities
+
+    def arm_watchdog_v1(self, fps: int, *, timeout_s: float = 2.0) -> None:
+        session = self._watchdog_session
+        if session is None:
+            raise RuntimeError("controller watchdog session was not negotiated")
+        session.arm(fps, timeout_s=timeout_s)
+
+    def disarm_watchdog_v1(self, *, timeout_s: float = 2.0) -> None:
+        session = self._watchdog_session
+        if session is None:
+            raise RuntimeError("controller watchdog session was not negotiated")
+        session.disarm(timeout_s=timeout_s)
+
+    @property
+    def watchdog_snapshot(self) -> dict[str, object] | None:
+        session = self._watchdog_session
+        return session.snapshot() if session is not None else None
+
     @property
     def stop_ack_count(self) -> int | None:
         """Final controller TTL count carried by the latest ACK_STOP row."""
-
+        if self._watchdog_session is not None:
+            return self._watchdog_session.final_ttl_count
         return self._stop_ack_count
 
     # ---- Alerts -------------------------------------------------------
     def _maybe_send_alert(self, line: str) -> None:
-        """Fire an email alert if the configured phrase is present; non-blocking."""
+        """Start at most one best-effort email worker for matching telemetry.
+
+        Serial input is not flow controlled by SMTP.  Coalescing matches while
+        one delivery is in flight keeps a noisy controller from creating an
+        unbounded number of threads without delaying the serial ledger.
+        """
         phrase = self._alert_phrase
         if not phrase:
             return
         if phrase.lower() not in line.lower():
             return
-        threading.Thread(target=self._send_email_alert, args=(line,), daemon=True).start()
+        with self._alert_lock:
+            if self._alert_inflight:
+                self._alert_suppressed += 1
+                return
+            self._alert_inflight = True
+        try:
+            threading.Thread(
+                target=self._run_email_alert,
+                args=(line,),
+                daemon=True,
+                name="squeakview-serial-alert",
+            ).start()
+        except Exception:
+            with self._alert_lock:
+                self._alert_inflight = False
+            raise
+
+    def _run_email_alert(self, line: str) -> None:
+        try:
+            self._send_email_alert(line)
+        finally:
+            with self._alert_lock:
+                suppressed = self._alert_suppressed
+                self._alert_suppressed = 0
+                self._alert_inflight = False
+            if suppressed:
+                self.emit(
+                    f"[{timestamp()}] [SER] coalesced {suppressed} additional "
+                    "serial alert match(es) while email delivery was active"
+                )
 
     def _send_email_alert(self, line: str) -> None:
         """Send a minimal SMTP email using env vars; best-effort and non-fatal."""
@@ -364,26 +630,37 @@ class SerialHandle:
             and self._csv_file is None
             and not (self._thread and self._thread.is_alive())
         ):
+            self._unregister_atexit()
             return
         self.emit(f"[{timestamp()}] [SER] closing …")
+        if self._watchdog_session is not None:
+            self._watchdog_session.stop_worker()
         self._stop.set()
-        if self._thread and self._thread.is_alive():
-            try:
-                self._thread.join(timeout=0.5)
-            except Exception:
-                pass
+        failure: str | None = None
+        # Close the port before joining so a driver read that ignores the
+        # configured timeout is actively unblocked.  The ledger remains open
+        # until the reader has had a chance to finish its final callback.
         try:
             if self.ser and getattr(self.ser, "is_open", False):
                 self.ser.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            failure = f"serial port close failed: {exc}"
+        if self._thread and self._thread.is_alive():
+            try:
+                self._thread.join(timeout=1.0)
+                if self._thread.is_alive() and failure is None:
+                    failure = "serial reader did not stop after the port was closed"
+            except Exception as exc:
+                if failure is None:
+                    failure = f"serial reader join failed: {exc}"
         with self._csv_lock:
             if self._csv_file:
                 try:
                     self._csv_file.flush()
                     self._csv_file.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    csv_failure = f"serial CSV close/flush failed: {exc}"
+                    failure = f"{failure}; {csv_failure}" if failure else csv_failure
             still_temp = self._tmp_opened and self._tmp_csv_path
             tmp_path = self._tmp_csv_path
             self._csv_file = None
@@ -391,12 +668,15 @@ class SerialHandle:
             self._csv_ready = False
             self._tmp_opened = False
             self._tmp_csv_path = None
+        if failure is not None:
+            self._report_fatal(failure)
         if still_temp and tmp_path:
             self.emit(
                 f"[{timestamp()}] [SER] Run dir unknown at stop. Temp CSV kept here:\n{tmp_path}"
             )
         self.ser = None
         self._closed = True
+        self._unregister_atexit()
 
 
 def iter_lines(buffer: Iterable[str]) -> Iterable[str]:

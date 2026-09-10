@@ -3,22 +3,46 @@ from __future__ import annotations
 
 import csv
 import json
-import shutil
+import os
 import sqlite3
-import subprocess
+import stat
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
+
+from squeakview.apps.inference.video_probe import probe_video_frames
+from squeakview.common.bounded_csv import BoundedCsvError, MAX_CSV_RECORD_BYTES
+from squeakview.common.diagnostics.evidence_identity import stable_file_identity
+from squeakview.common.run_context import atomic_write_json
+
+
+MAX_SQLITE_INTEGER = (1 << 63) - 1
+_MARKERS = frozenset(
+    {"START_SENT", "CAPTURE_STOP_REQUESTED", "CAPTURE_STOP_DONE", "STOP_SENT"}
+)
+_REQUIRED_EPOCH_MARKERS = (
+    "START_SENT", "CAPTURE_STOP_REQUESTED", "STOP_SENT", "CAPTURE_STOP_DONE"
+)
 
 
 def _to_int(value: Any) -> int | None:
     text = "" if value is None else str(value).strip()
-    if not text or text.lower() == "nan":
+    if not text or text.lower() in {"nan", "n/a"}:
         return None
-    try:
-        return int(float(text))
-    except ValueError:
-        return None
+    if not text.isascii() or not text.isdecimal():
+        raise ValueError(f"expected an unsigned decimal integer, got {text!r}")
+    number = int(text)
+    if number > MAX_SQLITE_INTEGER:
+        raise ValueError("integer exceeds the signed 64-bit scientific ledger bound")
+    return number
+
+
+def _required_uint(row: dict[str, str], field: str, *, source: str) -> int:
+    value = _to_int(row.get(field))
+    if value is None:
+        raise ValueError(f"{source} row is missing required integer field {field}")
+    return value
 
 
 def _fmt(value: Any) -> str:
@@ -33,27 +57,117 @@ def _marker(row: dict[str, str]) -> str:
     return (row.get("reason") or row.get("context") or row.get("unixTime") or "").strip()
 
 
-def _reader(path: Path) -> Iterator[dict[str, str]]:
-    with path.open(newline="") as handle:
-        yield from csv.DictReader(handle)
-
-
-def _ffprobe(path: Path) -> dict[str, Any]:
-    if not path.exists() or shutil.which("ffprobe") is None:
-        return {}
-    command = [
-        "ffprobe", "-hide_banner", "-v", "error", "-select_streams", "v:0",
-        "-show_entries",
-        "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames,duration,bit_rate",
-        "-of", "json", str(path),
-    ]
+def _stable_physical_lines(path: Path) -> Iterator[str]:
+    path = Path(path).absolute()
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
-        data = json.loads(result.stdout[result.stdout.find("{"):]) if result.returncode == 0 else {}
-        streams = data.get("streams") or []
-        return dict(streams[0]) if streams else {}
-    except Exception:
-        return {}
+        initial = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"scientific alignment input could not be read: {path}: {exc}") from exc
+    if stat.S_ISLNK(initial.st_mode):
+        raise ValueError(f"scientific alignment input must not be a symlink: {path}")
+    if not stat.S_ISREG(initial.st_mode):
+        raise ValueError(f"scientific alignment input is not a regular file: {path}")
+    try:
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"scientific alignment input is not a regular file: {path}")
+            line_number = 0
+            while True:
+                raw = handle.readline(MAX_CSV_RECORD_BYTES + 1)
+                if not raw:
+                    break
+                line_number += 1
+                if len(raw) > MAX_CSV_RECORD_BYTES:
+                    raise BoundedCsvError(
+                        f"CSV record exceeds {MAX_CSV_RECORD_BYTES} byte limit at "
+                        f"{path.name}:{line_number}"
+                    )
+                try:
+                    yield raw.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise BoundedCsvError(
+                        f"CSV input is not strict UTF-8 at {path.name}:{line_number}"
+                    ) from exc
+            after = os.fstat(handle.fileno())
+        current = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"scientific alignment input could not be read: {path}: {exc}") from exc
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or any(
+            getattr(before, field) != getattr(after, field)
+            or getattr(before, field) != getattr(current, field)
+            for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        )
+    ):
+        raise ValueError(f"scientific alignment input changed while reading: {path}")
+
+
+def _parse_physical_record(line: str, *, path: Path, line_number: int) -> list[str]:
+    try:
+        rows = list(csv.reader([line], strict=True))
+    except csv.Error as exc:
+        raise ValueError(
+            f"CSV record is malformed or spans physical lines at {path.name}:{line_number}: {exc}"
+        ) from exc
+    if len(rows) != 1:
+        raise ValueError(f"CSV physical record is invalid at {path.name}:{line_number}")
+    return rows[0]
+
+
+def _reader(
+    path: Path, *, required_columns: frozenset[str] = frozenset()
+) -> Iterator[dict[str, str]]:
+    lines = _stable_physical_lines(path)
+    try:
+        header_line = next(lines)
+    except StopIteration as exc:
+        raise ValueError(f"CSV input is empty: {path}") from exc
+    header = _parse_physical_record(header_line, path=path, line_number=1)
+    if not header or any(not name for name in header) or len(header) != len(set(header)):
+        raise ValueError(f"CSV header is empty, duplicated, or invalid: {path}")
+    missing = required_columns.difference(header)
+    if missing:
+        raise ValueError(
+            f"CSV input {path.name} is missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+    for line_number, line in enumerate(lines, start=2):
+        values = _parse_physical_record(line, path=path, line_number=line_number)
+        if len(values) != len(header):
+            raise ValueError(
+                f"CSV row has {len(values)} fields; expected {len(header)} at "
+                f"{path.name}:{line_number}"
+            )
+        yield dict(zip(header, values, strict=True))
+
+
+def _video_validation(
+    path: Path, supplied: Mapping[str, object] | None
+) -> dict[str, object]:
+    """Get one authoritative decoded-frame count for alignment.
+
+    The post-run coordinator supplies the result it just produced, avoiding a
+    second full read of long recordings. Standalone alignment performs the
+    same explicit Jetson full decode itself.
+    """
+
+    result = dict(supplied) if supplied is not None else probe_video_frames(path)
+    count = result.get("count")
+    if type(count) is not int or count < 0:
+        return {
+            "count": None,
+            "method": result.get("method"),
+            "error": result.get("error")
+            or "validated video frame count is unavailable",
+        }
+    return {
+        "count": count,
+        "method": result.get("method"),
+        "error": result.get("error"),
+    }
 
 
 def _open_index(path: Path) -> sqlite3.Connection:
@@ -77,61 +191,128 @@ def _open_index(path: Path) -> sqlite3.Connection:
     return db
 
 
+def _input_snapshot(paths: dict[str, Path], *, required: frozenset[str]) -> dict[str, dict[str, Any]]:
+    snapshot: dict[str, dict[str, Any]] = {}
+    for name, unresolved in paths.items():
+        path = Path(unresolved).absolute()
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            metadata = None
+        except OSError as exc:
+            raise ValueError(f"scientific alignment input could not be inspected: {path}: {exc}") from exc
+        if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"scientific alignment input must not be a symlink: {path}")
+        if metadata is not None and not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"scientific alignment input is not a regular file: {path}")
+        identity = stable_file_identity(path)
+        if name in required and identity.get("available") is not True:
+            raise ValueError(
+                f"required scientific alignment input is unavailable: {path}: "
+                f"{identity.get('error')}"
+            )
+        snapshot[name] = {
+            "path": str(path),
+            "available": identity.get("available") is True,
+            "size_bytes": identity.get("size_bytes"),
+            "sha256": identity.get("sha256"),
+        }
+    return snapshot
+
+
 def _index_serial(db: sqlite3.Connection, serial_path: Path) -> dict[str, Any]:
     serial_count = 0
     camera_high_count = 0
     last_high_count: int | None = None
     last_high_rp: int | None = None
+    last_epoch_high_rp: int | None = None
     first_high: tuple[int, int, int] | None = None
     first_after_start: tuple[int, int, int] | None = None
     start_index: int | None = None
     markers: dict[str, int | None] = {}
+    marker_indices: dict[str, int] = {}
     interval_sample: list[int] = []
     batch: list[tuple[int, int, int | None, str, str, int]] = []
-    for serial_index, row in enumerate(_reader(serial_path)):
+    for serial_index, row in enumerate(
+        _reader(
+            serial_path,
+            required_columns=frozenset({"eventType", "count", "rp2040Time"}),
+        )
+    ):
         serial_count += 1
         event = (row.get("eventType") or "").strip()
         if event == "MARKER":
             name = _marker(row)
-            if name:
+            if name in _MARKERS:
+                if name in markers:
+                    raise RuntimeError(f"serial.csv contains duplicate marker {name}")
                 markers[name] = last_high_count
+                marker_indices[name] = serial_index
             if name == "START_SENT" and start_index is None:
                 start_index = serial_index
         if event != "CAMERA_HIGH":
             continue
-        count = _to_int(row.get("count"))
-        rp = _to_int(row.get("rp2040Time"))
-        if count is None or rp is None:
-            continue
+        count = _required_uint(row, "count", source="serial.csv CAMERA_HIGH")
+        rp = _required_uint(row, "rp2040Time", source="serial.csv CAMERA_HIGH")
         camera_high_count += 1
         current = (count, rp, serial_index)
         if first_high is None:
             first_high = current
         if start_index is not None and serial_index > start_index and first_after_start is None:
             first_after_start = current
-        if last_high_rp is not None and rp > last_high_rp and len(interval_sample) < 10001:
-            interval_sample.append(rp - last_high_rp)
+        if (
+            start_index is not None
+            and serial_index > start_index
+            and last_epoch_high_rp is not None
+            and rp > last_epoch_high_rp
+            and len(interval_sample) < 10001
+        ):
+            interval_sample.append(rp - last_epoch_high_rp)
+        if last_high_count is not None and count <= last_high_count:
+            raise RuntimeError("serial CAMERA_HIGH count is duplicate or out of order")
+        if last_high_rp is not None and rp <= last_high_rp:
+            raise RuntimeError("serial CAMERA_HIGH clock is duplicate or out of order")
         last_high_count, last_high_rp = count, rp
+        if start_index is not None and serial_index > start_index:
+            last_epoch_high_rp = rp
         batch.append(
             (count, rp, _to_int(row.get("unixTime")), row.get("hostUnixNs", ""),
              row.get("hostMonotonicNs", ""), serial_index)
         )
         if len(batch) >= 10000:
             with db:
-                db.executemany("INSERT OR REPLACE INTO highs VALUES (?, ?, ?, ?, ?, ?)", batch)
+                db.executemany("INSERT INTO highs VALUES (?, ?, ?, ?, ?, ?)", batch)
             batch.clear()
     if batch:
         with db:
-            db.executemany("INSERT OR REPLACE INTO highs VALUES (?, ?, ?, ?, ?, ?)", batch)
-    chosen = first_after_start or first_high
+            db.executemany("INSERT INTO highs VALUES (?, ?, ?, ?, ?, ?)", batch)
+    missing_markers = [
+        name for name in _REQUIRED_EPOCH_MARKERS if name not in marker_indices
+    ]
+    if missing_markers:
+        raise RuntimeError(
+            "serial.csv cannot define the scientific trigger epoch; missing marker(s): "
+            + ", ".join(missing_markers)
+        )
+    ordered_indices = [marker_indices[name] for name in _REQUIRED_EPOCH_MARKERS]
+    if ordered_indices != sorted(ordered_indices) or len(set(ordered_indices)) != len(
+        ordered_indices
+    ):
+        raise RuntimeError(
+            "serial.csv scientific trigger epoch markers are out of order"
+        )
+    chosen = first_after_start
     if chosen is None:
-        raise RuntimeError("serial.csv contains no CAMERA_HIGH rows with count and rp2040Time")
+        raise RuntimeError(
+            "serial.csv contains no CAMERA_HIGH rows inside the START_SENT epoch"
+        )
     interval_sample.sort()
     median_interval = interval_sample[len(interval_sample) // 2] if interval_sample else None
     return {
         "serial_rows": serial_count, "camera_high_events": camera_high_count,
         "last_high_count": last_high_count, "first_high": chosen,
-        "start_marker_seen": start_index is not None, "markers": markers,
+        "start_marker_seen": True, "markers": markers,
+        "marker_indices": marker_indices,
         "median_interval_us": median_interval,
     }
 
@@ -142,7 +323,9 @@ def _index_detection_counts(db: sqlite3.Connection, path: Path) -> None:
     previous: int | None = None
     count = 0
     batch: list[tuple[int, int]] = []
-    for row in _reader(path):
+    for row in _reader(
+        path, required_columns=frozenset({"source_sequence_index"})
+    ):
         raw = _to_int(row.get("source_sequence_index"))
         if raw is None:
             continue
@@ -157,20 +340,32 @@ def _index_detection_counts(db: sqlite3.Connection, path: Path) -> None:
             previous, count = raw, 1
         if len(batch) >= 10000:
             with db:
-                db.executemany("INSERT OR REPLACE INTO detection_counts VALUES (?, ?)", batch)
+                db.executemany("INSERT INTO detection_counts VALUES (?, ?)", batch)
             batch.clear()
     if previous is not None:
         batch.append((previous, count))
     if batch:
         with db:
-            db.executemany("INSERT OR REPLACE INTO detection_counts VALUES (?, ?)", batch)
+            db.executemany("INSERT INTO detection_counts VALUES (?, ?)", batch)
 
 
 def _first_frame(path: Path) -> dict[str, str]:
-    for row in _reader(path):
-        if _to_int(row.get("camera_frame_id")) is not None:
-            return row
-    raise RuntimeError("frames.csv contains no camera_frame_id values")
+    first: dict[str, str] | None = None
+    for row in _reader(
+        path,
+        required_columns=frozenset(
+            {"camera_frame_id", "raw_frame_index", "camera_timestamp_ns", "pts_ns"}
+        ),
+    ):
+        _required_uint(row, "camera_frame_id", source="frames.csv")
+        _required_uint(row, "raw_frame_index", source="frames.csv")
+        _required_uint(row, "camera_timestamp_ns", source="frames.csv")
+        _required_uint(row, "pts_ns", source="frames.csv")
+        if first is None:
+            first = row
+    if first is None:
+        raise RuntimeError("frames.csv contains no camera_frame_id values")
+    return first
 
 
 def _write_frames(
@@ -190,17 +385,22 @@ def _write_frames(
     first_rp = epoch["first_rp2040_time_us"]
     insert_batch: list[tuple] = []
     try:
-        for row in _reader(frames_path):
-            camera_id = _to_int(row.get("camera_frame_id"))
-            if camera_id is None:
-                continue
-            raw_index = _to_int(row.get("raw_frame_index"))
+        for row in _reader(
+            frames_path,
+            required_columns=frozenset(
+                {"camera_frame_id", "raw_frame_index", "camera_timestamp_ns", "pts_ns"}
+            ),
+        ):
+            camera_id = _required_uint(row, "camera_frame_id", source="frames.csv")
+            raw_index = _required_uint(row, "raw_frame_index", source="frames.csv")
             ttl = camera_id - int(epoch["camera_frame_id_offset"])
             high = db.execute(
-                "SELECT rp, unix_us, host_unix, host_mono FROM highs WHERE count=?", (ttl,)
+                "SELECT rp, unix_us, host_unix, host_mono FROM highs "
+                "WHERE count=? AND serial_index>?",
+                (ttl, int(epoch["start_marker_index"])),
             ).fetchone()
             rp = int(high[0]) if high else None
-            pts = _to_int(row.get("pts_ns"))
+            pts = _required_uint(row, "pts_ns", source="frames.csv")
             det_row = db.execute(
                 "SELECT count FROM detection_counts WHERE raw_index=?", (raw_index,)
             ).fetchone() if raw_index is not None else None
@@ -229,7 +429,7 @@ def _write_frames(
                                      "single_file_frames_csv"))
             if len(insert_batch) >= 10000:
                 with db:
-                    db.executemany("INSERT OR REPLACE INTO frame_lookup VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", insert_batch)
+                    db.executemany("INSERT INTO frame_lookup VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", insert_batch)
                 insert_batch.clear()
             count += 1
             if high is None:
@@ -254,8 +454,10 @@ def _write_frames(
                             "actual_raw_frame_index": raw_index,
                         })
                 previous_raw_index = raw_index
-            camera_ts = _to_int(row.get("camera_timestamp_ns"))
-            if camera_ts is not None and first_camera_ts is not None and rp is not None:
+            camera_ts = _required_uint(
+                row, "camera_timestamp_ns", source="frames.csv"
+            )
+            if first_camera_ts is not None and rp is not None:
                 error = (camera_ts - first_camera_ts) / 1000.0 - (rp - first_rp)
                 elapsed = float(rp - first_rp)
                 clock_pairs += 1
@@ -267,7 +469,7 @@ def _write_frames(
                 sum_xy += elapsed * error
         if insert_batch:
             with db:
-                db.executemany("INSERT OR REPLACE INTO frame_lookup VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", insert_batch)
+                db.executemany("INSERT INTO frame_lookup VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", insert_batch)
     finally:
         pass
     clock_slope = clock_intercept = clock_residual_max = None
@@ -276,13 +478,23 @@ def _write_frames(
         clock_slope = (clock_pairs * sum_xy - sum_x * sum_y) / denominator
         clock_intercept = (sum_y - clock_slope * sum_x) / clock_pairs
         clock_residual_max = 0.0
-        for row in _reader(frames_path):
-            camera_id = _to_int(row.get("camera_frame_id"))
-            camera_ts = _to_int(row.get("camera_timestamp_ns"))
-            if camera_id is None or camera_ts is None or first_camera_ts is None:
+        for row in _reader(
+            frames_path,
+            required_columns=frozenset(
+                {"camera_frame_id", "camera_timestamp_ns"}
+            ),
+        ):
+            camera_id = _required_uint(row, "camera_frame_id", source="frames.csv")
+            camera_ts = _required_uint(
+                row, "camera_timestamp_ns", source="frames.csv"
+            )
+            if first_camera_ts is None:
                 continue
             ttl = camera_id - int(epoch["camera_frame_id_offset"])
-            high = db.execute("SELECT rp FROM highs WHERE count=?", (ttl,)).fetchone()
+            high = db.execute(
+                "SELECT rp FROM highs WHERE count=? AND serial_index>?",
+                (ttl, int(epoch["start_marker_index"])),
+            ).fetchone()
             if high is None:
                 continue
             elapsed = float(int(high[0]) - first_rp)
@@ -313,26 +525,31 @@ def _write_detections(
     cached_key: int | None = None
     cached_frame = None
     try:
-        for det_index, det in enumerate(_reader(path)):
+        for det_index, det in enumerate(
+            _reader(
+                path,
+                required_columns=frozenset({"source_sequence_index", "gst_pts_ns"}),
+            )
+        ):
             raw = _to_int(det.get("source_sequence_index"))
+            object_pts = _required_uint(det, "gst_pts_ns", source="objects.csv")
             if raw != cached_key:
                 cached_key = raw
                 cached_frame = db.execute(
                     "SELECT raw_index,camera_id,ttl,rp,time_s,pts,pts_s,raw_video,video_index,video_source "
-                    "FROM frame_lookup WHERE raw_index=? OR camera_id=? LIMIT 1", (raw, raw)
+                    "FROM frame_lookup WHERE raw_index=?", (raw,)
                 ).fetchone() if raw is not None else None
             frame = cached_frame
             method = "flir_user_meta" if raw is not None else "unmapped"
             stats["methods"][method] = stats["methods"].get(method, 0) + 1
             stats["fallback"] += int(method.startswith("fallback"))
-            mapping_ok = "1" if raw is not None else "0"
+            mapping_ok = "1" if raw is not None and frame is not None else "0"
             stats["failed"] += int(mapping_ok != "1")
             if frame is None:
                 stats["missing"] += 1
                 if len(samples["missing"]) < 50:
                     samples["missing"].append({"detection_index": det_index, "raw_frame_num": raw})
             frame_pts = _to_int(frame[5]) if frame else None
-            object_pts = _to_int(det.get("gst_pts_ns"))
             det_ts = object_pts // 1000 if object_pts is not None else None
             if frame_pts is not None and det_ts is not None and abs(det_ts - frame_pts // 1000) > 1:
                 stats["ts_mismatch"] += 1
@@ -357,8 +574,7 @@ def _write_detections(
 def _data_rows(path: Path) -> int:
     if not path.exists():
         return 0
-    with path.open() as handle:
-        return max(0, sum(1 for _ in handle) - 1)
+    return sum(1 for _ in _reader(path))
 
 
 def build_alignment(
@@ -366,25 +582,52 @@ def build_alignment(
     out_dir: Path,
     *,
     objects_path: Path | None = None,
+    video_validation: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
-    run_dir, out_dir = Path(run_dir), Path(out_dir)
+    raw_run_dir = Path(run_dir).absolute()
+    raw_out_dir = Path(out_dir).absolute()
+    if raw_run_dir.is_symlink() or not raw_run_dir.is_dir():
+        raise ValueError(f"run directory must be a real directory: {raw_run_dir}")
+    if raw_out_dir.is_symlink():
+        raise ValueError(f"alignment output directory must not be a symlink: {raw_out_dir}")
+    run_dir = raw_run_dir.resolve()
+    raw_out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = raw_out_dir.resolve()
+    if not out_dir.is_dir():
+        raise ValueError(f"alignment output is not a directory: {out_dir}")
     frames_path, serial_path = run_dir / "frames.csv", run_dir / "serial.csv"
-    objects_path = objects_path or run_dir / "objects.csv"
-    for required in (frames_path, serial_path):
-        if not required.exists():
-            raise FileNotFoundError(f"missing required run outputs in {run_dir}: {required.name}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    index_path = out_dir / ".alignment_index.sqlite"
-    db = _open_index(index_path)
+    objects_path = Path(objects_path).absolute() if objects_path else run_dir / "objects.csv"
+    evidence_paths = {
+        "frames": frames_path,
+        "serial": serial_path,
+        "objects": objects_path,
+        "errors": run_dir / "diagnostics" / "errors.csv",
+        "video": run_dir / "raw.mp4",
+    }
+    source_evidence = _input_snapshot(
+        evidence_paths, required=frozenset({"frames", "serial"})
+    )
+    summary_path = out_dir / "alignment_summary.json"
+    if summary_path.is_symlink():
+        raise ValueError("alignment summary output must not be a symlink")
+    descriptor, raw_index_path = tempfile.mkstemp(
+        prefix=".alignment_index.", suffix=".sqlite", dir=out_dir
+    )
+    os.close(descriptor)
+    index_path = Path(raw_index_path)
+    db: sqlite3.Connection | None = None
     try:
+        db = _open_index(index_path)
         serial = _index_serial(db, serial_path)
         _index_detection_counts(db, objects_path)
         first_frame = _first_frame(frames_path)
         first_high_count, first_high_rp, _ = serial["first_high"]
         first_camera_id = int(_to_int(first_frame.get("camera_frame_id")))
         epoch = {
-            "method": ("first_recorded_frame_to_first_camera_high_after_start_sent"
-                       if serial["start_marker_seen"] else "first_recorded_frame_to_first_camera_high"),
+            "method": "first_recorded_frame_to_first_camera_high_after_start_sent",
+            "marker_indices": dict(serial["marker_indices"]),
+            "start_marker_index": serial["marker_indices"]["START_SENT"],
+            "shutdown_marker_index": serial["marker_indices"]["CAPTURE_STOP_REQUESTED"],
             "first_camera_frame_id": first_camera_id,
             "first_raw_frame_index": _to_int(first_frame.get("raw_frame_index")),
             "first_ttl_count": first_high_count,
@@ -393,6 +636,32 @@ def build_alignment(
             "first_rp2040_time_us": first_high_rp,
         }
         frames = _write_frames(db, frames_path, epoch)
+        epoch_highs = int(
+            db.execute(
+                "SELECT COUNT(*) FROM highs WHERE serial_index>?",
+                (epoch["start_marker_index"],),
+            ).fetchone()[0]
+        )
+        unmatched_epoch_highs = int(
+            db.execute(
+                "SELECT COUNT(*) FROM highs h LEFT JOIN frame_lookup f ON f.ttl=h.count "
+                "WHERE h.serial_index>? AND f.ttl IS NULL",
+                (epoch["start_marker_index"],),
+            ).fetchone()[0]
+        )
+        shutdown_tail_highs = int(
+            db.execute(
+                "SELECT COUNT(*) FROM highs WHERE serial_index>?",
+                (epoch["shutdown_marker_index"],),
+            ).fetchone()[0]
+        )
+        unmatched_shutdown_tail_highs = int(
+            db.execute(
+                "SELECT COUNT(*) FROM highs h LEFT JOIN frame_lookup f ON f.ttl=h.count "
+                "WHERE h.serial_index>? AND f.ttl IS NULL",
+                (epoch["shutdown_marker_index"],),
+            ).fetchone()[0]
+        )
         observations = _write_detections(db, objects_path)
         median = serial["median_interval_us"]
         tolerance = max(1000.0, median / 2.0) if median is not None else None
@@ -413,16 +682,36 @@ def build_alignment(
             "clock_fit_intercept_us": frames["clock_fit_intercept_us"],
             "clock_detrended_residual_us_max_abs": frames["clock_residual_max"],
             "clock_tolerance_us": tolerance, "clock_within_tolerance": within,
+            "controller_high_events_in_epoch": epoch_highs,
+            "controller_high_events_unmatched": unmatched_epoch_highs,
+            "shutdown_tail_high_events": shutdown_tail_highs,
+            "shutdown_tail_high_events_unmatched": unmatched_shutdown_tail_highs,
+            "boundary_tail_policy": (
+                "every CAMERA_HIGH after START_SENT through end-of-serial, including "
+                "events after CAPTURE_STOP_REQUESTED, must map to one recorded camera frame"
+            ),
+            "epoch_markers_complete": True,
             "validated": (
                 frames["missing_ttl"] == 0
                 and frames["mismatch_count"] == 0
                 and frames["gap_count"] == 0
+                and frames["count"] == epoch_highs
+                and unmatched_epoch_highs == 0
+                and unmatched_shutdown_tail_highs == 0
                 and within is not False
             ),
         })
-        video_info = {"file": str(run_dir / "raw.mp4"), "file_name": "raw.mp4", **_ffprobe(run_dir / "raw.mp4")}
-        video_frames = _to_int(video_info.get("nb_frames"))
+        decoded = _video_validation(run_dir / "raw.mp4", video_validation)
+        video_frames = decoded["count"]
+        video_info = {
+            "file": str(run_dir / "raw.mp4"),
+            "file_name": "raw.mp4",
+            "decoded_frames": video_frames,
+            "frame_count_method": decoded.get("method"),
+            "frame_count_error": decoded.get("error"),
+        }
         summary = {
+            "schema_version": "2.0",
             "run_dir": str(run_dir), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "time_base": "serial.csv CAMERA_HIGH rp2040Time",
             "frame_alignment_rule": "camera_frame_id = CAMERA_HIGH count + dynamic offset",
@@ -456,10 +745,28 @@ def build_alignment(
                 "object_pts_mismatches_sample": observations["samples"]["pts"],
             },
             "frame_gaps": frames["gaps"], "raw_video_info": video_info,
-            "processing": {"mode": "streaming_disk_backed", "index": "temporary_sqlite"},
+            "processing": {
+                "mode": "streaming_disk_backed",
+                "index": "temporary_sqlite",
+                "source_evidence": source_evidence,
+            },
         }
-        (out_dir / "alignment_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
+        final_evidence = _input_snapshot(
+            evidence_paths, required=frozenset({"frames", "serial"})
+        )
+        if final_evidence != source_evidence:
+            changed = sorted(
+                name
+                for name in source_evidence
+                if source_evidence[name] != final_evidence[name]
+            )
+            raise RuntimeError(
+                "scientific alignment inputs changed during processing: "
+                + ", ".join(changed)
+            )
+        atomic_write_json(summary_path, summary)
         return summary
     finally:
-        db.close()
+        if db is not None:
+            db.close()
         index_path.unlink(missing_ok=True)

@@ -1,5 +1,10 @@
 # Local run outputs
 runs/
+qualification/*.local.yaml
+qualification/results/
+qualification/assignments*.yaml
+qualification/matrix_report.json
+qualification/debug-overhead.json
 
 # Device-local application state
 models/

@@ -18,6 +18,7 @@
 #include "Spinnaker.h"
 #include "SpinGenApi/SpinnakerGenApi.h"
 #include "gstnvdsmeta.h"
+#include "nvds_latency_meta.h"
 #include "nvdsmeta.h"
 
 using Spinnaker::CameraList;
@@ -69,6 +70,8 @@ enum {
   PROP_METADATA_PROFILE,
   PROP_MAX_CONSECUTIVE_TIMEOUTS,
   PROP_CAPTURE_LOG_PATH,
+  PROP_FAULT_AFTER_FRAMES,
+  PROP_FAULT_KIND,
 };
 
 struct _GstFlirSpinSrc {
@@ -92,6 +95,10 @@ struct _GstFlirSpinSrc {
   guint max_consecutive_timeouts;
   gchar* capture_log_path;
   FILE* capture_log;
+  guint64 fault_after_frames;
+  gchar* fault_kind;
+  gboolean fault_injected;
+  gboolean latency_reference_enabled;
 
   guint actual_width;
   guint actual_height;
@@ -165,6 +172,15 @@ static std::string spinnaker_exception_message(const Spinnaker::Exception& exc) 
   std::ostringstream oss;
   oss << exc.what();
   return oss.str();
+}
+
+static gboolean environment_value_is_truthy(const gchar* name) {
+  const gchar* value = g_getenv(name);
+  return value &&
+      (g_ascii_strcasecmp(value, "1") == 0 ||
+       g_ascii_strcasecmp(value, "true") == 0 ||
+       g_ascii_strcasecmp(value, "yes") == 0 ||
+       g_ascii_strcasecmp(value, "on") == 0);
 }
 
 static bool exception_is_timeout(const Spinnaker::Exception& exc) {
@@ -761,6 +777,7 @@ static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
     self->acquisition_started = TRUE;
     g_atomic_int_set(&self->stopping, FALSE);
     self->frame_count = 0;
+    self->fault_injected = FALSE;
     self->camera_timestamp_base = 0;
     self->last_frame_id = 0;
     self->last_stream_frame_id = 0;
@@ -863,6 +880,13 @@ static void gst_flir_spin_src_set_property(GObject* object, guint prop_id, const
       g_free(self->capture_log_path);
       self->capture_log_path = g_value_dup_string(value);
       break;
+    case PROP_FAULT_AFTER_FRAMES:
+      self->fault_after_frames = g_value_get_uint64(value);
+      break;
+    case PROP_FAULT_KIND:
+      g_free(self->fault_kind);
+      self->fault_kind = g_value_dup_string(value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -924,6 +948,12 @@ static void gst_flir_spin_src_get_property(GObject* object, guint prop_id, GValu
     case PROP_CAPTURE_LOG_PATH:
       g_value_set_string(value, self->capture_log_path);
       break;
+    case PROP_FAULT_AFTER_FRAMES:
+      g_value_set_uint64(value, self->fault_after_frames);
+      break;
+    case PROP_FAULT_KIND:
+      g_value_set_string(value, self->fault_kind);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -939,6 +969,7 @@ static void gst_flir_spin_src_finalize(GObject* object) {
   g_free(self->camera_serial);
   g_free(self->metadata_profile);
   g_free(self->capture_log_path);
+  g_free(self->fault_kind);
   g_free(self->resolved_serial);
   g_free(self->device_model);
   g_free(self->firmware_version);
@@ -961,6 +992,8 @@ static GstCaps* gst_flir_spin_src_get_caps(GstBaseSrc* base_src, GstCaps* filter
 
 static gboolean gst_flir_spin_src_start(GstBaseSrc* base_src) {
   GstFlirSpinSrc* self = GST_FLIR_SPIN_SRC(base_src);
+  self->latency_reference_enabled =
+      environment_value_is_truthy("NVDS_ENABLE_LATENCY_MEASUREMENT");
   std::string error;
   if (!open_camera(self, error)) {
     GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ, ("Failed to open FLIR Spinnaker camera"), ("%s", error.c_str()));
@@ -1152,6 +1185,28 @@ static GstFlowReturn copy_image_to_buffer(
   GST_BUFFER_PTS(buffer) = pts;
   GST_BUFFER_DTS(buffer) = pts;
   GST_BUFFER_DURATION(buffer) = self->frame_duration;
+  if (self->latency_reference_enabled) {
+    const gchar* source_element_name = GST_ELEMENT_NAME(self);
+    if (!source_element_name || !*source_element_name || self->frame_count > G_MAXUINT) {
+      GST_ELEMENT_ERROR(
+          self,
+          STREAM,
+          FAILED,
+          ("Cannot add the required DeepStream latency reference timestamp"),
+          ("source=%s source-sequence=%" G_GUINT64_FORMAT,
+           source_element_name ? source_element_name : "",
+           self->frame_count));
+      gst_buffer_unref(buffer);
+      return GST_FLOW_ERROR;
+    }
+    // DeepStream 9.1 exposes no return value for this public API. The call is
+    // therefore mandatory in the debug path; downstream qualification remains
+    // fail-closed unless NVIDIA's probes emit valid latency records.
+    nvds_add_reference_timestamp_meta(
+        buffer,
+        const_cast<gchar*>(source_element_name),
+        static_cast<guint>(self->frame_count));
+  }
   if (camera_frame_id) {
     GST_BUFFER_OFFSET(buffer) = *camera_frame_id;
     GST_BUFFER_OFFSET_END(buffer) = *camera_frame_id + 1;
@@ -1309,6 +1364,51 @@ static GstFlowReturn gst_flir_spin_src_create(GstPushSrc* push_src, GstBuffer** 
   GstFlirSpinSrc* self = GST_FLIR_SPIN_SRC(push_src);
   if (!self->camera || !self->acquisition_started) {
     return GST_FLOW_FLUSHING;
+  }
+
+  if (self->fault_after_frames > 0 && !self->fault_injected &&
+      self->frame_count >= self->fault_after_frames) {
+    self->fault_injected = TRUE;
+    const gchar* gate = g_getenv("SQUEAKVIEW_ENABLE_FAILURE_INJECTION");
+    if (g_strcmp0(gate, "1") != 0) {
+      GST_ELEMENT_ERROR(
+          self,
+          CORE,
+          FAILED,
+          ("FLIR failure injection was configured without the explicit safety gate"),
+          ("set SQUEAKVIEW_ENABLE_FAILURE_INJECTION=1 only for qualification"));
+      return GST_FLOW_ERROR;
+    }
+    if (g_strcmp0(self->fault_kind, "source_read") == 0) {
+      GST_ELEMENT_ERROR(
+          self,
+          RESOURCE,
+          READ,
+          ("Injected FLIR source read failure"),
+          ("after-frames=%" G_GUINT64_FORMAT, self->fault_after_frames));
+    } else if (g_strcmp0(self->fault_kind, "source_incomplete") == 0) {
+      GST_ELEMENT_ERROR(
+          self,
+          STREAM,
+          FAILED,
+          ("Injected FLIR incomplete-frame failure"),
+          ("after-frames=%" G_GUINT64_FORMAT, self->fault_after_frames));
+    } else if (g_strcmp0(self->fault_kind, "capture_ledger_write") == 0) {
+      GST_ELEMENT_ERROR(
+          self,
+          RESOURCE,
+          WRITE,
+          ("Injected FLIR capture-ledger write failure"),
+          ("after-frames=%" G_GUINT64_FORMAT, self->fault_after_frames));
+    } else {
+      GST_ELEMENT_ERROR(
+          self,
+          CORE,
+          FAILED,
+          ("Unsupported FLIR failure-injection kind"),
+          ("kind=%s", self->fault_kind ? self->fault_kind : ""));
+    }
+    return GST_FLOW_ERROR;
   }
 
   while (!g_atomic_int_get(&self->stopping)) {
@@ -1580,6 +1680,26 @@ static void gst_flir_spin_src_class_init(GstFlirSpinSrcClass* klass) {
           "Line-delimited JSON ledger written for every source buffer before downstream delivery",
           "",
           static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      object_class,
+      PROP_FAULT_AFTER_FRAMES,
+      g_param_spec_uint64(
+          "fault-after-frames",
+          "Qualification fault frame",
+          "Inject the selected qualification-only failure after this many emitted frames; zero disables",
+          0,
+          G_MAXUINT64,
+          0,
+          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      object_class,
+      PROP_FAULT_KIND,
+      g_param_spec_string(
+          "fault-kind",
+          "Qualification fault kind",
+          "Qualification-only failure kind; requires the explicit environment safety gate",
+          "",
+          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   gst_element_class_set_static_metadata(
       element_class,
@@ -1616,6 +1736,10 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   self->max_consecutive_timeouts = DEFAULT_MAX_CONSECUTIVE_TIMEOUTS;
   self->capture_log_path = g_strdup("");
   self->capture_log = nullptr;
+  self->fault_after_frames = 0;
+  self->fault_kind = g_strdup("");
+  self->fault_injected = FALSE;
+  self->latency_reference_enabled = FALSE;
   self->actual_width = 0;
   self->actual_height = 0;
   self->actual_fps = 0.0;

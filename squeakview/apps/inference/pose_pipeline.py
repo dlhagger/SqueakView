@@ -2,19 +2,29 @@
 from __future__ import annotations
 
 import atexit
-import csv
 import json
 import math
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from pyservicemaker import BatchMetadataOperator, osd
+from squeakview.common.bounded_input import read_json_object, read_stable_regular_file
+
+from .pose_persistence import (
+    KEYPOINT_HEADERS,
+    OBJECT_HEADERS,
+    STREAM_LEDGER_BUFFER_BYTES,
+    PoseCsvWriter,
+)
 
 
 POSE_META_DESCRIPTOR = b"SQUEAKVIEW.POSE.OBJECT_META.v1"
 UNTRACKED_OBJECT_IDS = {-1, (1 << 64) - 1}
+MAX_POSE_SCHEMA_BYTES = 4 * 1024 * 1024
+MAX_POSE_LABEL_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,8 +59,10 @@ def load_pose_schema(config_path: Path, class_names: list[str]) -> PoseSchema:
 
     path = config_path.with_name(f"{config_path.stem}.pose.json")
     try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        data = read_json_object(
+            path, max_bytes=MAX_POSE_SCHEMA_BYTES, label="pose schema"
+        )
+    except (OSError, ValueError) as exc:
         raise ValueError(f"Could not read pose schema {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError(f"Pose schema must contain a JSON object: {path}")
@@ -67,8 +79,11 @@ def load_pose_schema(config_path: Path, class_names: list[str]) -> PoseSchema:
     if not label_path.is_absolute():
         label_path = path.parent / label_path
     try:
-        labels = [line.strip() for line in label_path.read_text().splitlines() if line.strip()]
-    except OSError as exc:
+        label_text = read_stable_regular_file(
+            label_path, max_bytes=MAX_POSE_LABEL_BYTES, label="pose keypoint labels"
+        ).decode("utf-8", errors="strict")
+        labels = [line.strip() for line in label_text.splitlines() if line.strip()]
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise ValueError(f"Could not read pose keypoint labels {label_path}: {exc}") from exc
     count = int(data["keypoint_count"])
     if len(labels) != count:
@@ -203,14 +218,45 @@ class FramePoseStore:
 
     TOKEN = "SQPOSE"
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        max_frames: int = 64,
+        max_observations_per_frame: int = 1024,
+    ):
+        if int(max_frames) < 1:
+            raise ValueError("max_frames must be positive")
+        if int(max_observations_per_frame) < 1:
+            raise ValueError("max_observations_per_frame must be positive")
+        self.max_frames = int(max_frames)
+        self.max_observations_per_frame = int(max_observations_per_frame)
         self._lock = threading.Lock()
         self._frames: dict[tuple[int, int], dict[int, dict[str, Any]]] = {}
 
     def put(self, stream_id: int, frame_number: int, observation: dict[str, Any]) -> str:
         index = int(observation["detection_index"])
+        key = (int(stream_id), int(frame_number))
         with self._lock:
-            self._frames.setdefault((stream_id, frame_number), {})[index] = observation
+            frame = self._frames.get(key)
+            if frame is None:
+                if len(self._frames) >= self.max_frames:
+                    raise RuntimeError(
+                        "pose handoff exceeded its bounded frame capacity; "
+                        "downstream tracking is not consuming inference results"
+                    )
+                frame = {}
+                self._frames[key] = frame
+            if index in frame:
+                raise RuntimeError(
+                    f"duplicate pose detection index {index} for stream {key[0]} "
+                    f"frame {key[1]}"
+                )
+            if len(frame) >= self.max_observations_per_frame:
+                raise RuntimeError(
+                    "pose handoff exceeded its bounded per-frame observation capacity "
+                    f"on stream {key[0]} frame {key[1]}"
+                )
+            frame[index] = observation
         return f"{self.TOKEN}:{frame_number}:{index}"
 
     def get(self, stream_id: int, frame_number: int, token: str) -> dict[str, Any] | None:
@@ -298,19 +344,8 @@ class Yolo26PoseTensorOperator(BatchMetadataOperator):
 class ObservationOperator(BatchMetadataOperator):
     """Persist tracked objects/keypoints and produce the matching live overlay."""
 
-    OBJECT_HEADERS = [
-        "observation_id", "stream_id", "deepstream_frame_number", "source_sequence_index",
-        "camera_frame_id", "camera_timestamp_ns", "gst_pts_ns", "class_id", "class_label",
-        "track_id", "detected_this_frame", "tracker_predicted", "detector_confidence",
-        "tracker_confidence", "detector_x", "detector_y", "detector_w", "detector_h",
-        "track_x", "track_y", "track_w", "track_h", "pose_available", "schema_version",
-    ]
-    KEYPOINT_HEADERS = [
-        "observation_id", "stream_id", "deepstream_frame_number", "source_sequence_index",
-        "camera_frame_id", "track_id", "class_id", "class_label", "keypoint_index",
-        "keypoint_name", "x_px", "y_px", "x_norm", "y_norm", "confidence", "visible",
-        "coordinate_space", "source",
-    ]
+    OBJECT_HEADERS = OBJECT_HEADERS
+    KEYPOINT_HEADERS = KEYPOINT_HEADERS
     def __init__(
         self,
         run_dir: Path,
@@ -318,7 +353,7 @@ class ObservationOperator(BatchMetadataOperator):
         *,
         store: FramePoseStore,
         flir_meta_type: int | None,
-        frame_ledger: dict[int, dict[str, Any]] | None = None,
+        frame_ledger: Mapping[int, dict[str, Any]] | None = None,
         mapping_method: str = "flir_user_meta",
         source_name: str = "flirspinsrc",
     ):
@@ -331,16 +366,11 @@ class ObservationOperator(BatchMetadataOperator):
         self.source_name = str(source_name)
         self._lock = threading.Lock()
         self._closed = False
-        self._files: dict[str, Any] = {}
-        self._writers: dict[str, csv.writer] = {}
-        for name, headers in (
-            ("objects", self.OBJECT_HEADERS),
-            ("keypoints", self.KEYPOINT_HEADERS),
-        ):
-            handle = (run_dir / f"{name}.csv").open("w", newline="", buffering=1)
-            self._files[name] = handle
-            self._writers[name] = csv.writer(handle)
-            self._writers[name].writerow(headers)
+        self.persistence = PoseCsvWriter(run_dir)
+        # Retain these implementation attributes for compatibility with local
+        # diagnostics that inspected the former inline writer.
+        self._files = self.persistence._files
+        self._writers = self.persistence._writers
         atexit.register(self.close)
 
     @staticmethod
@@ -456,7 +486,7 @@ class ObservationOperator(BatchMetadataOperator):
                     observation_id = f"s{stream_id}:f{source_sequence if source_sequence is not None else frame_number}:o{ordinal}"
                     detector_confidence = pose.get("detector_confidence", "") if pose else ""
                     tracker_confidence = float(getattr(object_meta, "tracker_confidence", -0.1))
-                    self._writers["objects"].writerow(
+                    self.persistence.write_object(
                         [
                             observation_id, stream_id, frame_number,
                             "" if source_sequence is None else source_sequence,
@@ -471,8 +501,8 @@ class ObservationOperator(BatchMetadataOperator):
                         ]
                     )
                     if pose:
-                        for point in pose.get("keypoints", []):
-                            self._writers["keypoints"].writerow(
+                        self.persistence.write_keypoints(
+                            (
                                 [
                                     observation_id, stream_id, frame_number,
                                     "" if source_sequence is None else source_sequence,
@@ -483,7 +513,9 @@ class ObservationOperator(BatchMetadataOperator):
                                     point["confidence"], int(point["visible"]),
                                     pose.get("coordinate_space", "source_pixels"), "detector",
                                 ]
+                                for point in pose.get("keypoints", [])
                             )
+                        )
                     self._decorate(batch_meta, frame_meta, object_meta, pose, track_id, predicted)
                 self.store.discard(stream_id, frame_number)
 
@@ -492,6 +524,4 @@ class ObservationOperator(BatchMetadataOperator):
             if self._closed:
                 return
             self._closed = True
-            for handle in self._files.values():
-                handle.flush()
-                handle.close()
+            self.persistence.close()

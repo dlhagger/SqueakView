@@ -8,8 +8,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from squeakview.common.bounded_input import read_stable_regular_file  # noqa: E402
+from squeakview.common.run_context import atomic_write_json  # noqa: E402
 
 
 def _repo_root() -> Path:
@@ -19,8 +27,10 @@ def _repo_root() -> Path:
 def _latest_run_dir() -> Path | None:
     marker = _repo_root() / "runs" / ".latest_run"
     try:
-        text = marker.read_text().strip()
-    except FileNotFoundError:
+        text = read_stable_regular_file(
+            marker, max_bytes=4096, label="latest-run marker"
+        ).decode("utf-8", errors="strict").strip()
+    except (OSError, UnicodeDecodeError, ValueError):
         return None
     if not text:
         return None
@@ -33,6 +43,7 @@ def build_alignment(
     out_dir: Path,
     *,
     objects_path: Path | None = None,
+    video_validation: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Run the bounded-memory validator without copying canonical CSVs."""
     try:
@@ -48,6 +59,7 @@ def build_alignment(
         run_dir,
         out_dir,
         objects_path=objects_path,
+        video_validation=video_validation,
     )
 
 
@@ -104,9 +116,7 @@ def main() -> int:
         out_dir,
         objects_path=args.objects.resolve() if args.objects else None,
     )
-    (out_dir / "alignment_summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n"
-    )
+    atomic_write_json(out_dir / "alignment_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0 if validation_passed(summary) else 1
 

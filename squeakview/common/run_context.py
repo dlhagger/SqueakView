@@ -16,7 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from squeakview.common.bounded_csv import bounded_csv_lines
+
 from squeakview import config as squeakview_config
+from squeakview.common.storage_policy import resolve_storage_reserve_policy
 
 RUNS_DIR = squeakview_config.ensure_runs_dir()
 RUN_MARKER = RUNS_DIR / ".latest_run"
@@ -45,16 +48,6 @@ _METADATA_LOCK = threading.RLock()
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
 
 
 def slugify(value: str | None, *, fallback: str) -> str:
@@ -92,7 +85,10 @@ def atomic_write_text(path: Path, text: str) -> Path:
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> Path:
-    return atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return atomic_write_text(
+        path,
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+    )
 
 
 def _atomic_write_latest(run_dir: Path) -> None:
@@ -101,9 +97,13 @@ def _atomic_write_latest(run_dir: Path) -> None:
 
 def latest_run_dir() -> Path | None:
     """Return the most recent run directory recorded by timestamped_run_dir."""
+    from squeakview.common.bounded_input import read_stable_regular_file
+
     try:
-        text = RUN_MARKER.read_text().strip()
-    except FileNotFoundError:
+        text = read_stable_regular_file(
+            RUN_MARKER, max_bytes=4096, label="latest-run marker"
+        ).decode("utf-8", errors="strict").strip()
+    except (OSError, UnicodeDecodeError, ValueError):
         return None
     if not text:
         return None
@@ -166,7 +166,8 @@ def create_run_dir(
 def assert_runs_dir_ready(min_free_bytes: int | None = None) -> dict[str, Any]:
     """Verify local run storage is writable and has basic free-space headroom."""
     if min_free_bytes is None:
-        min_free_bytes = _env_int("SQUEAKVIEW_MIN_RUN_FREE_BYTES", 1_000_000_000)
+        min_free_bytes = resolve_storage_reserve_policy().min_free_bytes
+    min_free_bytes = max(1, int(min_free_bytes))
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     probe = RUNS_DIR / f".write_test_{os.getpid()}"
     try:
@@ -298,12 +299,11 @@ def build_bottle_summary(bottles: dict[str, Any] | None, *, updated_at: str | No
 def _read_bottle_measurement_rows(path: Path) -> dict[tuple[str, str], dict[str, str]]:
     rows: dict[tuple[str, str], dict[str, str]] = {}
     try:
-        with path.open(newline="") as f:
-            for row in csv.DictReader(f):
-                side = str(row.get("side") or "").strip().lower()
-                phase = str(row.get("phase") or "").strip().lower()
-                if side in {"left", "right"} and phase in {"initial", "final"}:
-                    rows[(side, phase)] = {str(key): str(value or "") for key, value in row.items()}
+        for row in csv.DictReader(bounded_csv_lines(path)):
+            side = str(row.get("side") or "").strip().lower()
+            phase = str(row.get("phase") or "").strip().lower()
+            if side in {"left", "right"} and phase in {"initial", "final"}:
+                rows[(side, phase)] = {str(key): str(value or "") for key, value in row.items()}
     except Exception:
         pass
     return rows
@@ -396,12 +396,53 @@ def manifest_path(run_dir: Path) -> Path:
     return run_dir / RUN_MANIFEST_FILENAME
 
 
+MAX_RUN_METADATA_BYTES = 16 * 1024 * 1024
+
+
+def read_json_required(
+    path: Path, *, max_bytes: int = MAX_RUN_METADATA_BYTES
+) -> dict[str, Any]:
+    """Read scientific run metadata with bounded, stable, strict semantics."""
+
+    from squeakview.common.bounded_input import read_json_object
+
+    return read_json_object(path, max_bytes=max_bytes, label=Path(path).name)
+
+
+def read_json_required_with_identity(
+    path: Path, *, max_bytes: int = MAX_RUN_METADATA_BYTES
+) -> tuple[dict[str, Any], dict[str, object]]:
+    """Read metadata and return the identity of the exact bytes decoded."""
+
+    from squeakview.common.bounded_input import read_json_object_with_identity
+
+    return read_json_object_with_identity(
+        path, max_bytes=max_bytes, label=Path(path).name
+    )
+
+
 def read_json(path: Path) -> dict[str, Any]:
+    """Best-effort bounded metadata read for presentation and initial creation.
+
+    Scientific validation and provenance decisions must use
+    :func:`read_json_required`; this compatibility edge intentionally maps a
+    missing or invalid document to an empty snapshot.
+    """
+
     try:
-        data = json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+        return read_json_required(path)
+    except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+
+
+def _read_json_for_update(path: Path) -> dict[str, Any]:
+    """Never replace an existing metadata document that cannot be verified."""
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return {}
+    return read_json_required(path)
 
 
 @contextmanager
@@ -431,7 +472,7 @@ def _apply_status_lifecycle_timestamps(payload: dict[str, Any], history: list[An
 def write_status(run_dir: Path, state: str, **updates: Any) -> Path:
     path = status_path(run_dir)
     with _metadata_file_lock(path):
-        payload = read_json(path)
+        payload = _read_json_for_update(path)
         history = payload.get("history")
         if not isinstance(history, list):
             history = []
@@ -440,6 +481,11 @@ def write_status(run_dir: Path, state: str, **updates: Any) -> Path:
         history.append(entry)
         payload.update(updates)
         payload["state"] = state
+        # A successfully finalized run has no active work stage. Preserve the
+        # completed stage in history, but do not expose it as current state.
+        # Failure states intentionally retain their stage for diagnosis.
+        if state == "finalized":
+            payload.pop("stage", None)
         payload["updated_at"] = entry["timestamp"]
         payload["history"] = history
         _apply_status_lifecycle_timestamps(payload, history)
@@ -449,7 +495,7 @@ def write_status(run_dir: Path, state: str, **updates: Any) -> Path:
 def update_status(run_dir: Path, **updates: Any) -> Path:
     path = status_path(run_dir)
     with _metadata_file_lock(path):
-        payload = read_json(path)
+        payload = _read_json_for_update(path)
         payload.update({key: value for key, value in updates.items() if value is not None})
         payload["updated_at"] = _now_iso()
         return atomic_write_json(path, payload)
@@ -464,7 +510,7 @@ def write_manifest(run_dir: Path, payload: dict[str, Any]) -> Path:
 def update_manifest(run_dir: Path, **updates: Any) -> Path:
     path = manifest_path(run_dir)
     with _metadata_file_lock(path):
-        payload = read_json(path)
+        payload = _read_json_for_update(path)
         payload.update(updates)
         payload["updated_at"] = _now_iso()
         return atomic_write_json(path, payload)

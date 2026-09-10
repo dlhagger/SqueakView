@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import platform
+import stat as stat_module
 import subprocess
 import sys
 from pathlib import Path
 
 
 _PACKAGES = (
+    "nvidia-jetpack",
     "nvidia-l4t-core",
     "deepstream-9.1",
     "cuda-toolkit-13-2",
@@ -17,6 +20,7 @@ _PACKAGES = (
     "libnvinfer10",
     "libgstreamer1.0-0",
     "libspinnaker",
+    "ffmpeg",
 )
 
 
@@ -41,23 +45,54 @@ def _command_output(command: list[str]) -> str | None:
     return result.stdout.strip() or None
 
 
-def file_identity(path: Path) -> dict[str, object]:
+def file_identity(
+    path: Path, *, max_bytes: int = 512 * 1024 * 1024
+) -> dict[str, object]:
     """Return an auditable identity for a native binary used by acquisition."""
 
     resolved = path.resolve()
     try:
-        stat = resolved.stat()
         digest = hashlib.sha256()
         with resolved.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            before = os.fstat(handle.fileno())
+            if not stat_module.S_ISREG(before.st_mode):
+                raise OSError("identity target is not a regular file")
+            if before.st_size > max_bytes:
+                raise OSError(f"identity target exceeds {max_bytes} byte limit")
+            remaining = before.st_size
+            while remaining:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
                 digest.update(chunk)
+                remaining -= len(chunk)
+            grew = bool(handle.read(1))
+            after = os.fstat(handle.fileno())
+        current = resolved.stat()
     except OSError as exc:
         return {"path": str(resolved), "available": False, "error": str(exc)}
+    if (
+        remaining
+        or grew
+        or after.st_dev != before.st_dev
+        or after.st_ino != before.st_ino
+        or after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+        or current.st_dev != before.st_dev
+        or current.st_ino != before.st_ino
+        or current.st_size != before.st_size
+        or current.st_mtime_ns != before.st_mtime_ns
+    ):
+        return {
+            "path": str(resolved),
+            "available": False,
+            "error": "identity target changed while being hashed",
+        }
     return {
         "path": str(resolved),
         "available": True,
-        "size_bytes": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
+        "size_bytes": before.st_size,
+        "mtime_ns": before.st_mtime_ns,
         "sha256": digest.hexdigest(),
     }
 

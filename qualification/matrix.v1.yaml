@@ -1,0 +1,47 @@
+schema_version: "1.0"
+matrix_id: orin-nano-super-jp721-sustained-v1
+description: Required scientific acquisition qualification cells.
+
+capture_profiles:
+  - id: mono8-1440x1080-30fps-1cam
+    width: 1440
+    height: 1080
+    fps: 30
+    camera_count: 1
+    pixel_format: Mono8
+    trigger_on: true
+    trigger_activation: rising
+    arduino_fps: 30
+    exposure_us: 10000.0
+    bitrate_kbps: 4000
+    serial_enabled: true
+    serial_port: /dev/ttyACM0
+    serial_baud: 115200
+
+durations:
+  - id: short
+    minimum_seconds: 300
+  - id: one-hour
+    minimum_seconds: 3600
+  - id: full-duration
+    minimum_seconds: 57600
+
+inference_enabled: [true, false]
+preview_enabled: [true, false]
+power_modes: [25W, MAXN_SUPER]
+
+provenance:
+  require_clean_git: true
+  require_same_git_commit: true
+  require_same_model_identity: true
+  require_same_device_identity: true
+  require_same_acquisition_identity: true
+  require_case_binding: true
+  require_production_eligible: true
+
+notes:
+  - Export SQUEAKVIEW_QUALIFICATION_CASE_ID to the exact case before launching each cell.
+  - Run every cell from the GUI launched in a standalone terminal.
+  - Use SQUEAKVIEW_DISABLE_PREVIEW=1 for preview-off cells.
+  - MAXN_SUPER is accepted only if telemetry proves a stable no-throttle run.
+  - A cell is not complete until its run passes frame-integrity and validated limits.
