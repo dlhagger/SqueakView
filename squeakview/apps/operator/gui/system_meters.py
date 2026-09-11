@@ -269,7 +269,7 @@ class MetersBar(QtWidgets.QWidget):
             bar.setValue(0)
             bar.setFormat("%p%")
             bar.setTextVisible(True)
-            bar.setFixedHeight(18)
+            bar.setFixedHeight(22)
             meter_layout.addWidget(label)
             meter_layout.addWidget(bar, 1)
             return widget, bar
@@ -299,7 +299,7 @@ class MetersBar(QtWidgets.QWidget):
             chunk = "#e74c3c"
         return (
             "QProgressBar { background-color: #101526; color: #eef1ff; border: 1px solid #333a55; "
-            "border-radius: 5px; text-align: center; font-size: 11px; font-weight: 700; }"
+            "border-radius: 5px; text-align: center; font-size: 12px; font-weight: 700; }"
             f" QProgressBar::chunk {{ background-color: {chunk}; }}"
         )
 

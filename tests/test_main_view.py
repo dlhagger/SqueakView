@@ -53,8 +53,24 @@ class MainViewTest(unittest.TestCase):
         self.assertFalse(self.view.stop_btn.isEnabled())
         self.assertTrue(self.view.event_log.isReadOnly())
         self.assertEqual(self.view.event_log.document().maximumBlockCount(), 500)
-        self.assertIs(self.view.stop_overlay.parentWidget(), self.view.central)
+        self.assertIs(self.view.stop_overlay.parentWidget(), self.window)
         self.assertEqual(self.view.bottle_panel.save_button.text(), "Save Bottle Info")
+        self.assertIs(self.view.workspace.parent(), self.window)
+        self.assertEqual(
+            set(self.view.workspace.cards),
+            {"preview", "system", "task", "bottles", "behavior", "events"},
+        )
+        self.assertEqual(self.view.event_log.objectName(), "eventLog")
+        self.assertIsInstance(self.view.event_dock, QtWidgets.QDockWidget)
+        self.assertFalse(self.view.workspace.layout_editable)
+        event_buttons = {
+            button.text(): button
+            for button in self.view.event_dock.findChildren(QtWidgets.QPushButton)
+        }
+        self.assertEqual(event_buttons["Copy"].size().toTuple(), (160, 36))
+        self.assertEqual(
+            event_buttons["Open Run Folder"].size().toTuple(), (160, 36)
+        )
 
     def test_connects_behavior_through_explicit_callbacks(self) -> None:
         self.view.configure_btn.click()
@@ -73,13 +89,59 @@ class MainViewTest(unittest.TestCase):
         self.callbacks.create_subject.assert_called_once_with()
         self.callbacks.save_bottles.assert_called_once_with()
 
-    def test_events_button_toggles_bounded_log_dock(self) -> None:
+    def test_native_title_menu_toggles_all_card_visibility(self) -> None:
         self.window.show()
         self.app.processEvents()
         self.assertFalse(self.view.event_dock.isVisible())
-        self.view.events_btn.click()
+
+        menu = self.window.createPopupMenu()
+        self.assertIsNotNone(menu)
+        assert menu is not None
+        actions = {action.text(): action for action in menu.actions()}
+        self.assertEqual(
+            {
+                "Live Preview",
+                "System Load",
+                "Live Task State",
+                "Bottles",
+                "Behavior Dashboard",
+                "Operator Events",
+            }.difference(actions),
+            set(),
+        )
+        self.assertTrue(all(actions[title].isEnabled() for title in actions))
+
+        actions["Operator Events"].trigger()
         self.assertTrue(self.view.event_dock.isVisible())
-        self.view.events_btn.click()
+        actions["Operator Events"].trigger()
+        self.assertFalse(self.view.event_dock.isVisible())
+
+    def test_programmatic_event_panel_open_updates_native_visibility_action(self) -> None:
+        self.window.show()
+        self.view.event_dock.show()
+        self.app.processEvents()
+
+        self.assertTrue(self.view.event_dock.isVisible())
+        self.assertTrue(self.view.event_dock.toggleViewAction().isChecked())
+
+    def test_layout_menu_unlocks_and_resets_native_dock_cards(self) -> None:
+        actions = {
+            action.text(): action
+            for action in self.view.layout_btn.menu().actions()
+        }
+        unlock = actions["Unlock card layout"]
+        reset = actions["Reset to default layout"]
+
+        unlock.setChecked(True)
+        self.assertTrue(self.view.workspace.layout_editable)
+        for dock in self.view.workspace.cards.values():
+            self.assertTrue(
+                dock.features()
+                & QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable
+            )
+
+        self.view.event_dock.show()
+        reset.trigger()
         self.assertFalse(self.view.event_dock.isVisible())
 
     def test_main_window_adapter_preserves_legacy_widget_aliases(self) -> None:
@@ -107,6 +169,7 @@ class MainViewTest(unittest.TestCase):
             self.assertIs(host.save_bottles_btn, host.bottle_panel.save_button)
             self.assertIs(host.stop_overlay_title, host.stop_overlay.title_label)
             self.assertIs(host.stop_overlay_bar, host.stop_overlay.progress_bar)
+            self.assertIs(host.workspace.parent(), host)
         finally:
             host.dashboard.close()
             host.close()

@@ -16,16 +16,26 @@ DEFAULT_TASK_CONFIG: dict[str, Any] = {
     "task_name": "SqueakView Default",
     "schema_version": 1,
     "events": [
-        {"name": "POKE", "match": {"event_contains": "POKE", "phase": "start"}, "split_by_side": True, "plot": "Poke"},
-        {"name": "DRINK", "match": {"event_contains": "DRINK", "phase": "start"}, "split_by_side": True, "plot": "Drink"},
-        {"name": "PELLET", "match": {"event_contains": "PELLET", "phase": "retrieval"}, "split_by_side": False, "plot": "Pellet"},
-        {"name": "WELL_CHECK", "match": {"event_contains": "WELL_CHECK", "phase": "start"}, "split_by_side": False, "plot": "Pellet"},
+        {"name": "POKE", "match": {"event_contains": "POKE", "phase": "start"}, "split_by_side": True, "plot": "Behavior"},
+        {"name": "DRINK", "match": {"event_contains": "DRINK", "phase": "start"}, "split_by_side": True, "plot": "Behavior"},
+        {"name": "PELLET", "match": {"event_contains": "PELLET", "phase": "retrieval"}, "split_by_side": False, "plot": "Behavior"},
+        {"name": "WELL_CHECK", "match": {"event_contains": "WELL_CHECK", "phase": "start"}, "split_by_side": False, "plot": "Behavior"},
     ],
     "dashboard": {
         "plots": [
-            {"id": "Poke", "title": "Pokes", "series": ["POKE_L", "POKE_R"]},
-            {"id": "Drink", "title": "Drinks", "series": ["DRINK_L", "DRINK_R"]},
-            {"id": "Pellet", "title": "Pellet & Well", "series": ["PELLET", "WELL_CHECK"]},
+            {
+                "id": "Behavior",
+                "title": "Behavior Events",
+                "type": "event_raster",
+                "series": [
+                    "POKE_L",
+                    "DRINK_L",
+                    "POKE_R",
+                    "DRINK_R",
+                    "PELLET",
+                    "WELL_CHECK",
+                ],
+            },
         ]
     },
 }

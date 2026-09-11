@@ -130,9 +130,23 @@ DARK_DIALOG_STYLE = """
     QDialogButtonBox QPushButton {
         min-width: 84px;
     }
-    QScrollArea, QAbstractScrollArea {
+    QScrollArea, QAbstractScrollArea,
+    QScrollArea > QWidget > QWidget {
         background-color: #0f1118;
         border: none;
+    }
+    QScrollBar:vertical {
+        background: #11162a;
+        width: 12px;
+        margin: 0;
+    }
+    QScrollBar::handle:vertical {
+        background: #4a5578;
+        min-height: 32px;
+        border-radius: 6px;
+    }
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+        height: 0;
     }
     QMenu {
         background-color: #11162a;
@@ -230,6 +244,25 @@ def center_window(widget: QtWidgets.QWidget) -> None:
     widget.move(frame.topLeft())
 
 
+def fit_window_to_available_area(
+    widget: QtWidgets.QWidget,
+    *,
+    margin: int = 32,
+) -> None:
+    """Keep a dialog inside the usable screen while its scroll area handles overflow."""
+
+    screen = widget.screen() or QtGui.QGuiApplication.primaryScreen()
+    if screen is None:
+        return
+    available = screen.availableGeometry()
+    maximum_width = max(320, available.width() - margin)
+    maximum_height = max(320, available.height() - margin)
+    widget.resize(
+        min(widget.width(), maximum_width),
+        min(widget.height(), maximum_height),
+    )
+
+
 def _size_button(button: QtWidgets.QPushButton, *, min_width: int = 96, min_height: int = 38) -> None:
     button.setMinimumWidth(min_width)
     button.setMinimumHeight(min_height)
@@ -261,4 +294,3 @@ def _dark_item_dialog(
     apply_dark_combo_popups(dialog)
     ok = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
     return dialog.textValue(), ok
-

@@ -42,6 +42,12 @@ class BuildEngineNotebookTests(unittest.TestCase):
         self.assertIn("engine_execution = run_trtexec_validation(engine_path)", source)
         self.assertIn('assert engine_execution["passed"]', source)
         self.assertIn('"engine_execution": True', source)
+        self.assertIn('one2one_head = getattr(head, "one2one", None)', source)
+        self.assertNotIn("assert bool(head.end2end)", source)
+        self.assertIn("    nms=False,", source)
+        self.assertNotIn("    end2end=True,", source)
+        self.assertIn('engine_metadata.get("end2end") is True', source)
+        self.assertIn('engine_metadata.get("args", {}).get("nms") is False', source)
         self.assertLess(
             source.index("report_path.write_text"),
             source.index("manifest_path.write_text"),

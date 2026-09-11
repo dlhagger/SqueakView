@@ -16,6 +16,7 @@ from squeakview.apps.operator.gui.config_view import (
     ConfigViewCallbacks,
     build_config_view,
 )
+from squeakview.apps.operator.gui.dialog_style import fit_window_to_available_area
 from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile, slugify
 
 from squeakview.apps.operator.gui.session_dialog import (
@@ -45,7 +46,8 @@ class ConfigDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.setMinimumWidth(440)
+        self.setMinimumSize(560, 520)
+        self.resize(700, 760)
 
         self.setStyleSheet(DARK_DIALOG_STYLE)
         cfg = config or {}
@@ -132,6 +134,7 @@ class ConfigDialog(QtWidgets.QDialog):
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
         super().showEvent(event)
+        fit_window_to_available_area(self)
         center_window(self)
 
     @QtCore.Slot(bool)

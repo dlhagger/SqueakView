@@ -54,8 +54,25 @@ def series_color(key: str, index: int) -> str:
 
 
 def window_bounds(now: float, window_sec: float) -> tuple[float, float]:
-    half = float(window_sec) / 2.0
-    return now - half, now + half
+    window = max(1.0, float(window_sec))
+    return now - window, now
+
+
+def raster_window_bounds(
+    now: float,
+    max_window_sec: float,
+    first_event_at: float | None,
+    *,
+    min_window_sec: float = 30.0,
+) -> tuple[float, float]:
+    """Return a trailing raster window that expands as a new run develops."""
+
+    maximum = max(1.0, float(max_window_sec))
+    minimum = min(maximum, max(1.0, float(min_window_sec)))
+    event_age = 0.0 if first_event_at is None else max(0.0, now - first_event_at)
+    span = min(maximum, max(minimum, event_age + 5.0))
+    right_padding = min(2.0, span * 0.05)
+    return now + right_padding - span, now + right_padding
 
 
 def trim_step_series(
@@ -92,6 +109,26 @@ def cap_step_series(
     if discard:
         del xs[:discard]
         del ys[:discard]
+
+
+def trim_event_times(timestamps: list[float], *, xstart: float) -> None:
+    """Discard raster events that are no longer visible in the time window."""
+
+    discard = 0
+    while discard < len(timestamps) and timestamps[discard] < xstart:
+        discard += 1
+    if discard:
+        del timestamps[:discard]
+
+
+def cap_event_times(
+    timestamps: list[float], *, max_points: int = MAX_SERIES_POINTS
+) -> None:
+    """Apply a display-only bound to one event-raster lane."""
+
+    excess = max(0, len(timestamps) - max(1, int(max_points)))
+    if excess:
+        del timestamps[:excess]
 
 
 def curve_points(
@@ -141,11 +178,14 @@ def counts_html(
 
 __all__ = [
     "MAX_SERIES_POINTS",
+    "cap_event_times",
     "cap_step_series",
     "counts_html",
     "curve_points",
+    "raster_window_bounds",
     "series_color",
     "series_label",
+    "trim_event_times",
     "trim_step_series",
     "window_bounds",
 ]

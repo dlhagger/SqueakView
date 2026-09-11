@@ -140,6 +140,37 @@ class FinalizationOverlayTests(unittest.TestCase):
         )
         self.assertEqual(self.overlay.progress_bar.value(), 90)
         self.assertTrue(self.overlay.progress_bar.isTextVisible())
+        self.assertEqual(self.overlay.progress_bar.format(), "%p% complete")
+
+    def test_compact_overlay_keeps_copy_and_progress_separated(self) -> None:
+        self.parent.resize(480, 300)
+        self.parent.show()
+        self.overlay.resize_to_parent()
+        self.overlay.update_progress(
+            {"state": "finalizing", "stage": "recording_validation"},
+            {
+                "video_frames_decoded": 10_326,
+                "video_frames_expected": 20_000,
+                "video_validation_rate_fps": 8_500.0,
+                "video_validation_eta_s": 1.0,
+            },
+        )
+        self.overlay.show_overlay()
+        self.app.processEvents()
+
+        self.assertLessEqual(self.overlay.content_panel.width(), 432)
+        self.assertLess(
+            self.overlay.title_label.geometry().bottom(),
+            self.overlay.message_label.geometry().top(),
+        )
+        self.assertLess(
+            self.overlay.message_label.geometry().bottom(),
+            self.overlay.progress_bar.geometry().top(),
+        )
+        self.assertLessEqual(
+            self.overlay.progress_bar.width(),
+            self.overlay.content_panel.width(),
+        )
 
 
 if __name__ == "__main__":

@@ -174,22 +174,24 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         action_row.addWidget(self.save_button, 0)
         layout.addLayout(action_row, 3, 0, 1, 4)
         layout.setColumnStretch(1, 1)
+        layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Maximum,
+            QtWidgets.QSizePolicy.Policy.Preferred,
         )
 
     def _make_fluid_combo(self) -> QtWidgets.QComboBox:
         combo = QtWidgets.QComboBox(self)
         combo.setEditable(True)
         combo.addItems(BOTTLE_FLUID_PRESETS)
-        combo.setMinimumWidth(96)
+        combo.setMinimumWidth(108)
         return combo
 
     def _make_weight_edit(self, phase: str) -> QtWidgets.QLineEdit:
         edit = QtWidgets.QLineEdit(self)
         edit.setPlaceholderText(phase)
-        edit.setMaximumWidth(82)
+        edit.setMinimumWidth(88)
+        edit.setMaximumWidth(120)
         validator = QtGui.QDoubleValidator(0.0, 100000.0, 4, edit)
         validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
         edit.setValidator(validator)

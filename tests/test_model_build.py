@@ -122,6 +122,8 @@ class ModelBuildPromotionTests(unittest.TestCase):
         self.assertTrue(evidence["output_truncated"])
         self.assertEqual(evidence["max_output_bytes"], 8)
         self.assertIn("--iterations=1", evidence["command"])
+        self.assertIn("--infStreams=1", evidence["command"])
+        self.assertNotIn("--streams=1", evidence["command"])
 
     def test_trtexec_stdout_handle_is_closed_after_success(self) -> None:
         executable = Path(self.temp_dir.name) / "fake-trtexec"

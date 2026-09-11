@@ -14,7 +14,7 @@ dependencies = [
     "jupyter>=1.1.1",
     "seaborn>=0.13.2",
     "scipy>=1.15.3",
-    "ultralytics==8.4.103",
+    "ultralytics>=8.4.142",
     "torch>=2.12.0",
     "torchvision>=0.27.0",
     "onnxslim>=0.1.94",

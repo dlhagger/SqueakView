@@ -199,6 +199,15 @@ line can no longer arm the controller without its validated structured event.
 Recording liveness and pose CSV persistence are independently tested inference
 services.
 
+The operator surface now uses versioned native Qt dock cards instead of a
+pixel-tuned central grid. The run-control header remains pinned, the canonical
+three-column plus full-width behavior arrangement is always recoverable, and
+operator card positions persist independently from run data. Card movement and
+floating require an explicit idle-only unlock and are forced locked throughout
+startup, recording, and finalization. Every card uses Qt's native hide/show
+action: right-click any card title to toggle cards from one unified checklist,
+and Reset Layout remains the recovery path if multiple cards are hidden.
+
 Pipeline construction is physically separated into source/recording,
 inference/tracking, and preview/output graph modules, with a small mux/resource
 orchestrator retaining the golden element order and properties. The GUI consumes

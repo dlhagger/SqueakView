@@ -94,6 +94,14 @@ class RunLifecycleController(QtCore.QObject):
         self.view.run_btn.setEnabled(presentation.run_enabled)
         self.view.stop_btn.setEnabled(presentation.stop_enabled)
         self.view.configure_btn.setEnabled(presentation.configure_enabled)
+        workspace = getattr(self.view, "workspace", None)
+        if workspace is not None:
+            workspace.set_runtime_locked(not presentation.configure_enabled)
+        layout_btn = getattr(self.view, "layout_btn", None)
+        if layout_btn is not None:
+            # Visibility and explicit Save remain safe during acquisition;
+            # the workspace disables only movement and reset actions.
+            layout_btn.setEnabled(True)
 
     def refresh_runtime_status(self) -> None:
         if not self.active:

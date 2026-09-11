@@ -12,6 +12,7 @@ from .dialog_style import (
     _size_button,
     apply_dark_combo_popups,
     center_window,
+    fit_window_to_available_area,
 )
 from .experiment_dialog import ExperimentSessionMixin
 from .subject_dialog import SubjectSessionMixin
@@ -28,15 +29,15 @@ class SessionLauncherDialog(ExperimentSessionMixin, SubjectSessionMixin, QtWidge
         super().__init__(parent)
         self.setWindowTitle("Start Session")
         self.setModal(True)
-        self.setMinimumWidth(720)
+        self.setMinimumWidth(640)
         self._base_config = dict(base_config or {})
         self._profile_store = profile_store or ProfileStore()
         self._experiments = self._profile_store.list_experiments()
         self._subjects = self._profile_store.list_subjects()
         self._result_config: dict | None = None
 
-        self.setMinimumSize(840, 780)
-        self.resize(860, 800)
+        self.setMinimumSize(640, 520)
+        self.resize(840, 780)
         self.setStyleSheet(
             DARK_DIALOG_STYLE
             + """
@@ -129,9 +130,9 @@ class SessionLauncherDialog(ExperimentSessionMixin, SubjectSessionMixin, QtWidge
             """
         )
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(22, 22, 22, 18)
-        layout.setSpacing(16)
+        outer_layout = QtWidgets.QVBoxLayout(self)
+        outer_layout.setContentsMargins(22, 22, 22, 18)
+        outer_layout.setSpacing(16)
 
         header = QtWidgets.QFrame(self)
         header.setObjectName("launcherShell")
@@ -145,7 +146,23 @@ class SessionLauncherDialog(ExperimentSessionMixin, SubjectSessionMixin, QtWidge
         subtitle.setWordWrap(True)
         header_layout.addWidget(title)
         header_layout.addWidget(subtitle)
-        layout.addWidget(header)
+        outer_layout.addWidget(header)
+
+        scroll_area = QtWidgets.QScrollArea(self)
+        scroll_area.setObjectName("launcherScrollArea")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll_content = QtWidgets.QWidget(scroll_area)
+        scroll_content.setObjectName("launcherScrollContent")
+        scroll_content.setStyleSheet(
+            "QWidget#launcherScrollContent { background-color: #0f1118; }"
+        )
+        layout = QtWidgets.QVBoxLayout(scroll_content)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(16)
 
         experiment_card = QtWidgets.QFrame(self)
         experiment_card.setObjectName("launcherCard")
@@ -289,6 +306,9 @@ class SessionLauncherDialog(ExperimentSessionMixin, SubjectSessionMixin, QtWidge
         self.subject_summary_label.setMinimumHeight(42)
         subject_layout.addWidget(self.subject_summary_label)
         layout.addWidget(subject_card)
+        layout.addStretch(1)
+        scroll_area.setWidget(scroll_content)
+        outer_layout.addWidget(scroll_area, 1)
 
         footer = QtWidgets.QHBoxLayout()
         footer.setSpacing(10)
@@ -303,7 +323,7 @@ class SessionLauncherDialog(ExperimentSessionMixin, SubjectSessionMixin, QtWidge
         _size_button(self.continue_btn, min_width=124, min_height=40)
         footer.addWidget(self.cancel_btn)
         footer.addWidget(self.continue_btn)
-        layout.addLayout(footer)
+        outer_layout.addLayout(footer)
 
         self.experiment_combo.currentIndexChanged.connect(self._on_experiment_changed)
         self.subject_combo.currentIndexChanged.connect(self._on_subject_changed)
@@ -312,6 +332,7 @@ class SessionLauncherDialog(ExperimentSessionMixin, SubjectSessionMixin, QtWidge
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
         super().showEvent(event)
+        fit_window_to_available_area(self)
         center_window(self)
 
     @property

@@ -14,8 +14,9 @@ from PySide6 import QtCore, QtWidgets
 
 from squeakview.apps.operator.gui.bottle_measurements import BottleMeasurementPanel
 from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+from squeakview.apps.operator.gui.dock_workspace import DockWorkspace, build_layout_menu
 from squeakview.apps.operator.gui.finalization_overlay import FinalizationOverlay
-from squeakview.apps.operator.gui.preview import PreviewWidget
+from squeakview.apps.operator.gui.preview import AspectRatioPreviewHost, PreviewWidget
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +44,7 @@ class MainView:
     run_identity_label: QtWidgets.QLabel
     run_elapsed_label: QtWidgets.QLabel
     capture_health_label: QtWidgets.QLabel
-    events_btn: QtWidgets.QPushButton
+    layout_btn: QtWidgets.QPushButton
     configure_btn: QtWidgets.QPushButton
     run_btn: QtWidgets.QPushButton
     stop_btn: QtWidgets.QPushButton
@@ -56,8 +57,9 @@ class MainView:
     new_subject_btn: QtWidgets.QPushButton
     summary_label: QtWidgets.QLabel
     bottle_panel: BottleMeasurementPanel
-    task_state_group: QtWidgets.QGroupBox
+    task_state_group: QtWidgets.QWidget
     stop_overlay: FinalizationOverlay
+    workspace: DockWorkspace
     event_dock: QtWidgets.QDockWidget
     event_log: QtWidgets.QPlainTextEdit
 
@@ -69,11 +71,15 @@ def build_main_view(
     """Build and connect the operator view without starting application logic."""
 
     central = QtWidgets.QWidget(window)
+    central.setMaximumSize(0, 0)
     window.setCentralWidget(central)
 
-    layout = QtWidgets.QVBoxLayout(central)
-    layout.setContentsMargins(14, 14, 14, 14)
-    layout.setSpacing(14)
+    header = QtWidgets.QWidget(window)
+    header.setObjectName("workspaceHeader")
+    header_layout = QtWidgets.QVBoxLayout(header)
+    header_layout.setContentsMargins(14, 14, 14, 8)
+    header_layout.setSpacing(0)
+    window.setMenuWidget(header)
 
     run_control = QtWidgets.QFrame(window)
     run_control.setObjectName("runControlBar")
@@ -96,8 +102,9 @@ def build_main_view(
     run_control_layout.addWidget(run_elapsed_label, 0)
     run_control_layout.addWidget(capture_health_label, 1)
 
-    events_btn = QtWidgets.QPushButton("Events", window)
-    events_btn.setObjectName("secondaryButton")
+    layout_btn = QtWidgets.QPushButton("Layout", window)
+    layout_btn.setObjectName("secondaryButton")
+    layout_btn.setToolTip("Unlock, rearrange, or reset workspace cards")
     configure_btn = QtWidgets.QPushButton("Configure…", window)
     configure_btn.setObjectName("secondaryButton")
     configure_btn.clicked.connect(callbacks.configure)
@@ -109,31 +116,27 @@ def build_main_view(
     stop_btn.setObjectName("dangerButton")
     stop_btn.setEnabled(False)
     stop_btn.clicked.connect(callbacks.stop_run)
-    run_control_layout.addWidget(events_btn, 0)
+    run_control_layout.addWidget(layout_btn, 0)
     run_control_layout.addWidget(configure_btn, 0)
     run_control_layout.addWidget(run_btn, 0)
     run_control_layout.addWidget(stop_btn, 0)
-    layout.addWidget(run_control, 0)
+    header_layout.addWidget(run_control, 0)
 
-    grid = QtWidgets.QGridLayout()
-    grid.setHorizontalSpacing(14)
-    grid.setVerticalSpacing(14)
+    workspace = DockWorkspace(window)
 
-    preview_group = QtWidgets.QGroupBox("Live Preview")
+    preview_group = QtWidgets.QWidget()
+    preview_group.setObjectName("workspaceCardContent")
     preview_layout = QtWidgets.QVBoxLayout(preview_group)
     preview_layout.setContentsMargins(10, 10, 10, 10)
-    preview = PreviewWidget(window)
-    preview.setSizePolicy(
-        QtWidgets.QSizePolicy.Policy.Expanding,
-        QtWidgets.QSizePolicy.Policy.Expanding,
-    )
-    preview_layout.addWidget(preview, 1, QtCore.Qt.AlignmentFlag.AlignHCenter)
-    grid.addWidget(preview_group, 0, 0, 1, 1)
+    preview = PreviewWidget()
+    preview_host = AspectRatioPreviewHost(preview, parent=preview_group)
+    preview_layout.addWidget(preview_host, 1)
 
     dashboard = BehaviorDashboard(window_sec=300.0, pellet_mode="auto")
     meters_only = dashboard.detach_meters()
     task_state_panel = dashboard.detach_task_panel()
-    meters_group = QtWidgets.QGroupBox("System Load")
+    meters_group = QtWidgets.QWidget()
+    meters_group.setObjectName("workspaceCardContent")
     meters_layout = QtWidgets.QVBoxLayout(meters_group)
     meters_layout.setContentsMargins(12, 12, 12, 12)
     meters_layout.addWidget(meters_only)
@@ -173,15 +176,12 @@ def build_main_view(
     meters_layout.addWidget(summary_label)
 
     bottle_panel = BottleMeasurementPanel(window)
+    bottle_panel.setTitle("")
+    bottle_panel.setProperty("embeddedCard", True)
     bottle_panel.save_requested.connect(callbacks.save_bottles)
-    grid.addWidget(meters_group, 0, 1, 1, 1)
 
-    right_column = QtWidgets.QWidget(window)
-    right_column_layout = QtWidgets.QVBoxLayout(right_column)
-    right_column_layout.setContentsMargins(0, 0, 0, 0)
-    right_column_layout.setSpacing(14)
-
-    task_state_group = QtWidgets.QGroupBox("Live Task State")
+    task_state_group = QtWidgets.QWidget()
+    task_state_group.setObjectName("workspaceCardContent")
     task_state_layout = QtWidgets.QVBoxLayout(task_state_group)
     task_state_layout.setContentsMargins(12, 12, 12, 12)
     task_state_layout.addWidget(task_state_panel, 1)
@@ -189,56 +189,54 @@ def build_main_view(
         QtWidgets.QSizePolicy.Policy.Expanding,
         QtWidgets.QSizePolicy.Policy.Expanding,
     )
-    right_column_layout.addWidget(task_state_group, 1)
-    right_column_layout.addWidget(bottle_panel, 0)
-    grid.addWidget(right_column, 0, 2, 1, 1)
 
-    dashboard_group = QtWidgets.QGroupBox("Behavior Dashboard")
+    dashboard_group = QtWidgets.QWidget()
+    dashboard_group.setObjectName("workspaceCardContent")
     dash_layout = QtWidgets.QVBoxLayout(dashboard_group)
     dash_layout.setContentsMargins(16, 16, 16, 16)
-    dashboard.setMinimumHeight(300)
+    dashboard.setMinimumHeight(210)
     dash_layout.addWidget(dashboard)
-    dashboard_group.setMinimumHeight(330)
-    grid.addWidget(dashboard_group, 1, 0, 1, 3)
 
-    grid.setColumnStretch(0, 5)
-    grid.setColumnStretch(1, 4)
-    grid.setColumnStretch(2, 4)
-    grid.setRowStretch(0, 1)
-    grid.setRowStretch(1, 2)
-    layout.addLayout(grid, 1)
-    layout.setStretch(0, 0)
-    layout.setStretch(1, 5)
-
-    stop_overlay = FinalizationOverlay(central)
-
-    event_dock = QtWidgets.QDockWidget("Operator Events", window)
-    event_dock.setObjectName("eventDock")
-    event_dock.setAllowedAreas(
-        QtCore.Qt.DockWidgetArea.BottomDockWidgetArea
-        | QtCore.Qt.DockWidgetArea.RightDockWidgetArea
-    )
-    event_panel = QtWidgets.QWidget(event_dock)
-    event_layout = QtWidgets.QVBoxLayout(event_panel)
-    event_layout.setContentsMargins(8, 8, 8, 8)
-    event_actions = QtWidgets.QHBoxLayout()
-    event_actions.addStretch(1)
+    event_panel = QtWidgets.QWidget()
+    event_panel.setObjectName("workspaceCardContent")
+    event_layout = QtWidgets.QHBoxLayout(event_panel)
+    event_layout.setContentsMargins(12, 12, 12, 12)
+    event_layout.setSpacing(8)
+    event_actions = QtWidgets.QVBoxLayout()
     copy_events_btn = QtWidgets.QPushButton("Copy", event_panel)
+    copy_events_btn.setFixedSize(160, 36)
     copy_events_btn.clicked.connect(callbacks.copy_events)
     open_run_btn = QtWidgets.QPushButton("Open Run Folder", event_panel)
+    open_run_btn.setFixedSize(160, 36)
     open_run_btn.clicked.connect(callbacks.open_run_folder)
-    event_actions.addWidget(copy_events_btn)
-    event_actions.addWidget(open_run_btn)
+    event_actions.addWidget(
+        copy_events_btn,
+        0,
+        QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignRight,
+    )
+    event_actions.addWidget(
+        open_run_btn,
+        0,
+        QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignRight,
+    )
+    event_actions.addStretch(1)
     event_log = QtWidgets.QPlainTextEdit(event_panel)
+    event_log.setObjectName("eventLog")
     event_log.setReadOnly(True)
     event_log.setMaximumBlockCount(500)
     event_log.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
-    event_layout.addLayout(event_actions)
-    event_layout.addWidget(event_log, 1)
-    event_dock.setWidget(event_panel)
-    window.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, event_dock)
-    event_dock.hide()
-    events_btn.clicked.connect(lambda: event_dock.setVisible(not event_dock.isVisible()))
+    event_layout.addWidget(event_log, 5)
+    event_layout.addLayout(event_actions, 1)
+    workspace.add_card("preview", "Live Preview", preview_group)
+    workspace.add_card("system", "System Load", meters_group)
+    workspace.add_card("task", "Live Task State", task_state_group)
+    workspace.add_card("bottles", "Bottles", bottle_panel)
+    workspace.add_card("behavior", "Behavior Dashboard", dashboard_group)
+    event_dock = workspace.add_card("events", "Operator Events", event_panel)
+    workspace.establish_default_layout()
+    build_layout_menu(layout_btn, workspace)
+
+    stop_overlay = FinalizationOverlay(window)
 
     return MainView(
         central=central,
@@ -246,7 +244,7 @@ def build_main_view(
         run_identity_label=run_identity_label,
         run_elapsed_label=run_elapsed_label,
         capture_health_label=capture_health_label,
-        events_btn=events_btn,
+        layout_btn=layout_btn,
         configure_btn=configure_btn,
         run_btn=run_btn,
         stop_btn=stop_btn,
@@ -261,6 +259,7 @@ def build_main_view(
         bottle_panel=bottle_panel,
         task_state_group=task_state_group,
         stop_overlay=stop_overlay,
+        workspace=workspace,
         event_dock=event_dock,
         event_log=event_log,
     )

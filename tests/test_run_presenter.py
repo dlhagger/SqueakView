@@ -82,6 +82,22 @@ class RunPresenterTests(unittest.TestCase):
                     buttons,
                 )
 
+    def test_layout_editing_is_available_only_in_idle_presentations(self) -> None:
+        view = _lifecycle_view()
+        view.workspace = SimpleNamespace(set_runtime_locked=mock.Mock())
+        view.layout_btn = SimpleNamespace(setEnabled=mock.Mock())
+        controller = RunLifecycleController(view)
+
+        controller._set_buttons(
+            present_run_phase(RunPhase.RECORDING)
+        )
+        view.workspace.set_runtime_locked.assert_called_with(True)
+        view.layout_btn.setEnabled.assert_called_with(True)
+
+        controller._set_buttons(present_run_phase(RunPhase.IDLE))
+        view.workspace.set_runtime_locked.assert_called_with(False)
+        view.layout_btn.setEnabled.assert_called_with(True)
+
     def test_terminal_presentation_fails_closed_without_explicit_validation(self) -> None:
         for status in (
             {},

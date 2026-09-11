@@ -60,6 +60,14 @@ class ConfigViewTest(unittest.TestCase):
         self.assertEqual(view.width_edit.validator().bottom(), 1)
         self.assertEqual(view.width_edit.validator().top(), 4096)
         self.assertIsNone(view.experiment_profile_name_edit)
+        scroll_area = self.dialog.findChild(
+            QtWidgets.QScrollArea, "configScrollArea"
+        )
+        self.assertIsNotNone(scroll_area)
+        self.assertTrue(scroll_area.widgetResizable())
+        self.assertEqual(
+            scroll_area.frameShape(), QtWidgets.QFrame.Shape.NoFrame
+        )
 
     def test_buttons_use_callbacks_and_optional_groups_preserve_visibility(self) -> None:
         view = build_config_view(

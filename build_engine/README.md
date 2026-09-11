@@ -34,7 +34,11 @@ models/<model_name>/
 2. Treats the dataset YAML as read-only ground truth; no SqueakView-specific fields are required or written. No model-specific labels or indices live in the notebook.
 3. Validates those values against the source `.pt` checkpoint.
 4. Passes the same YAML to the Ultralytics exporter with `data=...`.
-5. Exports a static, end-to-end TensorRT engine directly on the target Jetson.
+5. Exports a static, NMS-free one-to-one TensorRT engine directly on the target
+   Jetson with the current Ultralytics `nms=False` API. A loaded YOLO26
+   checkpoint normally starts in its one-to-many mode; the builder validates
+   that its selectable one-to-one head exists and verifies the exported engine
+   metadata instead of requiring the checkpoint's initial `end2end` flag.
 6. Validates the ONNX model and `(batch, 300, 6 + 3*kpts)` output contract.
 7. Removes the Ultralytics JSON prefix from the engine, deserializes the raw
    TensorRT plan, and runs one bounded `trtexec` synthetic inference before

@@ -93,6 +93,12 @@ class BottleMeasurementPanelTests(unittest.TestCase):
     def setUp(self) -> None:
         self.panel = BottleMeasurementPanel()
 
+    def test_panel_does_not_cap_the_height_of_its_dock_row(self) -> None:
+        self.assertEqual(
+            self.panel.sizePolicy().verticalPolicy(),
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
+
     def tearDown(self) -> None:
         self.panel.close()
         self.panel.deleteLater()

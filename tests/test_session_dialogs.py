@@ -69,6 +69,14 @@ class FocusedSessionDialogTests(unittest.TestCase):
             self.assertIs(dialog._profile_store, store)
             store.list_experiments.assert_called()
             store.list_subjects.assert_called()
+            scroll_area = dialog.findChild(
+                QtWidgets.QScrollArea, "launcherScrollArea"
+            )
+            self.assertIsNotNone(scroll_area)
+            self.assertTrue(scroll_area.widgetResizable())
+            self.assertEqual(
+                scroll_area.frameShape(), QtWidgets.QFrame.Shape.NoFrame
+            )
         finally:
             dialog.close()
 

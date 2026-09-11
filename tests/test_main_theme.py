@@ -23,7 +23,8 @@ class MainThemeTest(unittest.TestCase):
         self.assertIn("QLabel#runStateBadge", MAIN_WINDOW_STYLESHEET)
         self.assertIn("QLabel#captureHealth", MAIN_WINDOW_STYLESHEET)
         self.assertIn("QFrame#stopOverlay", MAIN_WINDOW_STYLESHEET)
-        self.assertIn("QDockWidget#eventDock", MAIN_WINDOW_STYLESHEET)
+        self.assertIn("QPlainTextEdit#eventLog", MAIN_WINDOW_STYLESHEET)
+        self.assertIn('QDockWidget[workspaceCard="true"]', MAIN_WINDOW_STYLESHEET)
 
     def test_theme_applies_to_plain_window_and_legacy_adapter(self) -> None:
         window = QtWidgets.QMainWindow()

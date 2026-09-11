@@ -12,7 +12,7 @@ class DashboardConfigTests(unittest.TestCase):
             {"events": [{"name": "BROKEN"}], "dashboard": "not-a-mapping"}
         )
 
-        self.assertEqual(definition.series_order[:4], ("POKE_L", "POKE_R", "DRINK_L", "DRINK_R"))
+        self.assertEqual(definition.series_order[:4], ("POKE_L", "DRINK_L", "POKE_R", "DRINK_R"))
         self.assertNotIn("BROKEN", definition.series_order)
         self.assertFalse(definition.settings_panel)
 
@@ -45,6 +45,26 @@ class DashboardConfigTests(unittest.TestCase):
 
         second = dashboard_model.default_task_config()
         self.assertEqual(second["events"][0]["match"]["phase"], "start")
+
+    def test_default_dashboard_combines_behavior_on_one_time_plot(self) -> None:
+        definition = dashboard_model.compile_task_config(
+            dashboard_model.default_task_config()
+        )
+
+        self.assertEqual(len(definition.plots), 1)
+        self.assertEqual(definition.plots[0]["id"], "Behavior")
+        self.assertEqual(definition.plots[0]["type"], "event_raster")
+        self.assertEqual(
+            definition.plots[0]["series"],
+            [
+                "POKE_L",
+                "DRINK_L",
+                "POKE_R",
+                "DRINK_R",
+                "PELLET",
+                "WELL_CHECK",
+            ],
+        )
 
 
 class DashboardEventSemanticsTests(unittest.TestCase):

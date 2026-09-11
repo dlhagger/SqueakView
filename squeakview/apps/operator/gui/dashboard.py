@@ -33,10 +33,12 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self.counters: dict[str, int] = {}
         self.series_x: dict[str, list[float]] = {}
         self.series_y: dict[str, list[int]] = {}
+        self.series_events: dict[str, list[float]] = {}
         self.series_order: list[str] = []
         self._rules: list[dict] = []
         self._plots: list[dict] = []
         self._task_cfg_path: Path | None = None
+        self._first_event_at: float | None = None
         self._jam_active = False
         self._jam_reason = ""
         self._jam_detected_at = ""
@@ -156,6 +158,8 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self.counters = {k: 0 for k in self.series_order}
         self.series_x = {k: [] for k in self.series_order}
         self.series_y = {k: [] for k in self.series_order}
+        self.series_events = {k: [] for k in self.series_order}
+        self._first_event_at = None
 
         self._clear_plots()
         for plot in plots_cfg:
@@ -166,6 +170,47 @@ class BehaviorDashboard(QtWidgets.QWidget):
                 self._plot_right_layout.addWidget(matrix, 1)
                 series_keys = matrix.series_keys()
                 self._plots.append({"kind": "matrix", "plot": matrix, "series": series_keys})
+            elif plot_type == "event_raster":
+                widget = self._make_plot(title)
+                self._plot_left_layout.addWidget(widget, 1)
+                series_keys = []
+                curves: dict[str, object] = {}
+                lanes: dict[str, float] = {}
+                configured_series = plot.get("series", []) or []
+                lane_count = len(configured_series)
+                marker = QtGui.QPainterPath()
+                marker.addRect(-0.12, -0.5, 0.24, 1.0)
+                for idx, series in enumerate(configured_series):
+                    key = self._norm_series(series)
+                    if not key:
+                        continue
+                    lane = float(lane_count - idx - 1)
+                    series_keys.append(key)
+                    lanes[key] = lane
+                    color = self._series_color(key, idx)
+                    curves[key] = widget.plot(
+                        pen=None,
+                        symbol=marker,
+                        symbolSize=13,
+                        symbolPen=pg.mkPen(color, width=1),
+                        symbolBrush=pg.mkBrush(color),
+                    )
+                ticks = [
+                    (lanes[key], self._series_label(key))
+                    for key in series_keys
+                ]
+                widget.getAxis("left").setTicks([ticks])
+                widget.getAxis("left").setWidth(86)
+                widget.setYRange(-0.6, max(0.6, float(lane_count) - 0.4), padding=0.0)
+                self._plots.append(
+                    {
+                        "kind": "event_raster",
+                        "plot": widget,
+                        "series": series_keys,
+                        "curves": curves,
+                        "lanes": lanes,
+                    }
+                )
             else:
                 widget = self._make_plot(title)
                 self._plot_left_layout.addWidget(widget, 1)
@@ -231,7 +276,7 @@ class BehaviorDashboard(QtWidgets.QWidget):
             item = plot.getAxis(axis_name)
             item.setPen(pg.mkPen("#2c3550"))
             item.setTextPen(pg.mkPen("#9aa7cc"))
-            item.setStyle(tickFont=QtGui.QFont("Sans Serif", 8), tickTextOffset=8)
+            item.setStyle(tickFont=QtGui.QFont("Sans Serif", 9), tickTextOffset=8)
         plot.getPlotItem().setContentsMargins(8, 8, 12, 8)
         return plot
 
@@ -363,6 +408,10 @@ class BehaviorDashboard(QtWidgets.QWidget):
             new_value = prev + 1
         elif new_value <= prev:
             return
+        self.series_events[key].append(tsec)
+        if self._first_event_at is None:
+            self._first_event_at = tsec
+        dashboard_presentation.cap_event_times(self.series_events[key])
         xs, ys = self.series_x[key], self.series_y[key]
 
         if xs and xs[-1] == tsec:
@@ -383,6 +432,9 @@ class BehaviorDashboard(QtWidgets.QWidget):
         for key in list(self.series_x.keys()):
             xs, ys = self.series_x[key], self.series_y[key]
             dashboard_presentation.trim_step_series(xs, ys, xstart=xstart)
+            dashboard_presentation.trim_event_times(
+                self.series_events[key], xstart=xstart
+            )
 
         def set_curve(curve, x, y):
             plot_x, plot_y = dashboard_presentation.curve_points(x, y, now=now)
@@ -397,6 +449,18 @@ class BehaviorDashboard(QtWidgets.QWidget):
                 continue
             plot = plot_entry["plot"]
             keys = plot_entry["series"]
+            if plot_entry.get("kind") == "event_raster":
+                lanes = plot_entry["lanes"]
+                raster_start, raster_end = dashboard_presentation.raster_window_bounds(
+                    now, self.window_sec, self._first_event_at
+                )
+                for key in keys:
+                    timestamps = self.series_events.get(key, [])
+                    plot_entry["curves"][key].setData(
+                        timestamps, [lanes[key]] * len(timestamps)
+                    )
+                plot.setXRange(raster_start, raster_end, padding=0.0)
+                continue
             ymax = 1
             for key in keys:
                 curve = plot_entry["curves"].get(key)
@@ -467,9 +531,9 @@ class BehaviorDashboard(QtWidgets.QWidget):
         ]
         for r, (label_text, key) in enumerate(rows):
             label = QtWidgets.QLabel(label_text)
-            label.setStyleSheet("color: #a7adbf; font-size: 11px;")
+            label.setStyleSheet("color: #b9c0d6; font-size: 12px;")
             value = QtWidgets.QLabel("--")
-            value.setStyleSheet("color: #e4e7f2; font-size: 11px; font-weight: 600;")
+            value.setStyleSheet("color: #e4e7f2; font-size: 12px; font-weight: 600;")
             grid.addWidget(label, r, 0)
             grid.addWidget(value, r, 1)
             self._settings_labels[key] = value
@@ -496,7 +560,7 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self._jam_title = QtWidgets.QLabel("FEEDER JAM DETECTED")
         self._jam_title.setStyleSheet("color: #ffd8dc; font-size: 12px; font-weight: 700;")
         self._jam_detail = QtWidgets.QLabel("--")
-        self._jam_detail.setStyleSheet("color: #ffb6be; font-size: 11px;")
+        self._jam_detail.setStyleSheet("color: #ffb6be; font-size: 12px;")
         self._jam_detail.setWordWrap(True)
         text_wrap.addWidget(self._jam_title)
         text_wrap.addWidget(self._jam_detail)

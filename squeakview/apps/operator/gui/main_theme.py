@@ -9,13 +9,40 @@ MAIN_WINDOW_STYLESHEET = """
             QMainWindow {
                 background-color: #171821;
                 color: #e8ebf4;
+                font-size: 13px;
             }
-            QStatusBar {
+            QScrollArea#workspaceScrollArea, QWidget#workspaceContent {
                 background-color: #171821;
-                color: #e8ebf4;
+                border: none;
             }
-            QStatusBar QLabel {
-                color: #e8ebf4;
+            QMainWindow#workspaceDockHost {
+                background-color: #171821;
+            }
+            QMainWindow#workspaceDockHost::separator {
+                background-color: #171821;
+                width: 10px;
+                height: 10px;
+            }
+            QMainWindow#workspaceDockHost::separator:hover {
+                background-color: #5967d8;
+            }
+            QDockWidget[workspaceCard="true"] {
+                color: #eef1ff;
+                background-color: #1a1d2a;
+                border: 1px solid #2a2d3d;
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QDockWidget[workspaceCard="true"]::title {
+                color: #aeb8ff;
+                background-color: #1a1d2a;
+                border-bottom: 1px solid #2a2d3d;
+                padding: 8px 10px;
+                text-align: left;
+            }
+            QWidget#workspaceCardContent {
+                background-color: #1a1d2a;
             }
             QWidget {
                 selection-background-color: #5967d8;
@@ -101,11 +128,20 @@ MAIN_WINDOW_STYLESHEET = """
             }
             QGroupBox::title {
                 color: #aeb8ff;
+                font-size: 13px;
+                font-weight: 700;
                 subcontrol-origin: margin;
                 left: 14px;
                 top: 10px;
                 padding: 0 6px;
                 background-color: #171821;
+            }
+            QGroupBox[embeddedCard="true"] {
+                border: none;
+                border-radius: 0;
+                background-color: #1a1d2a;
+                margin-top: 0;
+                padding: 8px 10px 10px 10px;
             }
             QMenu {
                 background-color: #11162a;
@@ -136,7 +172,7 @@ MAIN_WINDOW_STYLESHEET = """
                 color: #ffffff;
                 border-radius: 8px;
                 padding: 5px 10px;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 800;
             }
             QLabel#runIdentity {
@@ -152,12 +188,7 @@ MAIN_WINDOW_STYLESHEET = """
             }
             QLabel#captureHealth {
                 color: #a7d9c2;
-                font-size: 11px;
-            }
-            QDockWidget#eventDock {
-                color: #eef1ff;
-                background-color: #14192a;
-                font-weight: 700;
+                font-size: 12px;
             }
             QFrame#brandHeader {
                 background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2b2f46, stop:1 #202336);
@@ -181,8 +212,8 @@ MAIN_WINDOW_STYLESHEET = """
                 color: #e0e5ff;
             }
             QLabel#bottleStatus {
-                color: #9aa7cc;
-                font-size: 11px;
+                color: #aeb8d8;
+                font-size: 12px;
             }
             QLabel#taskTitle {
                 color: #eef1ff;
@@ -191,7 +222,7 @@ MAIN_WINDOW_STYLESHEET = """
             }
             QLabel#taskPath {
                 color: #9aa7cc;
-                font-size: 11px;
+                font-size: 12px;
             }
             QTextBrowser#taskSummary {
                 background-color: #101526;
@@ -203,6 +234,7 @@ MAIN_WINDOW_STYLESHEET = """
             }
             QPushButton {
                 padding: 8px 18px;
+                min-height: 30px;
                 border-radius: 6px;
                 font-weight: 600;
                 color: #e8ebf4;
@@ -214,7 +246,7 @@ MAIN_WINDOW_STYLESHEET = """
             }
             QPushButton:disabled {
                 background-color: #3b3f4f;
-                color: #7d8299;
+                color: #a4abc1;
                 border-color: #3b3f4f;
             }
             QPushButton#primaryButton {
@@ -228,7 +260,7 @@ MAIN_WINDOW_STYLESHEET = """
             QPushButton#primaryButton:disabled {
                 background-color: #2b3043;
                 border-color: #343a50;
-                color: #737b96;
+                color: #9ba5c4;
             }
             QPushButton#dangerButton {
                 background-color: #d9536f;
@@ -240,24 +272,56 @@ MAIN_WINDOW_STYLESHEET = """
             QPushButton#dangerButton:disabled {
                 background-color: #342a33;
                 border-color: #44313b;
-                color: #78636c;
+                color: #a68b95;
             }
             QPushButton#secondaryButton {
                 background-color: #353a4d;
             }
             QProgressBar {
                 background-color: #11162a;
+                color: #ffffff;
                 border: 1px solid #333a55;
                 border-radius: 6px;
-                min-height: 10px;
+                min-height: 22px;
+                text-align: center;
+                font-size: 12px;
+                font-weight: 700;
             }
             QProgressBar::chunk {
                 background-color: #5c6df5;
                 border-radius: 5px;
             }
+            QScrollBar:vertical {
+                background: #11162a;
+                width: 12px;
+                margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #4a5578;
+                min-height: 32px;
+                border-radius: 6px;
+            }
+            QScrollBar:horizontal {
+                background: #11162a;
+                height: 12px;
+                margin: 0;
+            }
+            QScrollBar::handle:horizontal {
+                background: #4a5578;
+                min-width: 32px;
+                border-radius: 6px;
+            }
+            QScrollBar::add-line, QScrollBar::sub-line {
+                width: 0;
+                height: 0;
+            }
             QFrame#stopOverlay {
                 background-color: rgba(10, 12, 20, 230);
-                border: 1px solid #2a2d3d;
+                border: none;
+            }
+            QFrame#stopOverlayPanel {
+                background-color: #151a2b;
+                border: 1px solid #3a4465;
                 border-radius: 12px;
             }
             QLabel#stopOverlayTitle {
@@ -266,8 +330,12 @@ MAIN_WINDOW_STYLESHEET = """
                 font-weight: 700;
             }
             QLabel#stopOverlayMsg {
-                color: #b8c0de;
-                font-size: 13px;
+                color: #d2d8ef;
+                font-size: 14px;
+            }
+            QPlainTextEdit#eventLog {
+                font-family: monospace;
+                font-size: 12px;
             }
 """
 

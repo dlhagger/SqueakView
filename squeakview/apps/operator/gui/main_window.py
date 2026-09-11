@@ -54,9 +54,6 @@ from squeakview.apps.operator.gui.session_controller import (
 from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile
 from squeakview import config as squeakview_config
 
-def _is_serial_log_message(message: str) -> bool:
-    return any(marker in message for marker in ("【SER】", "【SER→】", "[SER]"))
-
 
 GUI_HEARTBEAT_INTERVAL_MS = 1_000
 
@@ -125,7 +122,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_msg.connect(self._append_log)
         self.setWindowTitle("SqueakView")
         self.resize(1280, 820)
-        self.setMinimumSize(900, 600)
+        self.setMinimumSize(1024, 700)
 
         self._config_data: dict | None = None
         self._preview_window_id: int | None = None
@@ -186,7 +183,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._show_launch_dialog():
             QtCore.QTimer.singleShot(0, self.close)
         else:
-            self.statusBar().showMessage("Ready to record.")
+            self._emit_log("[GUI] Ready to record.")
         self.preview.set_status("Idle")
 
     # Compatibility aliases for callers/tests that inspected lifecycle state on
@@ -315,7 +312,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_identity_label = view.run_identity_label
         self.run_elapsed_label = view.run_elapsed_label
         self.capture_health_label = view.capture_health_label
-        self.events_btn = view.events_btn
+        self.layout_btn = view.layout_btn
         self.configure_btn = view.configure_btn
         self.run_btn = view.run_btn
         self.stop_btn = view.stop_btn
@@ -330,8 +327,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bottle_panel = view.bottle_panel
         self.task_state_group = view.task_state_group
         self.stop_overlay = view.stop_overlay
+        self.workspace = view.workspace
         self.event_dock = view.event_dock
         self.event_log = view.event_log
+        self.workspace.restore_layout()
 
         # Compatibility aliases retained for existing MainWindow integrations.
         self.bottle_group = self.bottle_panel
@@ -494,7 +493,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_run_state("ready")
         self.summary_label.setText(presentation.summary_html)
         self.preview.set_info(presentation.preview_info)
-        self.statusBar().showMessage("Configuration committed.", 4000)
+        self._emit_log("[GUI] Configuration committed.")
         try:
             if task_cfg is not None:
                 self.dashboard.apply_task_config(task_cfg)
@@ -546,7 +545,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def _copy_event_log(self) -> None:
         QtWidgets.QApplication.clipboard().setText(self.event_log.toPlainText())
-        self.statusBar().showMessage("Operator events copied.", 3000)
+        self._emit_log("[GUI] Operator events copied to clipboard.")
 
     @QtCore.Slot()
     def _open_run_folder(self) -> None:
@@ -596,8 +595,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- Actions --------------------------------------------------------
     def _on_configure(self) -> None:
-        if self._show_config_dialog(initial=False):
-            self.statusBar().showMessage("Configuration updated.", 5000)
+        self._show_config_dialog(initial=False)
 
     @staticmethod
     def _read_ds_batch_size(cfg_path: Path) -> int | None:
@@ -669,8 +667,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _append_log(self, msg: str) -> None:
         if hasattr(self, "event_log"):
             self.event_log.appendPlainText(msg)
-        if not _is_serial_log_message(msg):
-            self.statusBar().showMessage(msg, 5000)
+            self.event_log.moveCursor(QtGui.QTextCursor.MoveOperation.End)
+            self.event_log.ensureCursorVisible()
         try:
             print(msg, flush=True)
         except (BrokenPipeError, OSError, ValueError):
@@ -681,6 +679,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if not self._run_controller.request_window_close(event):
             return
+        try:
+            self.workspace.save_layout()
+        except Exception as exc:
+            self._emit_log(f"[GUI] Could not save workspace layout: {exc}")
         try:
             self.dashboard.close()
         except Exception:

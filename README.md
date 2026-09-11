@@ -202,7 +202,8 @@ The remaining cells:
 1. Read standard class names, keypoint names, and keypoint shape from the YAML
    and checkpoint without modifying the YAML.
 2. Pass the YAML to `Ultralytics.export(data=...)`.
-3. Export an end-to-end FP16 or FP32 TensorRT engine on the target Jetson.
+3. Export an NMS-free, end-to-end FP16 or FP32 TensorRT engine on the target
+   Jetson using Ultralytics `nms=False`.
 4. Strip the Ultralytics metadata prefix to produce the raw TensorRT plan
    expected by DeepStream.
 5. Validate ONNX and TensorRT input/output shapes.
@@ -399,8 +400,14 @@ The timeout is a maximum wait for pipeline readiness, not a fixed warm-up delay.
 Reducing it may reject a healthy pipeline that needs longer to load the engine
 and enter `PLAYING`.
 
-The run header and bottom status bar remain concise during normal operation.
-Open **Events** for the full runtime and serial log. The capture-health panel
+The run header remains fixed while the operator workspace is composed from
+native Qt cards. Open **Layout** while idle to unlock card dragging/floating,
+save the current arrangement immediately, or restore the versioned default;
+card dividers remain resizable, and a clean GUI close also saves the current
+arrangement. Card movement and reset are locked during startup, recording, and
+finalization, while explicit Save remains available. Right-click any card title
+to open Qt's unified checklist for showing or hiding every card, including Live
+Task State and Operator Events. The capture-health panel
 shows recording backlog, camera transport health, frame/drop counters, and the
 current stop/finalization stage. Run identity and elapsed state remain visible
 while the independent post-run finalizer is working.

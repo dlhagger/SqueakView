@@ -56,7 +56,7 @@ def run_trtexec_validation(
         "--iterations=1",
         "--warmUp=0",
         "--duration=0",
-        "--streams=1",
+        "--infStreams=1",
     )
     process = subprocess.Popen(
         command,

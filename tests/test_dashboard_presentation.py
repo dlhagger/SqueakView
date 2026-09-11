@@ -77,10 +77,30 @@ class DashboardPresentationTests(unittest.TestCase):
         self.assertEqual(xs, [6.0, 7.0, 8.0, 9.0, 10.0, 11.0])
         self.assertEqual(ys, [6, 7, 8, 9, 10, 11])
 
-    def test_window_bounds_remain_centered_on_present(self) -> None:
+    def test_event_raster_history_is_trimmed_and_bounded(self) -> None:
+        timestamps = [1.0, 2.0, 3.0, 4.0]
+
+        dashboard_presentation.trim_event_times(timestamps, xstart=2.5)
+        self.assertEqual(timestamps, [3.0, 4.0])
+
+        timestamps.extend([5.0, 6.0])
+        dashboard_presentation.cap_event_times(timestamps, max_points=3)
+        self.assertEqual(timestamps, [4.0, 5.0, 6.0])
+
+    def test_window_bounds_show_trailing_history_without_future_time(self) -> None:
         self.assertEqual(
             dashboard_presentation.window_bounds(1_000.0, 300.0),
-            (850.0, 1_150.0),
+            (700.0, 1_000.0),
+        )
+
+    def test_raster_window_starts_zoomed_and_expands_to_history_limit(self) -> None:
+        self.assertEqual(
+            dashboard_presentation.raster_window_bounds(100.0, 300.0, None),
+            (71.5, 101.5),
+        )
+        self.assertEqual(
+            dashboard_presentation.raster_window_bounds(400.0, 300.0, 0.0),
+            (102.0, 402.0),
         )
 
 

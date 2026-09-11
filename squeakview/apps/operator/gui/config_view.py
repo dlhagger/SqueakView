@@ -229,7 +229,21 @@ def build_config_view(
     button_box.accepted.connect(callbacks.accept)
     button_box.rejected.connect(callbacks.reject)
 
-    layout = QtWidgets.QVBoxLayout(dialog)
+    scroll_area = QtWidgets.QScrollArea(dialog)
+    scroll_area.setObjectName("configScrollArea")
+    scroll_area.setWidgetResizable(True)
+    scroll_area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+    scroll_area.setHorizontalScrollBarPolicy(
+        QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
+    scroll_content = QtWidgets.QWidget(scroll_area)
+    scroll_content.setObjectName("configScrollContent")
+    scroll_content.setStyleSheet(
+        "QWidget#configScrollContent { background-color: #0f1118; }"
+    )
+    layout = QtWidgets.QVBoxLayout(scroll_content)
+    layout.setContentsMargins(8, 8, 8, 8)
+    layout.setSpacing(10)
     header = QtWidgets.QLabel(
         _header_text(
             show_session_setup=show_session_setup,
@@ -293,8 +307,14 @@ def build_config_view(
     run_layout.setContentsMargins(12, 12, 12, 12)
     run_layout.addLayout(form)
     layout.addWidget(run_group)
-    layout.addSpacing(12)
-    layout.addWidget(button_box)
+    layout.addStretch(1)
+    scroll_area.setWidget(scroll_content)
+
+    outer_layout = QtWidgets.QVBoxLayout(dialog)
+    outer_layout.setContentsMargins(12, 12, 12, 12)
+    outer_layout.setSpacing(10)
+    outer_layout.addWidget(scroll_area, 1)
+    outer_layout.addWidget(button_box)
 
     return ConfigView(
         run_form=form,
