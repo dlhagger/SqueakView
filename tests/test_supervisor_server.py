@@ -49,6 +49,7 @@ class FakeBackend:
         self.block_stop = False
         self.abort_calls: list[str] = []
         self.saved = 0
+        self.saved_bottles = None
 
     def subscribe(self, callback) -> None:
         self.subscriber = callback
@@ -98,6 +99,7 @@ class FakeBackend:
 
     def save_bottle_measurements(self, bottles, run_dir=None):
         self.saved += 1
+        self.saved_bottles = bottles
         return {"complete": bool(bottles), "run_dir": str(run_dir) if run_dir else None}
 
 
@@ -201,6 +203,36 @@ class SupervisorServerTests(unittest.TestCase):
         worker.join(2)
 
         self.assertEqual(self.backend.saved, 1)
+
+    def test_bottle_command_preserves_nested_values_from_frozen_ipc_payload(self) -> None:
+        command = CommandEnvelope(
+            "save_bottle_measurements",
+            "save-bottles",
+            {
+                "bottles": {
+                    "left": {
+                        "fluid": "water",
+                        "initial_weight_g": 443.0,
+                        "final_weight_g": 422.0,
+                    },
+                    "right": {
+                        "fluid": "ethanol",
+                        "initial_weight_g": 321.0,
+                        "final_weight_g": 232.0,
+                    },
+                }
+            },
+        )
+
+        result, stop = self.server._dispatch(command)
+
+        self.assertFalse(stop)
+        self.assertTrue(result["complete"])
+        self.assertEqual(self.backend.saved_bottles["left"]["fluid"], "water")
+        self.assertEqual(
+            self.backend.saved_bottles["right"]["final_weight_g"],
+            232.0,
+        )
 
     def test_replay_window_evicts_oldest_and_never_blocks_shutdown(self) -> None:
         for index in range(MAX_MUTATION_REQUESTS):

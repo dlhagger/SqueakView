@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import MappingProxyType
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -18,9 +19,39 @@ from squeakview.apps.operator.gui.bottle_measurements import (
 from squeakview.apps.operator.gui.main_window import (
     BOTTLE_FLUID_PRESETS as LEGACY_BOTTLE_FLUID_PRESETS,
 )
+from squeakview.common.run_context import normalize_bottle_measurements
 
 
 class BottlePayloadTests(unittest.TestCase):
+    def test_normalization_preserves_supervisor_frozen_side_mappings(self) -> None:
+        bottles = MappingProxyType(
+            {
+                "left": MappingProxyType(
+                    {
+                        "fluid": "water",
+                        "initial_weight_g": 443.0,
+                        "final_weight_g": 422.0,
+                    }
+                ),
+                "right": MappingProxyType(
+                    {
+                        "fluid": "ethanol",
+                        "initial_weight_g": 321.0,
+                        "final_weight_g": 232.0,
+                    }
+                ),
+            }
+        )
+
+        normalized = normalize_bottle_measurements(bottles)
+
+        self.assertEqual(normalized["left"]["fluid"], "water")
+        self.assertEqual(normalized["left"]["initial_weight_g"], 443.0)
+        self.assertEqual(normalized["left"]["final_weight_g"], 422.0)
+        self.assertEqual(normalized["right"]["fluid"], "ethanol")
+        self.assertEqual(normalized["right"]["initial_weight_g"], 321.0)
+        self.assertEqual(normalized["right"]["final_weight_g"], 232.0)
+
     def test_parse_weight_normalizes_valid_values(self) -> None:
         self.assertEqual(parse_weight(" 12.3456789 ", "Left", strict=True), 12.345679)
         self.assertIsNone(parse_weight("", "Left", strict=True))

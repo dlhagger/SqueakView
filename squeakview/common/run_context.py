@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -237,12 +238,17 @@ def _format_optional_float(value: float | None) -> str:
     return text.rstrip("0").rstrip(".")
 
 
-def normalize_bottle_measurements(bottles: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
-    source = bottles if isinstance(bottles, dict) else {}
+def normalize_bottle_measurements(
+    bottles: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    source = bottles if isinstance(bottles, Mapping) else {}
     normalized: dict[str, dict[str, Any]] = {}
     for side in ("left", "right"):
         raw = source.get(side)
-        raw_side = raw if isinstance(raw, dict) else {}
+        # Supervisor messages recursively freeze JSON objects as mapping
+        # proxies. The mapping interface is the contract; requiring concrete
+        # dictionaries silently discarded valid bottle values at this boundary.
+        raw_side = raw if isinstance(raw, Mapping) else {}
         normalized[side] = {
             "fluid": str(raw_side.get("fluid") or "").strip(),
             "initial_weight_g": _optional_float(raw_side.get("initial_weight_g")),
