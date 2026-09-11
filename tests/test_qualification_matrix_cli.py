@@ -173,7 +173,7 @@ class QualificationMatrixCliTests(unittest.TestCase):
             "1",
         )
         self.assertIn("SQUEAKVIEW_QUALIFICATION_CASE_ID=", worksheet["launch_command"])
-        self.assertIn("scripts/launch_operator.sh", worksheet["launch_command"])
+        self.assertIn("squeakview.sh", worksheet["launch_command"])
 
     def test_next_case_worksheet_reports_completed_campaign(self) -> None:
         worksheet = _next_case_worksheet(

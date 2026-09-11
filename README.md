@@ -308,7 +308,7 @@ easily achieved by installing jtop.
 ## Launch the operator GUI
 
 ```bash
-bash scripts/launch_operator.sh
+bash squeakview.sh
 ```
 
 This detached launcher is the production path. It starts a Qt-free supervisor,
@@ -362,7 +362,7 @@ export SQUEAKVIEW_WORKSPACE=/path/to/SqueakView
 export SQUEAKVIEW_DEEPSTREAM_SDK=/opt/nvidia/deepstream/deepstream
 export SQUEAKVIEW_MODEL_ROOT=/path/to/models
 export SQUEAKVIEW_RUNS_DIR=/path/to/runs
-bash scripts/launch_operator.sh
+bash squeakview.sh
 ```
 
 The supervised backend launches inference first. For free-running capture, the
@@ -745,19 +745,19 @@ See [data_viz/README.md](data_viz/README.md) for downstream source-data rules.
 Show optional DeepStream plugin warnings that the GUI normally filters:
 
 ```bash
-SQUEAKVIEW_SHOW_PLUGIN_WARNINGS=1 bash scripts/launch_operator.sh
+SQUEAKVIEW_SHOW_PLUGIN_WARNINGS=1 bash squeakview.sh
 ```
 
 Request fan control when the current user has the required privileges:
 
 ```bash
-SQUEAKVIEW_SET_FAN=1 bash scripts/launch_operator.sh
+SQUEAKVIEW_SET_FAN=1 bash squeakview.sh
 ```
 
 Temporarily bypass GUI preflight only for deliberate diagnosis:
 
 ```bash
-SQUEAKVIEW_SKIP_PREFLIGHT=1 bash scripts/launch_operator.sh
+SQUEAKVIEW_SKIP_PREFLIGHT=1 bash squeakview.sh
 ```
 
 Any run started with this bypass is explicitly marked non-production and cannot
@@ -770,7 +770,7 @@ in status and manifest metadata. Never enable this for data collection:
 ```bash
 SQUEAKVIEW_ENABLE_FAILURE_INJECTION=1 \
 SQUEAKVIEW_FAILURE_PLAN=/absolute/path/to/failure-plan.json \
-bash scripts/launch_operator.sh
+bash squeakview.sh
 ```
 
 Supported boundaries are the FLIR source, non-leaky recording queue, encoder,
@@ -790,7 +790,7 @@ omits the preview branch from the capture graph; it does not run the app
 headlessly:
 
 ```bash
-SQUEAKVIEW_DISABLE_PREVIEW=1 bash scripts/launch_operator.sh
+SQUEAKVIEW_DISABLE_PREVIEW=1 bash squeakview.sh
 ```
 
 Run the test suite without changing the environment:

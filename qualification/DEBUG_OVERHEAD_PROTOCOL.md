@@ -41,7 +41,7 @@ Launch and complete the baseline with the debug profile explicitly off:
 
 ```bash
 export SQUEAKVIEW_DEEPSTREAM_DEBUG_PROFILE=0
-bash scripts/launch_operator.sh
+bash squeakview.sh
 ```
 
 Wait for terminal finalization, then exit that GUI/supervisor before changing
@@ -57,7 +57,7 @@ case and duration, and wait for terminal finalization:
 
 ```bash
 export SQUEAKVIEW_DEEPSTREAM_DEBUG_PROFILE=1
-bash scripts/launch_operator.sh
+bash squeakview.sh
 .venv/bin/python scripts/qualify_run.py /absolute/path/to/debug-run \
   --limits qualification/<validated-limits>.yaml \
   --allow-debug-profile

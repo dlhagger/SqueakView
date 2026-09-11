@@ -462,7 +462,7 @@ class BackendFactoryPolicyTest(unittest.TestCase):
         from squeakview.apps.operator.gui.main_window import _production_backend_factory
 
         with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(RuntimeError, "launch_operator"):
+            with self.assertRaisesRegex(RuntimeError, "squeakview.sh"):
                 _production_backend_factory(mock.Mock())
 
     def test_explicit_dev_override_is_visible_and_uses_inprocess_backend(self) -> None:

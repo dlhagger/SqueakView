@@ -90,7 +90,7 @@ class OperatorSignalLifecycleTest(unittest.TestCase):
 class OperatorLauncherTest(unittest.TestCase):
     def test_launcher_detaches_only_the_durable_supervisor(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        script = (root / "scripts" / "launch_operator.sh").read_text()
+        script = (root / "squeakview.sh").read_text()
 
         supervisor = "-m squeakview.apps.operator.backend.supervisor"
         gui = '--gui-command "$PYTHON_BIN" "$ROOT/squeakview_gui.py"'
@@ -112,7 +112,7 @@ class OperatorLauncherTest(unittest.TestCase):
             fake_python.write_text("#!/bin/sh\nexit 7\n")
             fake_python.chmod(0o700)
             completed = subprocess.run(
-                ["bash", str(root / "scripts" / "launch_operator.sh")],
+                ["bash", str(root / "squeakview.sh")],
                 cwd=root,
                 env={
                     **os.environ,

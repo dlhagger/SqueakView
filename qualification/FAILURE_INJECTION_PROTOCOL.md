@@ -23,7 +23,7 @@ and selected plan:
 ```bash
 SQUEAKVIEW_ENABLE_FAILURE_INJECTION=1 \
 SQUEAKVIEW_FAILURE_PLAN=/absolute/path/to/plan.json \
-bash scripts/launch_operator.sh
+bash squeakview.sh
 ```
 
 Supported target/kind pairs are:

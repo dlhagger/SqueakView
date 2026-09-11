@@ -68,7 +68,7 @@ Before each cell:
    remove it for preview-on cells. Select inference on/off explicitly in the GUI.
    Set the named `25W` or `MAXN_SUPER` nvpmodel mode through the device's normal
    provisioning procedure and verify the exact label with `nvpmodel -q`.
-3. Launch with `bash scripts/launch_operator.sh` from a standalone terminal and
+3. Launch with `bash squeakview.sh` from a standalone terminal and
    let the requested minimum duration elapse. Wait for terminal finalization;
    never assign an active or partially finalized run.
 
@@ -78,7 +78,7 @@ Bind the launch to the exact canonical case before starting the supervisor:
 export SQUEAKVIEW_QUALIFICATION_CASE_ID='<case-id>'
 # Only for a deliberately selected alternate versioned matrix:
 # export SQUEAKVIEW_QUALIFICATION_MATRIX='/absolute/path/to/matrix.yaml'
-bash scripts/launch_operator.sh
+bash squeakview.sh
 ```
 
 The supervisor-owned backend loads the strict matrix and compares the effective

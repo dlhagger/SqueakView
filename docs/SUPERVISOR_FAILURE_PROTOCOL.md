@@ -35,7 +35,7 @@ application with the explicit qualification gate:
 
 ```bash
 SQUEAKVIEW_ENABLE_SUPERVISOR_FAILURE_INJECTION=1 \
-  bash scripts/launch_operator.sh
+  bash squeakview.sh
 ```
 
 The launcher prints the supervisor PID. Every run created by this supervisor is
@@ -53,7 +53,7 @@ the barrier releases itself so a missed injection cannot hang collection:
 SQUEAKVIEW_ENABLE_SUPERVISOR_FAILURE_INJECTION=1 \
 SQUEAKVIEW_SUPERVISOR_FAILURE_BARRIER=after_spawn_before_ready \
 SQUEAKVIEW_SUPERVISOR_FAILURE_BARRIER_TIMEOUT_S=30 \
-  bash scripts/launch_operator.sh
+  bash squeakview.sh
 ```
 
 Supported barriers are `pre_capture`, `after_spawn_before_ready`, and

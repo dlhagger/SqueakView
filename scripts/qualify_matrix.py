@@ -87,7 +87,7 @@ def _next_case_worksheet(
             [
                 *(f"{name}={value}" for name, value in environment.items()),
                 "bash",
-                "scripts/launch_operator.sh",
+                "squeakview.sh",
             ]
         )
     return worksheet

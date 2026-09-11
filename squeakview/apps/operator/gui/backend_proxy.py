@@ -660,7 +660,7 @@ def supervisor_socket_from_environment() -> Path:
     if not raw:
         raise RuntimeError(
             f"{SUPERVISOR_SOCKET_ENV} is required. Launch SqueakView with "
-            "scripts/launch_operator.sh so the durable supervisor owns acquisition."
+            "squeakview.sh so the durable supervisor owns acquisition."
         )
     return Path(raw)
 
