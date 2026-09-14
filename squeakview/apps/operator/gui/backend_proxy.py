@@ -39,7 +39,10 @@ ALLOW_INPROCESS_BACKEND_ENV = "SQUEAKVIEW_ALLOW_INPROCESS_BACKEND"
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _SOCKET_IO_TIMEOUT_SECONDS = 1.0
 _COMMAND_TIMEOUT_SECONDS = 120.0
-_FINALIZE_TIMEOUT_SECONDS = 1_200.0
+# Normal stop performs only bounded ledger-tail and MP4 sample-table checks.
+# Allow ample time for EOS/container closure without masking a stuck shutdown
+# behind the offline analysis worker's former multi-hour ceiling.
+_FINALIZE_TIMEOUT_SECONDS = 180.0
 _MAX_PENDING_COMMANDS = 32
 _MAX_PENDING_HEARTBEATS = 1
 _MUTATING_COMMANDS = {

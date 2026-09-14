@@ -1025,7 +1025,7 @@ power_modes: [25W]
         self.assertEqual(worker.wait_timeouts, [30.0])
         self.assertEqual(self.status()["state"], "finalization_failed")
 
-    def test_serial_alignment_cannot_be_disabled_by_environment(self) -> None:
+    def test_triggered_run_defers_alignment_outside_shutdown(self) -> None:
         self.backend.launch_cfg = self.config(serial_enabled=True, trigger_on=True)
         with (
             mock.patch.object(
@@ -1039,7 +1039,7 @@ power_modes: [25W]
                 self.backend, self.run_dir
             )
 
-        self.assertTrue(run_finalizer.call_args.kwargs["enable_align"])
+        self.assertFalse(run_finalizer.call_args.kwargs["enable_align"])
 
     def test_free_running_serial_logging_does_not_request_trigger_alignment(self) -> None:
         self.backend.launch_cfg = self.config(serial_enabled=True, trigger_on=False)

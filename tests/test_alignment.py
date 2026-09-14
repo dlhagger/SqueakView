@@ -256,6 +256,7 @@ class AlignmentIntegrationTests(unittest.TestCase):
         fake_ffmpeg.chmod(0o755)
         cli_env = dict(os.environ)
         cli_env["PATH"] = f"{fake_bin}:{cli_env.get('PATH', '')}"
+        cli_env["SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE"] = "1"
         result = subprocess.run(
             [
                 "python3",

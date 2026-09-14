@@ -21,6 +21,8 @@ class FinalizationPresenterTests(unittest.TestCase):
             "capture_drained": "Closing Capture…",
             "capture_closed": "Capture Saved — Validating…",
             "capture_reconciliation": "Validating Capture…",
+            "recording_count_validation": "Checking Recording Counts…",
+            "recording_count_validation_complete": "Recording Validated…",
             "inference_admission": "Validating Inference…",
             "recording_validation": "Validating Video…",
             "recording_validation_complete": "Video Validated…",

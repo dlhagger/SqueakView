@@ -42,6 +42,14 @@ _STAGE_COPY: dict[str, tuple[str, str]] = {
         "Capture Saved — Validating…",
         "The MP4 is safely closed. Starting post-run validation.",
     ),
+    "recording_count_validation": (
+        "Checking Recording Counts…",
+        "Comparing the closed MP4 with durable camera and recording totals.",
+    ),
+    "recording_count_validation_complete": (
+        "Recording Validated…",
+        "MP4, camera, and recording totals agree. Finishing the run manifest.",
+    ),
     "capture_reconciliation": (
         "Validating Capture…",
         "Reconciling source frames with the non-leaky recording branch.",

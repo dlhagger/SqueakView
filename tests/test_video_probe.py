@@ -41,7 +41,7 @@ class VideoProbeSelectionTests(unittest.TestCase):
         gstreamer_decode.assert_not_called()
         ffmpeg.assert_not_called()
 
-    def test_ffmpeg_fallback_preserves_gstreamer_failure(self) -> None:
+    def test_structural_failure_does_not_start_a_decoder(self) -> None:
         with (
             mock.patch.object(
                 video_probe,
@@ -52,27 +52,16 @@ class VideoProbeSelectionTests(unittest.TestCase):
                     "error": "parser error",
                 },
             ),
-            mock.patch.object(
-                video_probe,
-                "_full_decode_gstreamer",
-                return_value={
-                    "count": None,
-                    "method": video_probe.GSTREAMER_METHOD,
-                    "error": "decoder unavailable",
-                },
-            ),
-            mock.patch.object(
-                video_probe,
-                "_full_decode",
-                return_value={"count": 42, "method": "full_decode_ffmpeg", "error": None},
-            ),
-            mock.patch.object(video_probe.shutil, "which", return_value="/usr/bin/ffmpeg"),
+            mock.patch.object(video_probe, "_full_decode_gstreamer") as decode,
+            mock.patch.object(video_probe, "_full_decode") as ffmpeg,
+            mock.patch.dict(video_probe.os.environ, {}, clear=True),
         ):
             result = video_probe.probe_video_frames(self.video)
 
-        self.assertEqual(result["count"], 42)
-        self.assertEqual(result["method"], "full_decode_ffmpeg_fallback")
-        self.assertIn("decoder unavailable", result["warning"])
+        self.assertIsNone(result["count"])
+        self.assertEqual(result["error"], "parser error")
+        decode.assert_not_called()
+        ffmpeg.assert_not_called()
 
     def test_opt_in_ab_verification_requires_identical_counts(self) -> None:
         with (
@@ -106,7 +95,7 @@ class VideoProbeSelectionTests(unittest.TestCase):
         self.assertIsNone(result["count"])
         self.assertIn("GStreamer=42, FFmpeg=41", result["error"])
 
-    def test_structural_count_mismatch_escalates_to_full_decode(self) -> None:
+    def test_structural_count_mismatch_fails_without_full_decode(self) -> None:
         with (
             mock.patch.object(
                 video_probe,
@@ -117,24 +106,18 @@ class VideoProbeSelectionTests(unittest.TestCase):
                     "error": None,
                 },
             ),
-            mock.patch.object(
-                video_probe,
-                "_full_decode_gstreamer",
-                return_value={
-                    "count": 42,
-                    "method": video_probe.GSTREAMER_METHOD,
-                    "error": None,
-                },
-            ) as decode,
+            mock.patch.object(video_probe, "_full_decode_gstreamer") as decode,
+            mock.patch.object(video_probe, "_full_decode") as ffmpeg,
             mock.patch.dict(video_probe.os.environ, {}, clear=True),
         ):
             result = video_probe.probe_video_frames(
                 self.video, expected_frames=42
             )
 
-        decode.assert_called_once()
-        self.assertEqual(result["count"], 42)
-        self.assertIn("structural frame-count mismatch", result["warning"])
+        decode.assert_not_called()
+        ffmpeg.assert_not_called()
+        self.assertEqual(result["count"], 41)
+        self.assertIn("MP4 sample-count mismatch", result["error"])
 
     def test_gstreamer_worker_pins_complete_hardware_pipeline(self) -> None:
         self.assertEqual(

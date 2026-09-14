@@ -31,10 +31,12 @@ does not provide the hardware encoder used by larger Jetson modules.
 
 ## Acquisition and analysis boundary
 
-The Jetson is the acquisition appliance. It records the run and performs only
-the bounded post-run reconciliation and timing audit required to declare the
-capture valid. Exploratory notebooks, production-scale analysis, video
-transcoding, and offline re-inference belong on the DGX Spark.
+The Jetson is the acquisition appliance. Normal shutdown validates the final
+MP4 sample count against the durable capture, recording-admission, and
+controller totals without rereading the multi-gigabyte ledgers. Frame-level
+reconciliation, controller timing alignment, exploratory notebooks,
+production-scale analysis, video transcoding, and offline re-inference are
+explicit analysis work and do not block safe recording closure.
 
 The current transfer procedure is a manual copy of the complete finalized run
 directory. Keep the Jetson original until the DGX copy has been inspected and
@@ -660,33 +662,34 @@ every acquired image. The aligner derives a per-run offset between that hardware
 frame sequence and RP2040 `CAMERA_HIGH` counts. It validates frame continuity,
 MP4 length, inference mapping, PTS, and camera/controller elapsed-clock agreement.
 
-On stop, SqueakView asks the controller to stop before draining DeepStream,
-keeps the serial reader open for final acknowledgements, validates `raw.mp4`,
-reconciles the ledgers with bounded memory, and writes one compact alignment
-summary. It does not create expanded copies of the canonical CSVs.
-
-Finalization time scales with ledger length. The validated 16-hour run required
-about 7.5 minutes to reconcile 1.7 million frames and 3.4 million serial rows.
-Video validation normally reads the MP4 sample tables and sends the complete
-compressed stream through `h264parse` to clean EOS. It does not reconstruct
-pixels. Structural errors or count mismatches automatically escalate to the
-isolated hardware decoder and then the FFmpeg fallback. During validation, the
-GUI reports processed and expected samples, percentage, rate, elapsed time,
-and ETA; do not close the application or move the run directory. Set
+On stop, SqueakView asks the controller to stop before draining DeepStream and
+keeps the serial reader open for final acknowledgements. After the capture
+process confirms EOS and closes `raw.mp4`, the shutdown validator reads the
+last monotonic indices from the capture and non-leaky recording-admission
+ledgers, reads the MP4 sample-size/timing/sample-to-chunk/chunk-offset tables,
+and requires all totals (plus the controller total when triggered) to agree.
+These are bounded tail/table reads; normal shutdown does not hash the complete
+video, scan every ledger row, build `frames.csv`, run controller alignment, or
+decode the recording. Structural errors and count mismatches fail directly.
+Set
 `SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE=1` for qualification runs that require
 every pixel frame to be decoded. Add `SQUEAKVIEW_VIDEO_VALIDATION_AB_VERIFY=1`
 to run both full decoders and reject any count disagreement.
 Bottle intake is calculated as initial minus final weight. A final weight above
 the initial weight is saved but shown as a plausibility warning.
 
-To rerun the compact validator manually:
+To run the full bounded-memory reconstruction and alignment explicitly:
 
 ```bash
-uv run python scripts/align_run_outputs.py /path/to/run
+.venv/bin/python -m squeakview.apps.inference.post_run /path/to/run \
+  --camera-count 1 --full-analysis --enable-infer --align
 ```
 
-The command writes `alignment_summary.json` and exits nonzero when frame,
-video, controller, or object mapping validation fails.
+The command rebuilds `frames.csv`, performs inference-admission reconciliation,
+writes `alignment_summary.json`, and exits nonzero when frame, video,
+controller, or object mapping validation fails. This analysis may take tens of
+minutes for a multi-day run and is not part of the Stop button's recording
+integrity gate.
 
 ## Analyze a run
 

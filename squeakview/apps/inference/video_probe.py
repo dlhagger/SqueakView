@@ -1,4 +1,4 @@
-"""Bounded full-decode validation of recorded scientific video."""
+"""Bounded sample-table validation with opt-in scientific video decoding."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ DEFAULT_VIDEO_VALIDATION_TIMEOUT_S = 5 * 60 * 60
 JETSON_H264_DECODER = "h264_nvv4l2dec"
 GSTREAMER_H264_DECODER = "nvv4l2decoder"
 GSTREAMER_METHOD = "full_decode_gstreamer_nvv4l2decoder"
-STRUCTURAL_METHOD = "mp4_sample_table_plus_full_h264_parse"
+STRUCTURAL_METHOD = "mp4_sample_table"
 VALIDATION_OUTPUT_FILTER = "settb=1/1000000,setpts=N"
 VALIDATION_PROGRESS_PERIOD_S = 2
 DecodeProgressCallback = Callable[[int], None]
@@ -426,7 +426,21 @@ def _structural_probe(
     *,
     progress_callback: DecodeProgressCallback | None,
 ) -> dict[str, object]:
-    """Reconcile MP4 sample tables with a complete H.264 parse to clean EOS."""
+    """Validate the bounded MP4 sample tables without reading decoded pixels.
+
+    Routine scientific validation proves temporal frame completeness by
+    reconciling this authoritative container sample count with the source and
+    non-leaky recording ledgers.  It deliberately does not send multi-day
+    recordings through ``qtdemux``: that element materializes a per-sample
+    index and rejects sufficiently long, otherwise valid recordings.
+
+    ``timeout_s`` and ``progress_callback`` remain part of the private call
+    shape for compatibility with the explicit full-decode path.  Reading the
+    bounded sample tables is synchronous and does not publish pseudo-decode
+    progress.
+    """
+
+    _ = timeout_s, progress_callback
 
     try:
         table = read_video_sample_table(path)
@@ -435,22 +449,6 @@ def _structural_probe(
             "count": None,
             "method": STRUCTURAL_METHOD,
             "error": f"MP4 sample-table validation failed: {exc}",
-        }
-    parsed = _full_parse_gstreamer(
-        path,
-        timeout_s,
-        progress_callback=progress_callback,
-    )
-    if parsed.get("error") is not None:
-        return parsed
-    if parsed.get("count") != table.sample_count:
-        return {
-            "count": None,
-            "method": STRUCTURAL_METHOD,
-            "error": (
-                "MP4 sample count and parsed H.264 access-unit count disagree: "
-                f"samples={table.sample_count}, parsed={parsed.get('count')}"
-            ),
         }
     return {
         "count": table.sample_count,
@@ -547,7 +545,14 @@ def probe_video_frames(
     expected_frames: int | None = None,
     force_full_decode: bool = False,
 ) -> dict[str, object]:
-    """Validate a recording structurally, escalating anomalies to full decode."""
+    """Count final MP4 samples, decoding only when explicitly requested.
+
+    Routine post-run validation must remain proportional to metadata size and
+    never turn a container-reader limitation or count mismatch into an
+    hours-long decode.  The caller reconciles the returned sample count with
+    source and recording-admission metadata.  Full decoding remains available
+    for the preflight decoder self-test and explicit qualification flags.
+    """
 
     path = Path(path)
     if not path.is_file():
@@ -560,16 +565,27 @@ def probe_video_frames(
         timeout_s,
         progress_callback=progress_callback,
     )
-    structural_mismatch = (
-        expected_frames is not None
-        and structural.get("count") != expected_frames
+    full_required = (
+        force_full_decode or _full_decode_enabled() or _ab_verify_enabled()
     )
-    full_required = force_full_decode or _full_decode_enabled() or _ab_verify_enabled()
-    if structural.get("error") is None and not structural_mismatch and not full_required:
+    if not full_required:
+        if (
+            structural.get("error") is None
+            and expected_frames is not None
+            and structural.get("count") != expected_frames
+        ):
+            structural["error"] = (
+                "MP4 sample-count mismatch: "
+                f"recording={structural.get('count')}, expected={expected_frames}"
+            )
         return structural
 
     anomaly = structural.get("error")
-    if anomaly is None and structural_mismatch:
+    if (
+        anomaly is None
+        and expected_frames is not None
+        and structural.get("count") != expected_frames
+    ):
         anomaly = (
             "structural frame-count mismatch: "
             f"recording={structural.get('count')}, expected={expected_frames}"
@@ -608,7 +624,7 @@ def video_frame_count(path: Path) -> int | None:
 
 
 def decode_self_test(path: Path, *, expected_frames: int = 1) -> tuple[bool, str]:
-    """Exercise the same real decoder used by post-run validation."""
+    """Exercise the real decoder retained for preflight and qualification."""
 
     result = probe_video_frames(
         path,

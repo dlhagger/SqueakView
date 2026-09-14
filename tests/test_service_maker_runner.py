@@ -1193,7 +1193,14 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         ffmpeg.write_text("#!/bin/sh\nprintf 'frame=3389\\nprogress=end\\n'\n")
         ffmpeg.chmod(0o755)
 
-        with mock.patch.object(video_probe.shutil, "which", return_value=str(ffmpeg)):
+        with (
+            mock.patch.object(video_probe.shutil, "which", return_value=str(ffmpeg)),
+            mock.patch.dict(
+                video_probe.os.environ,
+                {"SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE": "1"},
+                clear=True,
+            ),
+        ):
             probe = video_probe.probe_video_frames(video)
 
         self.assertEqual(probe["count"], 3389)
@@ -1213,7 +1220,14 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         ffmpeg.chmod(0o755)
         updates: list[int] = []
 
-        with mock.patch.object(video_probe.shutil, "which", return_value=str(ffmpeg)):
+        with (
+            mock.patch.object(video_probe.shutil, "which", return_value=str(ffmpeg)),
+            mock.patch.dict(
+                video_probe.os.environ,
+                {"SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE": "1"},
+                clear=True,
+            ),
+        ):
             probe = video_probe.probe_video_frames(
                 video, progress_callback=updates.append
             )
@@ -1259,7 +1273,14 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         )
         ffmpeg.chmod(0o755)
 
-        with mock.patch.object(video_probe.shutil, "which", return_value=str(ffmpeg)):
+        with (
+            mock.patch.object(video_probe.shutil, "which", return_value=str(ffmpeg)),
+            mock.patch.dict(
+                video_probe.os.environ,
+                {"SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE": "1"},
+                clear=True,
+            ),
+        ):
             probe = video_probe.probe_video_frames(video)
 
         self.assertEqual(probe["count"], 7)
@@ -1274,7 +1295,14 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         )
         ffmpeg.chmod(0o755)
 
-        with mock.patch.object(video_probe.shutil, "which", return_value=str(ffmpeg)):
+        with (
+            mock.patch.object(video_probe.shutil, "which", return_value=str(ffmpeg)),
+            mock.patch.dict(
+                video_probe.os.environ,
+                {"SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE": "1"},
+                clear=True,
+            ),
+        ):
             probe = video_probe.probe_video_frames(video)
 
         self.assertIsNone(probe["count"])
@@ -1773,6 +1801,45 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         self.assertFalse(progress["alignment_validation_passed"])
         self.assertFalse(progress["overall_validation_passed"])
         self.assertEqual(run_context.read_json(self.root / "run_status.json")["state"], "analysis_failed")
+
+    def test_successful_alignment_retry_clears_prior_failure(self) -> None:
+        run_context.write_status(
+            self.root,
+            "analysis_failed",
+            stage="streaming_alignment",
+            error="old recoverable failure",
+        )
+        summary = {
+            "schema_version": "2.0",
+            "frame_alignment": {
+                "validated": True,
+                "epoch_markers_complete": True,
+                "controller_high_events_unmatched": 0,
+                "shutdown_tail_high_events_unmatched": 0,
+                "controller_high_events_in_epoch": 2,
+            },
+            "start_marker_seen": True,
+            "counts": {"recorded_frames": 2, "frame_gaps_detected": 0},
+            "validation": {
+                "video_frame_count_matches_frames_csv": True,
+                "objects_missing_frame_count": 0,
+                "object_mapping_failed_rows": 0,
+                "object_ts_mismatch_count": 0,
+                "object_pts_mismatch_count": 0,
+            },
+        }
+
+        with mock.patch(
+            "scripts.align_run_outputs_streaming.build_alignment",
+            return_value=summary,
+        ):
+            post_run.align_run(self.root)
+
+        status = run_context.read_json(self.root / "run_status.json")
+        self.assertEqual(status["state"], "analysis_complete")
+        self.assertEqual(status["stage"], "complete")
+        self.assertIsNone(status["error"])
+        self.assertTrue(status["analysis_complete"])
 
 
 if __name__ == "__main__":

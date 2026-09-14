@@ -1011,7 +1011,7 @@ class QualificationTests(unittest.TestCase):
     def test_routine_structural_validation_is_not_full_qualification(self) -> None:
         self.status["recording_validation"]["cameras"][0][
             "frame_count_method"
-        ] = "mp4_sample_table_plus_full_h264_parse"
+        ] = "mp4_sample_table"
         self.status_path.write_text(json.dumps(self.status))
 
         summary = qualify_run(

@@ -20,9 +20,11 @@ flirspinsrc -> GRAY8 -> tee -> non-leaky record queue -> x264enc -> MP4
 - The recording queue must remain non-leaky and must backpressure. A slow
   encoder causes a visible, fatal acquisition fault before the bounded queue
   fills; it must never silently discard a frame.
-- Source capture, recording admission, encoded output, camera frame IDs, and
-  trigger ledgers must reconcile at finalization. A run that cannot prove this
-  equality fails.
+- Normal shutdown must reconcile the encoded MP4 sample total with the durable
+  capture, recording-admission, and controller totals in bounded time. Full
+  row-level camera-ID, trigger, inference, and object reconciliation remains a
+  required explicit analysis/qualification step rather than blocking safe MP4
+  closure.
 - Inference and preview may shed work without changing the ground-truth
   recording. Their skips remain measured and attributable by source frame ID.
 - Refactors must preserve shutdown order: stop new triggers/acquisition, send
@@ -70,9 +72,10 @@ notes. Their raw run directories are not committed and do not count as retained
 qualification evidence. Repeat them under the checked-in protocol and retain
 immutable run IDs, report hashes, and archive location for release qualification.
 
-Triggered, serial-enabled acquisition now makes controller/camera alignment mandatory;
-the former `SQUEAKVIEW_AUTO_ALIGN=0` escape hatch cannot turn a run into a
-successful final state without alignment evidence. Model provenance hashes the
+Triggered, serial-enabled acquisition retains all evidence required for
+controller/camera alignment, but that multi-million-row analysis no longer
+blocks the Stop operation. It remains mandatory before scientific
+qualification. Model provenance hashes the
 portable manifest, pose sidecar, ONNX source, DeepStream configuration, and
 generated engine independently. Runtime preparation additionally binds the
 exact localized config/pose schema/class labels/keypoint labels plus the
@@ -337,31 +340,31 @@ turning measurement defaults into acceptance limits. Completed campaigns can
 be inventoried outside their run directories with bounded streaming SHA-256;
 the archive verifier rejects missing, extra, symlinked, special, traversing, or
 modified copied evidence and never copies or bundles large videos itself.
-The recording validator no longer accepts an unverified container-header frame
-count as proof. Routine finalization validates the MP4 sample-size, timing,
-sample-to-chunk, and chunk-offset tables, then sends the complete compressed
-video through `h264parse` and requires clean EOS with an identical access-unit
-count. This avoids pixel reconstruction. Any structural error or ledger-count
-mismatch automatically escalates to a bounded full decode in an isolated child
-with Jetson's `nvv4l2decoder`; the explicit FFmpeg
-`h264_nvv4l2dec`/rawvideo/null path remains a supervised fallback. Qualification
-can require full decode, and an opt-in A/B mode runs both decoders and rejects a
-count disagreement. The validator publishes bounded sample, percentage, rate,
-elapsed-time, and ETA progress and reuses its one authoritative count during
-alignment. It requires that count to reconcile exactly, and
-binds the exact direct-regular MP4/capture-ledger/admission-ledger set by size
-and SHA-256. Qualification rehashes those artifacts, rejects substitutions or
-unexpected files, and carries their identities into paired and campaign
-evidence checks.
+The recording validator does not accept a duration/header estimate as proof.
+Routine shutdown validates the final MP4 sample-size, timing,
+sample-to-chunk, and chunk-offset tables and reconciles that exact sample count
+with the durable final capture/admission indices and controller count. It does
+not scan full ledgers, hash or decode the complete recording, or perform
+alignment. Explicit offline analysis performs row-level reconciliation and
+alignment; qualification additionally hashes the artifacts, rejects
+substitutions or unexpected files, and may explicitly require full decode or
+A/B decoder agreement.
+
+Future development should add richer progress/checkpointing to explicit
+offline analysis, optimize multi-million-row reconciliation, and add a
+bounded complete compressed-bitstream scan that does not depend on
+`qtdemux`'s per-sample index. None of those items changes the non-leaky
+recording path or blocks the metadata/sample-table validation policy above.
+
 Controller alignment now requires the ordered `START_SENT`,
 `CAPTURE_STOP_REQUESTED`, `STOP_SENT`, and `CAPTURE_STOP_DONE` markers. Its
 trigger epoch starts immediately after `START_SENT` and continues through the
 end of the bounded serial ledger: every `CAMERA_HIGH` in that epoch, including
 the shutdown tail after `CAPTURE_STOP_REQUESTED`, must map bijectively to one
 recorded camera frame. The summary records unmatched epoch and tail counts;
-post-run finalization and later qualification both fail closed unless those
-counts are zero and the video/frame-ledger count also matches. Qualification
-binds the exact alignment-summary bytes it parsed into its source evidence.
+explicit analysis and later qualification both fail closed unless those counts
+are zero and the video/frame-ledger count also matches. Qualification binds the
+exact alignment-summary bytes it parsed into its source evidence.
 
 1. Add an opt-in debug profile that captures DeepStream frame/component latency
    (`NVDS_ENABLE_LATENCY_MEASUREMENT` and

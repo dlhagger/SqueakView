@@ -1,8 +1,10 @@
-"""Bounded-memory post-run capture reconciliation and recording validation."""
+"""Fast recording validation and opt-in bounded-memory run analysis."""
 from __future__ import annotations
 
 import argparse
+import csv
 import heapq
+import json
 import os
 import shutil
 import tempfile
@@ -41,6 +43,7 @@ from .video_probe import probe_video_frames
 
 
 PROGRESS_FILENAME = "post_run_progress.json"
+MAX_LEDGER_TAIL_BYTES = 65_536
 
 
 def _timestamp() -> str:
@@ -176,6 +179,248 @@ def _validate_acquisition_integrity(
     return result.to_dict(), result.passed
 
 
+def _last_complete_line(path: Path) -> str | None:
+    """Read one bounded final ledger record without scanning the whole file."""
+
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            if end <= 0:
+                return None
+            read_size = min(end, MAX_LEDGER_TAIL_BYTES)
+            handle.seek(end - read_size)
+            data = handle.read(read_size)
+    except OSError:
+        return None
+    lines = data.splitlines()
+    if data and not data.endswith((b"\n", b"\r")):
+        lines = lines[:-1]
+    for line in reversed(lines):
+        text = line.decode("utf-8", errors="strict").strip()
+        if text:
+            return text
+    return None
+
+
+def _durable_ledger_counts(run_dir: Path, camera_count: int) -> dict[int, tuple[int, int]]:
+    """Return capture/admission totals from their monotonic final indices."""
+
+    counts: dict[int, tuple[int, int]] = {}
+    for stream_id in range(camera_count):
+        capture_path = run_dir / f"capture_cam{stream_id}.jsonl"
+        admission_path = run_dir / (
+            "record_admission.csv"
+            if stream_id == 0
+            else f"record_admission_cam{stream_id}.csv"
+        )
+        capture_line = _last_complete_line(capture_path)
+        admission_line = _last_complete_line(admission_path)
+        try:
+            capture_payload = json.loads(capture_line or "")
+            capture_index = capture_payload["source_sequence_index"]
+            if type(capture_index) is not int or capture_index < 0:
+                raise ValueError("invalid source_sequence_index")
+            capture_count = capture_index + 1
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot read final capture metadata count for camera {stream_id}: {exc}"
+            ) from exc
+        try:
+            fields = next(csv.reader([admission_line or ""]))
+            record_index_text = fields[1]
+            if not record_index_text.isascii() or not record_index_text.isdecimal():
+                raise ValueError("invalid record_frame_index")
+            admission_count = int(record_index_text) + 1
+        except (IndexError, StopIteration, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot read final recording-admission count for camera {stream_id}: {exc}"
+            ) from exc
+        counts[stream_id] = (capture_count, admission_count)
+    return counts
+
+
+def _video_metadata_identity(path: Path) -> tuple[int, int, int, int, int]:
+    metadata = Path(path).stat()
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult:
+    """Validate final MP4 sample totals against durable metadata counters.
+
+    This is the normal shutdown gate.  It performs bounded tail reads and MP4
+    sample-table reads only; frame reconstruction, hashing, inference
+    reconciliation, and controller alignment are explicit offline analysis.
+    """
+
+    run_dir = Path(run_dir).resolve()
+    if type(camera_count) is not int or not 1 <= camera_count <= MAX_RECORDING_CAMERAS:
+        raise ValueError(
+            f"camera_count must be an integer from 1 through {MAX_RECORDING_CAMERAS}"
+        )
+    run_context.write_status(
+        run_dir,
+        "finalizing",
+        stage="recording_count_validation",
+        error=None,
+    )
+    run_context.atomic_write_json(
+        run_dir / PROGRESS_FILENAME,
+        {"stage": "recording_count_validation", "frames_processed": 0},
+    )
+    try:
+        counts = _durable_ledger_counts(run_dir, camera_count)
+        prior_status = run_context.read_json_required(
+            run_dir / run_context.RUN_STATUS_FILENAME
+        )
+        expected_ttl = prior_status.get("expected_ttl_count")
+        if expected_ttl is not None and (
+            type(expected_ttl) is not int or expected_ttl < 0
+        ):
+            raise RuntimeError("persisted expected_ttl_count is invalid")
+
+        cameras: list[dict[str, object]] = []
+        source_counts: dict[int, int] = {}
+        recorded_counts: dict[int, int] = {}
+        for stream_id in range(camera_count):
+            source_count, admitted_count = counts[stream_id]
+            source_counts[stream_id] = source_count
+            recorded_counts[stream_id] = admitted_count
+            video_path = run_dir / (
+                "raw.mp4" if stream_id == 0 else f"raw_cam{stream_id}.mp4"
+            )
+            before = _video_metadata_identity(video_path)
+            probe = probe_video_frames(video_path, expected_frames=admitted_count)
+            after = _video_metadata_identity(video_path)
+            raw_video_count = probe.get("count")
+            video_count = (
+                raw_video_count
+                if type(raw_video_count) is int and raw_video_count >= 0
+                else None
+            )
+            unchanged = before == after
+            source_matches = source_count == admitted_count
+            controller_matches = expected_ttl is None or source_count == expected_ttl
+            count_matches = video_count == admitted_count if video_count is not None else None
+            error = probe.get("error")
+            if not unchanged:
+                error = "recording changed during sample-count validation"
+            elif not controller_matches:
+                error = (
+                    f"camera metadata count {source_count} does not match "
+                    f"controller count {expected_ttl}"
+                )
+            cameras.append(
+                {
+                    "stream_id": stream_id,
+                    "video": video_path.name,
+                    "exists": before[2] > 0,
+                    "source_frames": source_count,
+                    "record_admitted_frames": admitted_count,
+                    "source_count_matches": source_matches,
+                    "controller_count_matches": controller_matches,
+                    "nonzero_frame_count": bool(
+                        source_count > 0 and admitted_count > 0 and (video_count or 0) > 0
+                    ),
+                    "video_frames": video_count,
+                    "frame_count_matches": count_matches,
+                    "frame_count_method": probe.get("method"),
+                    "frame_count_error": error,
+                    "frame_count_warning": probe.get("warning"),
+                    "video_unchanged_during_validation": unchanged,
+                    "video_size_bytes": before[2],
+                }
+            )
+
+        recording_passed = bool(cameras) and all(
+            camera["exists"] is True
+            and camera["source_count_matches"] is True
+            and camera["controller_count_matches"] is True
+            and camera["nonzero_frame_count"] is True
+            and camera["frame_count_matches"] is True
+            and camera["frame_count_error"] is None
+            and camera["video_unchanged_during_validation"] is True
+            for camera in cameras
+        )
+        recording_report = {
+            "schema_version": "3.0",
+            "validation_tier": "shutdown_fast_count",
+            "policy": "mp4_sample_count_equals_durable_capture_and_recording_counts",
+            "cameras": cameras,
+            "passed": recording_passed,
+        }
+        integrity_report, integrity_passed = _validate_acquisition_integrity(
+            run_dir, camera_count
+        )
+        passed = recording_passed and integrity_passed
+        reconciliation = {
+            "schema_version": "2.0",
+            "validation_tier": "durable_final_indices",
+            "source_frames": source_counts,
+            "record_admitted_frames": recorded_counts,
+            "source_not_recorded_frames": {
+                stream_id: source_counts[stream_id] - recorded_counts[stream_id]
+                for stream_id in source_counts
+            },
+            "policy": "final monotonic capture/admission indices must agree",
+        }
+        total = sum(recorded_counts.values())
+        run_context.write_status(
+            run_dir,
+            "post_run_complete",
+            stage="recording_count_validation_complete",
+            error=None,
+            post_run_frames=total,
+            recording_validation_passed=recording_passed,
+            recording_validation=recording_report,
+            acquisition_integrity=integrity_report,
+            overall_validation_passed=passed,
+            capture_reconciliation=reconciliation,
+            analysis_complete=False,
+            alignment_validated=False,
+        )
+        _update_progress(
+            run_dir,
+            stage="complete" if passed else "failed",
+            frames_processed=total,
+            recording_validation_passed=recording_passed,
+            overall_validation_passed=passed,
+        )
+        level = "PASS" if passed else "ERROR"
+        print(
+            f"[{_timestamp()}] [POST-RUN] {level}: MP4/metadata count validation "
+            f"completed for {total} frame(s)",
+            flush=True,
+        )
+        primary = cameras[0]
+        return FinalizationResult(
+            source_counts,
+            recorded_counts,
+            total,
+            passed,
+            {
+                "count": primary.get("video_frames"),
+                "method": primary.get("frame_count_method"),
+                "error": primary.get("frame_count_error"),
+            },
+        )
+    except Exception as exc:
+        run_context.write_status(run_dir, "finalization_failed", error=str(exc))
+        _update_progress(
+            run_dir,
+            stage="failed",
+            overall_validation_passed=False,
+            error=str(exc),
+        )
+        raise
+
+
 def finalize_run(
     run_dir: Path,
     *,
@@ -187,7 +432,16 @@ def finalize_run(
         raise ValueError(
             f"camera_count must be an integer from 1 through {MAX_RECORDING_CAMERAS}"
         )
-    run_context.write_status(run_dir, "finalizing", stage="capture_reconciliation")
+    # A finalizer may be rerun after a recoverable validation failure.  Clear
+    # the prior active error as soon as recovery begins; write_status merges
+    # with the durable document so omitting this would leave a stale failure
+    # attached to a healthy retry.
+    run_context.write_status(
+        run_dir,
+        "finalizing",
+        stage="capture_reconciliation",
+        error=None,
+    )
     qualification_barrier.wait_at_barrier(
         run_dir, "finalizer:capture_reconciliation"
     )
@@ -424,6 +678,7 @@ def finalize_run(
         run_context.write_status(
             run_dir,
             "post_run_complete",
+            error=None,
             post_run_frames=processed,
             recording_validation_passed=recording_passed,
             recording_validation=report,
@@ -535,6 +790,9 @@ def align_run(
         run_context.write_status(
             run_dir,
             "analysis_complete",
+            stage="complete",
+            error=None,
+            analysis_complete=True,
             alignment_summary="alignment_summary.json",
             alignment_validated=summary.get("frame_alignment", {}).get("validated"),
         )
@@ -565,6 +823,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--camera-count", type=int, default=1)
+    parser.add_argument(
+        "--full-analysis",
+        action="store_true",
+        help=(
+            "rebuild canonical frame metadata and run optional inference/alignment "
+            "analysis; normal shutdown performs fast count validation only"
+        ),
+    )
     parser.add_argument("--enable-infer", action="store_true")
     parser.add_argument("--align", action="store_true")
     return parser.parse_args()
@@ -573,15 +839,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        result = finalize_run(
-            args.run_dir,
-            camera_count=max(1, int(args.camera_count)),
-            enable_infer=bool(args.enable_infer),
-        )
+        if args.full_analysis:
+            result = finalize_run(
+                args.run_dir,
+                camera_count=max(1, int(args.camera_count)),
+                enable_infer=bool(args.enable_infer),
+            )
+        else:
+            result = fast_finalize_run(
+                args.run_dir,
+                camera_count=max(1, int(args.camera_count)),
+            )
     except Exception as exc:
         print(f"[{_timestamp()}] [POST-RUN] ERROR: {exc}", flush=True)
         return 1
-    if args.align and result.validation_passed:
+    if args.full_analysis and args.align and result.validation_passed:
         try:
             summary = align_run(
                 args.run_dir,
