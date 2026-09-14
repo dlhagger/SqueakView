@@ -434,6 +434,22 @@ class ServiceMakerRunnerTests(unittest.TestCase):
             pipeline.nodes["flirsrc0"][1]["capture-log-path"],
             str(app.run_dir / "capture_cam0.jsonl"),
         )
+        self.assertEqual(
+            pipeline.nodes["flirsrc0"][1]["frame-manifest-path"],
+            str(app.run_dir / "frames.csv"),
+        )
+        self.assertEqual(
+            pipeline.nodes["flirsrc0"][1]["camera-telemetry-path"],
+            str(app.run_dir / "diagnostics/camera.csv"),
+        )
+        self.assertEqual(
+            pipeline.nodes["flirsrc0"][1]["error-log-path"],
+            str(app.run_dir / "diagnostics/errors.csv"),
+        )
+        self.assertEqual(
+            pipeline.nodes["flirsrc0"][1]["camera-runtime-path"],
+            str(app.run_dir / "diagnostics/camera_runtime.json"),
+        )
         self.assertEqual(pipeline.nodes["record_queue0"][1]["leaky"], 0)
         self.assertFalse(pipeline.nodes["record_queue0"][1]["flush-on-eos"])
         self.assertEqual(pipeline.nodes["record_queue0"][1]["max-size-buffers"], 120)
@@ -559,6 +575,41 @@ class ServiceMakerRunnerTests(unittest.TestCase):
                                 "stream-buffer-count": 64,
                                 "capture-log-path": str(
                                     run_dir / f"capture_cam{index}.jsonl"
+                                ),
+                                "frame-manifest-path": str(
+                                    run_dir
+                                    / (
+                                        "frames.csv"
+                                        if index == 0
+                                        else f"frames_cam{index}.csv"
+                                    )
+                                ),
+                                "camera-telemetry-path": str(
+                                    run_dir
+                                    / "diagnostics"
+                                    / (
+                                        "camera.csv"
+                                        if index == 0
+                                        else f"camera_cam{index}.csv"
+                                    )
+                                ),
+                                "error-log-path": str(
+                                    run_dir
+                                    / "diagnostics"
+                                    / (
+                                        "errors.csv"
+                                        if index == 0
+                                        else f"errors_cam{index}.csv"
+                                    )
+                                ),
+                                "camera-runtime-path": str(
+                                    run_dir
+                                    / "diagnostics"
+                                    / (
+                                        "camera_runtime.json"
+                                        if index == 0
+                                        else f"camera_runtime_cam{index}.json"
+                                    )
                                 ),
                                 "metadata-profile": "scientific",
                                 "max-consecutive-timeouts": 10,

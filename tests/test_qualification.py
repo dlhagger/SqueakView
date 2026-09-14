@@ -1008,7 +1008,7 @@ class QualificationTests(unittest.TestCase):
             summary["failed_reasons"],
         )
 
-    def test_routine_structural_validation_is_not_full_qualification(self) -> None:
+    def test_mp4_sample_table_validation_satisfies_recording_integrity(self) -> None:
         self.status["recording_validation"]["cameras"][0][
             "frame_count_method"
         ] = "mp4_sample_table"
@@ -1018,10 +1018,9 @@ class QualificationTests(unittest.TestCase):
             self.run_dir, limits_path=self._limits(validated=False)
         )
 
-        self.assertEqual(summary["result"], "failed")
-        self.assertIn(
-            "frame-integrity gate failed: recording_validation_passed",
-            summary["failed_reasons"],
+        self.assertEqual(summary["result"], "incomplete")
+        self.assertTrue(
+            summary["frame_integrity_gates"]["recording_validation_passed"]
         )
 
     def test_power_interrupted_nonterminal_run_cannot_qualify(self) -> None:

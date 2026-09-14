@@ -537,7 +537,7 @@ alignment_summary.json          Compact frame/video/controller audit
 diagnostics/camera.csv          Temperature and transport health samples
 diagnostics/recording.csv       Recording queue and encoder telemetry
 diagnostics/system.csv          Capture-owned bounded Jetson resource telemetry
-diagnostics/errors.csv          Camera gaps, CRC, and metadata failures
+diagnostics/errors.csv          Camera gaps, CRC, and incomplete-frame events
 diagnostics/camera_runtime.json Camera identity and clock calibration
 diagnostics/deepstream.log      Size-bounded capture/DeepStream child output
 diagnostics/post_run.log        Finalizer subprocess log
@@ -546,10 +546,15 @@ diagnostics/preview_delivery*.csv  Source IDs delivered after preview shedding
 config/task.yaml               Immutable run-local task definition snapshot
 ```
 
-`frames.csv` is the source of truth for recorded frame identity. It contains
-one row per recorded buffer and an `inference_admitted` field, so inference
-admission does not require a second frame ledger. `objects.csv` is the single
-object-observation table; track summaries are derived from it when analyzed.
+`frames.csv` is written live by the FLIR source and is the source of truth for
+captured frame identity. It contains one row per emitted source buffer. Stop
+uses bounded tail reads and the MP4 sample table; it does not rebuild this file.
+Validation requires its final index to agree with the non-leaky recording
+admission ledger and the finalized MP4 sample count.
+The camera telemetry, error ledger, and runtime snapshot are also written by
+the source while acquisition is active, rather than reconstructed at shutdown.
+`objects.csv` is the single object-observation table; track summaries are
+derived from it when analyzed.
 Once a run reaches a terminal state, its acquisition, model, Git, and storage
 provenance in `run_manifest.json` is immutable. Later bottle entry updates only
 the bottle summary, artifact inventory, and manifest update timestamp.
@@ -559,19 +564,11 @@ Source, admission, and inference ledgers (`capture_cam*.jsonl`,
 validation as primary scientific provenance. Only transient finalizer progress
 state is cleaned up. This costs additional storage but preserves the evidence
 needed to reproduce frame reconciliation and diagnose a later integrity issue.
-Routine finalization validates every MP4 sample table and parses the complete
-H.264 stream to clean EOS without reconstructing pixels. It requires the MP4
-sample-size, timing, sample-to-chunk, and parser access-unit counts to agree.
-Any structural error or ledger-count mismatch escalates automatically to a
-complete hardware decode through Jetson's `nvv4l2decoder`; FFmpeg's explicitly
-selected `h264_nvv4l2dec` path remains a fail-closed fallback. Qualification
-can explicitly require a complete decode. The resulting authoritative count is reused by
-controller alignment so a long recording is not decoded twice. It
-requires the decoded count to equal both source and recording-admission counts,
-and stores SHA-256 identities for the exact MP4, capture ledger, and admission
-ledger set. The exact installed FFmpeg package version is part of device and
-campaign provenance. Qualification rehashes those primary artifacts and fails if they
-were missing, added, symlinked, or changed after finalization.
+Routine finalization reads the bounded MP4 sample tables without parsing or
+decoding the complete H.264 stream. It requires the sample-size, timing, and
+sample-to-chunk totals to agree with the live frame manifest, source ledger,
+recording-admission ledger, and controller count. Full decode remains an
+explicit qualification option, not an automatic shutdown fallback.
 
 Generate a bounded-memory qualification summary after finalization with:
 
@@ -668,9 +665,11 @@ process confirms EOS and closes `raw.mp4`, the shutdown validator reads the
 last monotonic indices from the capture and non-leaky recording-admission
 ledgers, reads the MP4 sample-size/timing/sample-to-chunk/chunk-offset tables,
 and requires all totals (plus the controller total when triggered) to agree.
-These are bounded tail/table reads; normal shutdown does not hash the complete
-video, scan every ledger row, build `frames.csv`, run controller alignment, or
-decode the recording. Structural errors and count mismatches fail directly.
+These are bounded tail/table reads; normal shutdown does not hash or decode the
+complete video and never rebuilds `frames.csv`. Triggered runs then generate
+the controller/camera alignment summary automatically from the already-written
+manifest and serial ledger. Structural errors and count mismatches fail
+directly.
 Set
 `SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE=1` for qualification runs that require
 every pixel frame to be decoded. Add `SQUEAKVIEW_VIDEO_VALIDATION_AB_VERIFY=1`
@@ -678,18 +677,16 @@ to run both full decoders and reject any count disagreement.
 Bottle intake is calculated as initial minus final weight. A final weight above
 the initial weight is saved but shown as a plausibility warning.
 
-To run the full bounded-memory reconstruction and alignment explicitly:
+To rerun the legacy bounded-memory recovery reconstruction explicitly:
 
 ```bash
 .venv/bin/python -m squeakview.apps.inference.post_run /path/to/run \
   --camera-count 1 --full-analysis --enable-infer --align
 ```
 
-The command rebuilds `frames.csv`, performs inference-admission reconciliation,
-writes `alignment_summary.json`, and exits nonzero when frame, video,
-controller, or object mapping validation fails. This analysis may take tens of
-minutes for a multi-day run and is not part of the Stop button's recording
-integrity gate.
+The command rebuilds `frames.csv` from recovery ledgers and performs the deeper
+inference/object reconciliation. Normal runs do not need this command because
+capture writes `frames.csv` live and Stop generates `alignment_summary.json`.
 
 ## Analyze a run
 

@@ -341,17 +341,20 @@ be inventoried outside their run directories with bounded streaming SHA-256;
 the archive verifier rejects missing, extra, symlinked, special, traversing, or
 modified copied evidence and never copies or bundles large videos itself.
 The recording validator does not accept a duration/header estimate as proof.
-Routine shutdown validates the final MP4 sample-size, timing,
-sample-to-chunk, and chunk-offset tables and reconciles that exact sample count
-with the durable final capture/admission indices and controller count. It does
-not scan full ledgers, hash or decode the complete recording, or perform
-alignment. Explicit offline analysis performs row-level reconciliation and
-alignment; qualification additionally hashes the artifacts, rejects
-substitutions or unexpected files, and may explicitly require full decode or
-A/B decoder agreement.
+The FLIR source writes canonical `frames.csv` rows during acquisition. Routine
+shutdown validates the final MP4 sample-size, timing, sample-to-chunk, and
+chunk-offset tables against the live manifest and durable final
+capture/admission indices. Triggered runs then generate controller/camera
+alignment automatically. Shutdown does not reconstruct `frames.csv`, hash or
+decode the complete recording, or perform detailed object reconciliation.
+The source also writes low-rate camera telemetry, camera integrity events, and
+the resolved camera runtime snapshot live, so those diagnostic artifacts do
+not require post-run reconstruction. Deferred object statistics are recorded
+as unavailable (`null`), never as a misleading measured zero.
+Qualification may explicitly request the deeper object or decode checks.
 
-Future development should add richer progress/checkpointing to explicit
-offline analysis, optimize multi-million-row reconciliation, and add a
+Future development should add richer progress/checkpointing to optional deep
+analysis and add a
 bounded complete compressed-bitstream scan that does not depend on
 `qtdemux`'s per-sample index. None of those items changes the non-leaky
 recording path or blocks the metadata/sample-table validation policy above.
@@ -362,7 +365,7 @@ trigger epoch starts immediately after `START_SENT` and continues through the
 end of the bounded serial ledger: every `CAMERA_HIGH` in that epoch, including
 the shutdown tail after `CAPTURE_STOP_REQUESTED`, must map bijectively to one
 recorded camera frame. The summary records unmatched epoch and tail counts;
-explicit analysis and later qualification both fail closed unless those counts
+automatic alignment and later qualification both fail closed unless those counts
 are zero and the video/frame-ledger count also matches. Qualification binds the
 exact alignment-summary bytes it parsed into its source evidence.
 

@@ -532,14 +532,15 @@ class OperatorBackend:
         )
 
     def _run_capture_finalizer(self, run_dir: Path) -> int:
+        alignment_required = bool(
+            getattr(self.launch_cfg, "serial_enabled", False)
+            and getattr(self.launch_cfg, "trigger_on", False)
+        )
         return finalizer.run_capture_finalizer(
             run_dir,
             camera_count=int(getattr(self.launch_cfg, "num_cameras", 1)),
             enable_infer=bool(getattr(self.launch_cfg, "inference_enabled", True)),
-            # Shutdown validates recording completeness from durable counts.
-            # Controller/object alignment is explicit offline analysis and
-            # must never block closing an otherwise complete MP4.
-            enable_align=False,
+            enable_align=alignment_required,
             emit=self._log,
             force_timeout=bool(
                 self._failure_plan is not None
@@ -579,7 +580,10 @@ class OperatorBackend:
                         controller_protocol=getattr(
                             self.launch_cfg, "controller_protocol", "legacy"
                         ),
-                        alignment_required=False,
+                        alignment_required=bool(
+                            getattr(self.launch_cfg, "serial_enabled", False)
+                            and getattr(self.launch_cfg, "trigger_on", False)
+                        ),
                         failure_plan=self._failure_plan,
                     ),
                     lifecycle.FinalizationHooks(

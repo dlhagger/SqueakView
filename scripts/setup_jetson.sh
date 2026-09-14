@@ -93,13 +93,15 @@ FLIR_INSPECT="$(
   GST_PLUGIN_PATH="$ROOT/native/flir_gst_source/build:/opt/nvidia/deepstream/deepstream/lib/gst-plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
     gst-inspect-1.0 flirspinsrc
 )"
-case "$FLIR_INSPECT" in
-  *capture-log-path*) ;;
-  *)
-    printf '[FAIL] Built flirspinsrc is stale: capture-log-path is unavailable.\n' >&2
-    exit 1
-    ;;
-esac
+for property in capture-log-path frame-manifest-path camera-telemetry-path error-log-path camera-runtime-path; do
+  case "$FLIR_INSPECT" in
+    *"$property"*) ;;
+    *)
+      printf '[FAIL] Built flirspinsrc is stale: required property %s is unavailable.\n' "$property" >&2
+      exit 1
+      ;;
+  esac
+done
 printf '[PASS] Native FLIR and DeepStream components built successfully.\n'
 
 if ! getent group dialout >/dev/null; then

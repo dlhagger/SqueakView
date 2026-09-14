@@ -334,10 +334,14 @@ check_ffmpeg_decode_path
 if [ "$CAPTURE_BACKEND" = "flir_direct" ]; then
   if gst-inspect-1.0 flirspinsrc >/dev/null 2>&1; then
     pass "GStreamer element 'flirspinsrc' is available"
-    if gst-inspect-1.0 flirspinsrc 2>/dev/null | grep -q 'capture-log-path'; then
-      pass "GStreamer element 'flirspinsrc' supports the source capture ledger"
+    FLIR_PROPERTIES="$(gst-inspect-1.0 flirspinsrc 2>/dev/null)"
+    if printf '%s' "$FLIR_PROPERTIES" | grep -q 'frame-manifest-path' \
+      && printf '%s' "$FLIR_PROPERTIES" | grep -q 'camera-telemetry-path' \
+      && printf '%s' "$FLIR_PROPERTIES" | grep -q 'error-log-path' \
+      && printf '%s' "$FLIR_PROPERTIES" | grep -q 'camera-runtime-path'; then
+      pass "GStreamer element 'flirspinsrc' supports live scientific ledgers"
     else
-      printf '[FAIL] flirspinsrc is stale: capture-log-path is unavailable\n'
+      printf '[FAIL] flirspinsrc is stale: live frame/diagnostic outputs are unavailable\n'
       fail=1
     fi
   else

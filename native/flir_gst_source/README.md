@@ -93,10 +93,14 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
 - Attaches `SQUEAKVIEW.FLIR.FRAME_META.v1` before `nvstreammux`. DeepStream
   transforms it to frame-level `NvDsUserMeta` for inference admission auditing.
 - Writes the same payload to `capture-log-path` as line-delimited JSON before
-  returning each source buffer. This temporary recovery ledger is the durable
-  pre-tee audit during capture. SqueakView reconciles it with recording-branch
-  admissions to build authoritative `frames.csv`, then removes it only after
-  successful validation; failed finalization retains it for diagnosis.
+  returning each source buffer. This is the verbose recovery ledger.
+- Writes canonical frame rows directly to `frame-manifest-path` during capture.
+  Shutdown validates that live manifest against the non-leaky recording branch
+  and MP4 sample table instead of reconstructing it from the JSON ledger.
+- Writes low-rate transport telemetry to `camera-telemetry-path`, camera gap/CRC/
+  incomplete-frame events to `error-log-path`, and the resolved camera identity
+  and configuration to `camera-runtime-path`. These files are produced live by
+  the source; shutdown does not reconstruct them by scanning the capture ledger.
 - Captures immediate host receipt clocks, source image layout, actual exposure
   and gain, payload sizes, image status, CRC validation, frame gaps, and source
   health counters.
@@ -104,7 +108,7 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
   monotonic and Unix clocks, preserving the raw device tick value and its
   reported nanoseconds-per-tick increment.
 - Samples camera temperature and transport-layer health counters about once
-  per second; SqueakView writes these samples to `diagnostics/camera.csv` using
+  per second and writes them to `diagnostics/camera.csv` using
   the frame's acquisition-side host Unix and monotonic clocks. Missing source
   clocks remain empty rather than being replaced with CSV-write time.
 - Uses Spinnaker's typed timeout error and supports a bounded consecutive
@@ -128,11 +132,11 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
   silently clamped.
 - `record_admission.csv` is a temporary recovery ledger written at the
   non-leaky recording queue. It is removed after successful finalization.
-- `frames.csv` is finalized by matching recording admissions to the source-side
-  metadata ledger. Its `inference_admitted` column records whether each frame
-  also entered the downstream-leaky inference branch.
-- `diagnostics/errors.csv` records camera-ID gaps, source-to-mux gaps, CRC failures,
-  and missing/invalid metadata; a header-only file means none were observed.
+- `frames.csv` is written directly by this source; shutdown compares its final
+  index with the recording-admission ledger and MP4 sample count.
+- `diagnostics/errors.csv` records camera-ID gaps, CRC failures, and incomplete
+  source images; a header-only file means none were observed. Recording-path
+  admission checks independently detect loss between the source and MP4.
 
 The direct source and recording path completed a validated 16-hour,
 1,707,205-frame single-camera run at 1440×1080 and 30 FPS with no source gaps,

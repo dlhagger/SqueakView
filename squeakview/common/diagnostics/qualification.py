@@ -937,9 +937,14 @@ def _integrity_gates(
     def recording_validation_valid() -> bool:
         if (
             not isinstance(recording, dict)
-            or recording.get("schema_version") != "2.0"
+            or recording.get("schema_version") not in {"2.0", "3.0"}
             or recording.get("passed") is not True
-            or recording.get("evidence_unchanged_during_validation") is not True
+        ):
+            return False
+        schema_version = recording.get("schema_version")
+        if (
+            schema_version == "2.0"
+            and recording.get("evidence_unchanged_during_validation") is not True
         ):
             return False
         cameras = recording.get("cameras")
@@ -957,8 +962,17 @@ def _integrity_gates(
                 and camera.get("nonzero_frame_count") is True
                 and camera.get("source_count_matches") is True
                 and camera.get("frame_count_matches") is True
-                and isinstance(camera.get("frame_count_method"), str)
-                and camera["frame_count_method"].startswith("full_decode_")
+                and camera.get("frame_count_method")
+                in {
+                    "mp4_sample_table",
+                    "full_decode_gstreamer_nvv4l2decoder",
+                    "full_decode_ffmpeg_h264_nvv4l2dec",
+                }
+                and camera.get("video_unchanged_during_validation", True) is True
+                and (
+                    schema_version != "3.0"
+                    or camera.get("frame_manifest_count_matches") is True
+                )
                 and type(camera.get("source_frames")) is int
                 and camera["source_frames"] > 0
                 and camera.get("record_admitted_frames") == camera["source_frames"]

@@ -1025,21 +1025,16 @@ power_modes: [25W]
         self.assertEqual(worker.wait_timeouts, [30.0])
         self.assertEqual(self.status()["state"], "finalization_failed")
 
-    def test_triggered_run_defers_alignment_outside_shutdown(self) -> None:
+    def test_triggered_run_generates_alignment_during_finalization(self) -> None:
         self.backend.launch_cfg = self.config(serial_enabled=True, trigger_on=True)
-        with (
-            mock.patch.object(
-                manager.finalizer, "run_capture_finalizer", return_value=0
-            ) as run_finalizer,
-            mock.patch.dict(
-                manager.os.environ, {"SQUEAKVIEW_AUTO_ALIGN": "0"}
-            ),
-        ):
+        with mock.patch.object(
+            manager.finalizer, "run_capture_finalizer", return_value=0
+        ) as run_finalizer:
             manager.OperatorBackend._run_capture_finalizer(
                 self.backend, self.run_dir
             )
 
-        self.assertFalse(run_finalizer.call_args.kwargs["enable_align"])
+        self.assertTrue(run_finalizer.call_args.kwargs["enable_align"])
 
     def test_free_running_serial_logging_does_not_request_trigger_alignment(self) -> None:
         self.backend.launch_cfg = self.config(serial_enabled=True, trigger_on=False)

@@ -36,6 +36,8 @@ def camera_source_properties(
     """Return the exact audited properties for one FLIR source element."""
 
     buffer_policy = capture_buffer_policy(config.fps)
+    diagnostics_dir = Path(run_dir) / "diagnostics"
+    suffix = "" if index == 0 else f"_cam{index}"
     properties: dict[str, object] = {
         "camera-index": index,
         "width": int(config.width),
@@ -56,6 +58,14 @@ def camera_source_properties(
         "buffer-handling": "OldestFirst",
         "stream-buffer-count": buffer_policy.source_transport_buffers,
         "capture-log-path": str(Path(run_dir) / f"capture_cam{index}.jsonl"),
+        "frame-manifest-path": str(
+            Path(run_dir) / ("frames.csv" if index == 0 else f"frames_cam{index}.csv")
+        ),
+        "camera-telemetry-path": str(diagnostics_dir / f"camera{suffix}.csv"),
+        "error-log-path": str(diagnostics_dir / f"errors{suffix}.csv"),
+        "camera-runtime-path": str(
+            diagnostics_dir / f"camera_runtime{suffix}.json"
+        ),
         "metadata-profile": "scientific",
         "max-consecutive-timeouts": 0 if config.trigger_on else 10,
     }
