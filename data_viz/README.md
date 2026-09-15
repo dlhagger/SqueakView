@@ -23,6 +23,9 @@ The DGX Spark:
 The Jetson post-run aligner is part of acquisition validation, not downstream
 scientific analysis. Wait for it to finish before copying a run.
 
+For the exact frame identities, controller-clock mapping, inference joins, and
+large-run processing rules, see [ALIGNMENT_GUIDE.md](ALIGNMENT_GUIDE.md).
+
 ## Current Transfer Procedure
 
 The initial workflow uses a manual copy. Transfer automation is intentionally

@@ -321,6 +321,10 @@ finalization; acquisition never continues headlessly. Terminal or VS Code loss
 does not end the supervised session. Separate bounded GUI and supervisor logs
 are written under `runs/logs/`; each mirror is capped at 32 MiB and partial
 lines are capped at 64 KiB.
+Stop requests are acknowledged immediately by the supervisor. Capture closure
+and post-run analysis continue in a supervisor-owned worker while the responsive
+GUI receives lifecycle events and heartbeats; run duration therefore cannot
+turn a slow alignment pass into an IPC timeout or a false GUI-loss failure.
 The launcher reports success only after the supervisor has authenticated the
 GUI's IPC connection; an early GUI failure or connection timeout returns
 nonzero with the supervisor log path. The bounded wait defaults to 35 seconds,

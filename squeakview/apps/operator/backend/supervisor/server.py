@@ -201,6 +201,8 @@ class SupervisorServer:
         self._dropped_lock = threading.Lock()
         self._loss_thread: threading.Thread | None = None
         self._operation_lock = threading.Lock()
+        self._async_stop_lock = threading.Lock()
+        self._async_stop_thread: threading.Thread | None = None
         self._mutation_ledger: OrderedDict[
             str, tuple[str, Mapping[str, object], bool]
         ] = OrderedDict()
@@ -340,6 +342,40 @@ class SupervisorServer:
         self._renew_gui_lease()
         return True
 
+    def _run_async_stop(self) -> None:
+        """Own one complete stop without occupying the IPC command worker."""
+
+        try:
+            self.backend.stop_run()
+        except Exception as exc:
+            error = f"asynchronous stop failed: {type(exc).__name__}: {exc}"
+            self._emit_log(f"[SUPERVISOR] {error}")
+            try:
+                self.backend.abort_run(error)
+            except Exception as abort_exc:
+                self._emit_log(
+                    "[SUPERVISOR] asynchronous stop recovery failed: "
+                    f"{type(abort_exc).__name__}: {abort_exc}"
+                )
+
+    def _request_async_stop(self) -> bool:
+        """Start finalization once and return without waiting for completion."""
+
+        with self._async_stop_lock:
+            existing = self._async_stop_thread
+            if existing is not None and existing.is_alive():
+                return False
+            if self.backend.snapshot().phase in {RunPhase.IDLE, RunPhase.FINALIZED, RunPhase.FAILED}:
+                return False
+            worker = threading.Thread(
+                target=self._run_async_stop,
+                name="squeakview-supervisor-stop",
+                daemon=False,
+            )
+            self._async_stop_thread = worker
+            worker.start()
+            return True
+
     def _dispatch(self, command: CommandEnvelope) -> tuple[object, bool]:
         payload = command.payload
         if command.name == "ping":
@@ -357,8 +393,8 @@ class SupervisorServer:
                 "snapshot": self._snapshot(),
             }, False
         if command.name == "stop_run":
-            self.backend.stop_run()
-            return {"snapshot": self._snapshot()}, False
+            accepted = self._request_async_stop()
+            return {"accepted": accepted, "snapshot": self._snapshot()}, False
         if command.name == "save_bottle_measurements":
             bottles = payload.get("bottles")
             if bottles is not None and not isinstance(bottles, Mapping):
@@ -689,6 +725,8 @@ class SupervisorServer:
                     gui.wait(timeout=5.0)
             if self._loss_thread is not None:
                 self._loss_thread.join()
+            if self._async_stop_thread is not None:
+                self._async_stop_thread.join()
             if worker is not None and worker.ident is not None:
                 worker.join()
             self._unlink_owned_socket()

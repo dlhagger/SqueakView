@@ -246,6 +246,11 @@ with an explicit count. GUI loss is tested before run creation and during
 recording/finalization. Startup cancellation and controller `START` are
 lease-atomic, and the supervisor remains alive until ordered finalization and
 terminal persistence finish.
+Run stop is asynchronous at the IPC boundary: the command worker acknowledges
+ownership immediately, a non-daemon supervisor worker performs ordered shutdown,
+and the GUI waits for terminal lifecycle events while continuing its main-loop
+lease. Accelerated blocked-finalizer tests verify stop acknowledgement and
+progress snapshots without requiring an hours-long acquisition.
 
 A bounded lease emitted by a Qt-main-loop timer also makes a frozen GUI fail
 closed; a proxy background thread cannot renew that lease by itself. The

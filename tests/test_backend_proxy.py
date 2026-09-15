@@ -7,6 +7,7 @@ import stat
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -386,6 +387,54 @@ class SupervisorBackendProxyTest(unittest.TestCase):
         self.assertEqual(snapshot.phase, RunPhase.VALIDATING)
         self.assertFalse(proxy.state.inference.is_running())
         self.assertTrue(proxy.finalization_in_progress)
+
+    def test_stop_ack_is_async_and_waits_for_terminal_event_without_rpc_timeout(self) -> None:
+        proxy = self.proxy()
+        proxy._apply_phase(RunPhase.RECORDING, Path("/tmp/long-run"))
+        terminal_delay = 0.15
+
+        def serve() -> None:
+            command = self.fake.receive()
+            self.assertEqual(command.name, "stop_run")
+            self.fake.respond(
+                command,
+                {
+                    "accepted": True,
+                    "snapshot": {
+                        "schema_version": "1.0",
+                        "phase": "recording",
+                        "run_dir": "/tmp/long-run",
+                        "error": None,
+                        "capture_running": True,
+                        "finalization_in_progress": False,
+                    },
+                },
+            )
+            time.sleep(terminal_delay)
+            self.fake.event(
+                "backend_event",
+                {
+                    "schema_version": "1.0",
+                    "type": "phase_changed",
+                    "phase": "finalized",
+                    "run_dir": "/tmp/long-run",
+                    "message": None,
+                    "payload": {"previous_phase": "validating"},
+                    "host_unix_ns": 123,
+                },
+            )
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        started = time.monotonic()
+        proxy.stop_run()
+        elapsed = time.monotonic() - started
+        thread.join()
+
+        self.assertGreaterEqual(elapsed, terminal_delay)
+        self.assertFalse(proxy._closed.is_set())
+        self.assertEqual(proxy.current_snapshot.phase, RunPhase.FINALIZED)
+        self.assertFalse(proxy.finalization_in_progress)
 
     def test_shutdown_response_then_eof_is_not_reported_as_connection_loss(self) -> None:
         emit = mock.Mock()

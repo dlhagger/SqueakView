@@ -92,6 +92,11 @@ class FakeBackend:
 
     def abort_run(self, error: str) -> bool:
         self.abort_calls.append(error)
+        if self.phase == RunPhase.STOPPING and self.finalization_in_progress:
+            # The real backend serializes abort/finalize through its
+            # finalization lock. Model that ownership in this lightweight fake.
+            self.stop_release.wait()
+            return False
         if self.phase in {RunPhase.CREATED, RunPhase.STARTING, RunPhase.RECORDING}:
             self.phase = RunPhase.FAILED
             return True
@@ -116,6 +121,8 @@ class SupervisorServerTests(unittest.TestCase):
         self.backend.stop_release.set()
         if self.server._loss_thread is not None:
             self.server._loss_thread.join(timeout=2)
+        if self.server._async_stop_thread is not None:
+            self.server._async_stop_thread.join(timeout=2)
         self.temp_dir.cleanup()
 
     def _worker(self) -> threading.Thread:
@@ -173,6 +180,7 @@ class SupervisorServerTests(unittest.TestCase):
         self.assertNotEqual(self.backend.phase, RunPhase.RECORDING)
 
     def test_gui_loss_waits_for_in_progress_finalization(self) -> None:
+        self.backend.phase = RunPhase.RECORDING
         self.backend.block_stop = True
         worker = self._worker()
         self.server._commands.put(CommandEnvelope("stop_run", "stop-1"))
@@ -183,11 +191,75 @@ class SupervisorServerTests(unittest.TestCase):
         self.assertTrue(self.server._loss_thread.is_alive())
         self.backend.stop_release.set()
         self.server._loss_thread.join(2)
+        self.server._async_stop_thread.join(2)
         worker.join(2)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(self.backend.phase, RunPhase.FINALIZED)
         self.assertEqual(self.backend.abort_calls, ["operator GUI lost"])
+
+    def test_stop_command_acknowledges_while_long_finalizer_is_still_running(self) -> None:
+        self.backend.phase = RunPhase.RECORDING
+        self.backend.block_stop = True
+
+        started = time.monotonic()
+        result, stop = self.server._dispatch(
+            CommandEnvelope("stop_run", "stop-async")
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertFalse(stop)
+        self.assertTrue(result["accepted"])
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(self.backend.stop_entered.wait(1))
+        self.assertTrue(self.server._async_stop_thread.is_alive())
+
+        duplicate, _ = self.server._dispatch(
+            CommandEnvelope("stop_run", "stop-async-duplicate")
+        )
+        self.assertFalse(duplicate["accepted"])
+
+        self.backend.stop_release.set()
+        self.server._async_stop_thread.join(2)
+        self.assertEqual(self.backend.phase, RunPhase.FINALIZED)
+
+    def test_blocked_finalizer_does_not_block_stop_ack_or_progress_snapshot(self) -> None:
+        self.backend.phase = RunPhase.RECORDING
+        self.backend.block_stop = True
+        responses: dict[str, dict] = {}
+        response_ready = threading.Event()
+
+        def enqueue(name, payload, **kwargs):
+            if name == "command_result":
+                responses[str(kwargs.get("request_id"))] = dict(payload)
+                response_ready.set()
+            return True
+
+        with mock.patch.object(self.server, "_enqueue", side_effect=enqueue):
+            worker = self._worker()
+            self.server._commands.put(CommandEnvelope("stop_run", "slow-stop"))
+            self.assertTrue(self.backend.stop_entered.wait(1))
+            self.assertTrue(response_ready.wait(1))
+            self.assertTrue(responses["slow-stop"]["ok"])
+            self.assertTrue(responses["slow-stop"]["result"]["accepted"])
+
+            response_ready.clear()
+            self.server._commands.put(CommandEnvelope("snapshot", "during-stop"))
+            self.assertTrue(response_ready.wait(1))
+            self.assertEqual(
+                responses["during-stop"]["result"]["phase"], "stopping"
+            )
+            self.assertTrue(
+                responses["during-stop"]["result"]["finalization_in_progress"]
+            )
+
+            self.backend.stop_release.set()
+            self.server._async_stop_thread.join(2)
+            self.server._stopping.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.backend.phase, RunPhase.FINALIZED)
 
     def test_duplicate_mutation_request_replays_without_reexecution(self) -> None:
         worker = self._worker()
