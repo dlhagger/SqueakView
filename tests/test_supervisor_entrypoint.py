@@ -54,6 +54,7 @@ class SupervisorEntrypointTests(unittest.TestCase):
             server = mock.Mock()
             server.serve.return_value = 0
             server.last_error = None
+            server.last_warning = None
             socket_path = Path(temp_dir) / "operator.sock"
             mirror = mock.Mock()
             with (

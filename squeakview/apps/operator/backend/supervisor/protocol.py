@@ -10,8 +10,10 @@ control; this module owns only immutable messages and their framing.
 import json
 import math
 import re
+import select
 import socket
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -384,16 +386,64 @@ class SocketEnvelopeReader:
 class SocketEnvelopeWriter:
     """Thread-safe writer for async events and responses on one connection."""
 
-    def __init__(self, connection: socket.socket) -> None:
+    def __init__(
+        self,
+        connection: socket.socket,
+        *,
+        send_timeout_s: float | None = None,
+    ) -> None:
         self._connection = connection
         self._lock = threading.Lock()
+        self._send_timeout_s = (
+            None if send_timeout_s is None else max(0.001, float(send_timeout_s))
+        )
+
+    def _send_with_deadline(self, frame: bytes) -> None:
+        """Send one complete frame without inheriting the short read timeout.
+
+        The supervisor reads frequently to enforce its heartbeat lease, while
+        outbound delivery may legitimately need the whole lease interval when
+        the GUI is momentarily busy. ``MSG_DONTWAIT`` plus ``select`` gives the
+        writer its own bounded deadline without changing the socket timeout
+        observed concurrently by the reader thread.
+        """
+
+        assert self._send_timeout_s is not None
+        deadline = time.monotonic() + self._send_timeout_s
+        pending = memoryview(frame)
+        flags = getattr(socket, "MSG_DONTWAIT", 0)
+        while pending:
+            try:
+                sent = self._connection.send(pending, flags)
+            except (BlockingIOError, socket.timeout):
+                sent = None
+            except InterruptedError:
+                continue
+            if sent is not None and sent > 0:
+                pending = pending[sent:]
+                continue
+            if sent == 0:
+                raise BrokenPipeError("IPC socket closed during frame delivery")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"IPC frame delivery exceeded {self._send_timeout_s:.3f}s"
+                )
+            _, writable, _ = select.select([], [self._connection], [], remaining)
+            if not writable:
+                raise TimeoutError(
+                    f"IPC frame delivery exceeded {self._send_timeout_s:.3f}s"
+                )
 
     def send(self, envelope: Envelope) -> None:
-        # Encoding is pure and may proceed concurrently.  Exactly one complete
-        # frame is handed to sendall while holding the connection's write lock.
+        # Encoding is pure and may proceed concurrently. Exactly one complete
+        # frame is delivered while holding the connection's write lock.
         frame = encode_envelope(envelope)
         with self._lock:
-            self._connection.sendall(frame)
+            if self._send_timeout_s is None:
+                self._connection.sendall(frame)
+            else:
+                self._send_with_deadline(frame)
 
 
 def send_envelope(connection: socket.socket, envelope: Envelope) -> None:

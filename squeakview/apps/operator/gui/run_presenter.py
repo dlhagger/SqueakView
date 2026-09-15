@@ -255,7 +255,6 @@ class RunLifecycleController(QtCore.QObject):
         view._set_bottle_completion_pending(False)
         if view.backend.current_snapshot.run_dir is not None:
             view._set_bottle_status("Initial bottle info saved with current run.")
-        view.dashboard.clear_jam_alert()
         view.preview.show_hint(False)
         view.preview.set_preview_enabled(True)
         # start_run confirms that startup orchestration handed off a live

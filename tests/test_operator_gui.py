@@ -316,6 +316,73 @@ class BehaviorDashboardTests(unittest.TestCase):
         self.assertEqual(dashboard._observed_pellet_mode, "both")
         self.assertEqual(dashboard.counters.get("PELLET"), 2)
 
+    def test_feed_jam_persists_until_authoritative_clear_ack(self) -> None:
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        try:
+            dashboard.ingest(
+                "FEED_JAM,100,200,nan,3,69420,69420,69420,Feeding,"
+                "Pellet did not trigger sensor"
+            )
+            self.assertTrue(dashboard.feeder_jammed)
+            self.assertFalse(dashboard._jam_banner.isHidden())
+            self.assertTrue(dashboard._clear_jam_btn.isEnabled())
+            self.assertIn("PHYSICAL INSPECTION", dashboard._jam_title.text())
+
+            dashboard.ingest("FEED_STOP,101,201,nan,3,69420,69420,69420,Feeding,Complete")
+            self.assertTrue(dashboard.feeder_jammed)
+
+            dashboard.ingest("ACK_CLEAR_JAM")
+            self.assertFalse(dashboard.feeder_jammed)
+            self.assertTrue(dashboard._jam_banner.isHidden())
+            self.assertFalse(dashboard._clear_jam_btn.isEnabled())
+        finally:
+            dashboard.close()
+
+    def test_feed_jammed_nack_activates_state_and_click_is_deduplicated(self) -> None:
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        requests: list[bool] = []
+        dashboard.clear_jam_requested.connect(lambda: requests.append(True))
+        try:
+            dashboard.ingest("NACK,FEED,JAMMED")
+            self.assertTrue(dashboard.feeder_jammed)
+            dashboard._clear_jam_btn.click()
+            dashboard._request_clear_jam()
+
+            self.assertEqual(requests, [True])
+            self.assertTrue(dashboard.clear_jam_pending)
+            self.assertFalse(dashboard._clear_jam_btn.isEnabled())
+        finally:
+            dashboard.close()
+
+    def test_clear_jam_failures_keep_warning_active_with_useful_message(self) -> None:
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        try:
+            dashboard.ingest("NACK,FEED,JAMMED")
+            for response, expected in (
+                ("NACK,CLEAR_JAM,FEED_ACTIVE", "current feed stops"),
+                ("NACK,CLEAR_JAM,NOT_JAMMED", "no jam is currently latched"),
+            ):
+                with self.subTest(response=response):
+                    dashboard._request_clear_jam()
+                    dashboard.ingest(response)
+                    self.assertTrue(dashboard.feeder_jammed)
+                    self.assertFalse(dashboard.clear_jam_pending)
+                    self.assertTrue(dashboard._clear_jam_btn.isEnabled())
+                    self.assertIn(expected, dashboard._jam_detail.text())
+
+            dashboard._request_clear_jam()
+            dashboard.clear_jam_failed("Controller disconnected; jam remains active.")
+            self.assertTrue(dashboard.feeder_jammed)
+            self.assertIn("disconnected", dashboard._jam_detail.text())
+        finally:
+            dashboard.close()
+
 
 if __name__ == "__main__":
     unittest.main()

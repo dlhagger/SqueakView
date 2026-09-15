@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -116,6 +117,8 @@ class MainWindow(QtWidgets.QMainWindow):
     run_failed = QtCore.Signal(str)
     backend_event = QtCore.Signal(object)
     dashboard_event = QtCore.Signal(object)
+    clear_jam_finished = QtCore.Signal(str)
+    clear_jam_failed = QtCore.Signal(str)
 
     def __init__(self, *, backend_factory=None) -> None:
         super().__init__()
@@ -139,6 +142,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_failed.connect(self._on_backend_run_failed)
         self.backend_event.connect(self._on_backend_event)
         self.dashboard_event.connect(self._on_dashboard_event)
+        self.clear_jam_finished.connect(self._on_clear_jam_finished)
+        self.clear_jam_failed.connect(self._on_clear_jam_failed)
+        self._clear_jam_thread = None
 
         self.backend: BackendProtocol = (backend_factory or _production_backend_factory)(
             self._emit_log,
@@ -318,6 +324,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn = view.stop_btn
         self.preview = view.preview
         self.dashboard = view.dashboard
+        clear_jam_handler = getattr(self, "_on_clear_jam_requested", None)
+        if callable(clear_jam_handler):
+            self.dashboard.clear_jam_requested.connect(clear_jam_handler)
         self._profile_group = view.profile_group
         self.experiment_combo = view.experiment_combo
         self.new_experiment_btn = view.new_experiment_btn
@@ -532,7 +541,65 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(object)
     def _on_dashboard_event(self, event: DashboardEvent) -> None:
+        was_jammed = self.dashboard.feeder_jammed
         self.dashboard.ingest_event(event)
+        if self.dashboard.feeder_jammed and not was_jammed:
+            behavior_dock = self.workspace.cards.get("behavior")
+            if behavior_dock is not None:
+                behavior_dock.show()
+                behavior_dock.raise_()
+
+    @QtCore.Slot()
+    def _on_clear_jam_requested(self) -> None:
+        if self._clear_jam_thread is not None and self._clear_jam_thread.is_alive():
+            return
+        self._emit_log("[GUI] Sending CLEAR_JAM after operator confirmation")
+
+        def worker() -> None:
+            try:
+                response = self.backend.clear_feeder_jam()
+            except Exception as exc:
+                self.clear_jam_failed.emit(str(exc))
+                return
+            self.clear_jam_finished.emit(response)
+
+        self._clear_jam_thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name="squeakview-clear-feeder-jam",
+        )
+        self._clear_jam_thread.start()
+
+    @QtCore.Slot(str)
+    def _on_clear_jam_finished(self, response: str) -> None:
+        if response == "ACK_CLEAR_JAM":
+            self.dashboard.clear_jam_alert()
+            self._emit_log("[GUI] Feeder jam latch cleared by ACK_CLEAR_JAM")
+        elif response == "NACK,CLEAR_JAM,FEED_ACTIVE":
+            message = (
+                "Clear Jam was rejected: wait until the current feed stops, "
+                "then inspect the mechanism and try again."
+            )
+            self.dashboard.clear_jam_failed(message)
+            self._emit_log(f"[GUI] {message}")
+        elif response == "NACK,CLEAR_JAM,NOT_JAMMED":
+            message = (
+                "The firmware reports that no jam is currently latched. "
+                "The warning remains active because no ACK_CLEAR_JAM was received."
+            )
+            self.dashboard.clear_jam_failed(message)
+            self._emit_log(f"[GUI] {message}")
+        else:
+            self._on_clear_jam_failed(f"unrecognized controller response: {response}")
+
+    @QtCore.Slot(str)
+    def _on_clear_jam_failed(self, error: str) -> None:
+        message = (
+            f"Clear Jam failed: {error}. Inspect and physically clear the feeder; "
+            "the jam warning remains active."
+        )
+        self.dashboard.clear_jam_failed(message)
+        self._emit_log(f"[GUI] {message}")
 
     @QtCore.Slot()
     def _send_supervisor_heartbeat(self) -> None:

@@ -949,6 +949,16 @@ class OperatorBackend:
     def stop_run(self) -> None:
         self._finalize_run(final_state="finalized")
 
+    def clear_feeder_jam(self) -> str:
+        """Clear the firmware latch through the currently owned serial link."""
+
+        handle = self.state.serial
+        if handle is None:
+            raise ConnectionError(
+                "the controller is not connected; the feeder jam remains latched"
+            )
+        return handle.clear_feeder_jam(timeout_s=2.0)
+
     def cancel_operator_lease(self) -> None:
         """Persistently cancel startup and wake any readiness wait."""
 

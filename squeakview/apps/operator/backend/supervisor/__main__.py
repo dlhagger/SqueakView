@@ -145,6 +145,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = 1
         if server.last_error:
             print(f"SqueakView supervisor failed: {server.last_error}", file=sys.stderr)
+        if server.last_warning:
+            print(f"SqueakView supervisor warning: {server.last_warning}", file=sys.stderr)
         return result
     finally:
         watcher_finished.set()

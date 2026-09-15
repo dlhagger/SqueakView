@@ -50,6 +50,7 @@ _STRING_TUPLE_FIELDS = {"camera_serials"}
 _MUTATING_COMMANDS = {
     "start_run",
     "stop_run",
+    "clear_feeder_jam",
     "save_bottle_measurements",
     "shutdown_server",
 }
@@ -203,6 +204,11 @@ class SupervisorServer:
         self._operation_lock = threading.Lock()
         self._async_stop_lock = threading.Lock()
         self._async_stop_thread: threading.Thread | None = None
+        # Once Stop has been accepted, acquisition shutdown and finalization
+        # are owned by the supervisor rather than by the GUI connection.  A
+        # presentation-channel failure after this point must not invalidate an
+        # otherwise sound scientific run.
+        self._stop_accepted = threading.Event()
         self._mutation_ledger: OrderedDict[
             str, tuple[str, Mapping[str, object], bool]
         ] = OrderedDict()
@@ -211,6 +217,7 @@ class SupervisorServer:
         self.gui_lease_timeout_s = max(1.0, float(gui_lease_timeout_s))
         self._monotonic = monotonic
         self.last_error: str | None = None
+        self.last_warning: str | None = None
         self.backend = backend_factory(
             self._emit_log,
             self._emit_dashboard,
@@ -272,7 +279,13 @@ class SupervisorServer:
         )
 
     def _sender(self, client: socket.socket) -> None:
-        writer = SocketEnvelopeWriter(client)
+        # The socket's 250 ms timeout belongs to the receive loop so heartbeat
+        # expiry is noticed promptly. Outbound traffic receives the complete
+        # GUI lease interval before the connection is declared lost.
+        writer = SocketEnvelopeWriter(
+            client,
+            send_timeout_s=self.gui_lease_timeout_s,
+        )
         while not self._stopping.is_set():
             item: _Outbound | None = None
             try:
@@ -301,8 +314,12 @@ class SupervisorServer:
                 )
                 if item.sent is not None:
                     item.sent.set()
-            except (OSError, ProtocolError):
-                self._signal_client_loss("supervisor IPC send failed")
+            except (OSError, ProtocolError) as exc:
+                detail = str(exc).strip() or repr(exc)
+                self._signal_client_loss(
+                    "supervisor IPC send failed: "
+                    f"{type(exc).__name__}: {detail}"
+                )
                 return
 
     def _snapshot(self) -> dict[str, object]:
@@ -373,7 +390,13 @@ class SupervisorServer:
                 daemon=False,
             )
             self._async_stop_thread = worker
-            worker.start()
+            self._stop_accepted.set()
+            try:
+                worker.start()
+            except Exception:
+                self._stop_accepted.clear()
+                self._async_stop_thread = None
+                raise
             return True
 
     def _dispatch(self, command: CommandEnvelope) -> tuple[object, bool]:
@@ -386,6 +409,7 @@ class SupervisorServer:
             config_payload = payload.get("config", payload)
             if not isinstance(config_payload, Mapping):
                 raise ValueError("start_run config must be an object")
+            self._stop_accepted.clear()
             started = self.backend.start_run(_request_from_payload(config_payload))
             return {
                 "started": started,
@@ -395,6 +419,8 @@ class SupervisorServer:
         if command.name == "stop_run":
             accepted = self._request_async_stop()
             return {"accepted": accepted, "snapshot": self._snapshot()}, False
+        if command.name == "clear_feeder_jam":
+            return {"response": self.backend.clear_feeder_jam()}, False
         if command.name == "save_bottle_measurements":
             bottles = payload.get("bottles")
             if bottles is not None and not isinstance(bottles, Mapping):
@@ -507,18 +533,27 @@ class SupervisorServer:
             self.backend.abort_run("operator GUI lost")
 
     def _signal_client_loss(self, error: str | None = None) -> None:
+        stop_already_accepted = self._stop_accepted.is_set()
         with self._loss_lock:
             if (
                 error
                 and not self._graceful_shutdown.is_set()
-                and self.last_error is None
             ):
-                self.last_error = error
+                if stop_already_accepted:
+                    if self.last_warning is None:
+                        self.last_warning = (
+                            f"{error}; operator connection was lost after Stop was "
+                            "accepted, so durable finalization continued"
+                        )
+                elif self.last_error is None:
+                    self.last_error = error
             if self._client_lost.is_set():
                 return
             self._client_lost.set()
         self._stopping.set()
         self._close_client()
+        if stop_already_accepted:
+            return
         self.backend.cancel_operator_lease()
         self._loss_thread = threading.Thread(
             target=self._finalize_client_loss,

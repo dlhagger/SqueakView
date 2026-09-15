@@ -159,6 +159,22 @@ class SupervisorBackendProxyTest(unittest.TestCase):
         self.assertEqual(proxy.state.run_dir, Path("/tmp/run-1"))
         self.assertTrue(proxy.state.inference.is_running())
 
+    def test_clear_jam_command_returns_exact_controller_response(self) -> None:
+        proxy = self.proxy()
+
+        def serve() -> None:
+            command = self.fake.receive()
+            self.assertEqual(command.name, "clear_feeder_jam")
+            self.assertEqual(command.payload, {})
+            self.fake.respond(command, {"response": "ACK_CLEAR_JAM"})
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        try:
+            self.assertEqual(proxy.clear_feeder_jam(), "ACK_CLEAR_JAM")
+        finally:
+            thread.join()
+
     def test_malformed_start_snapshot_closes_lease_as_uncertain_active(self) -> None:
         proxy = self.proxy()
 

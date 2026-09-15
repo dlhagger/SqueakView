@@ -44,6 +44,27 @@ SERIAL_HEADER = [
 ]
 MAX_SERIAL_LINE_BYTES = 64 * 1024
 MAX_BUFFERED_SERIAL_ROWS = 1024
+CLEAR_JAM_ACK = "ACK_CLEAR_JAM"
+CLEAR_JAM_NACK_FEED_ACTIVE = "NACK,CLEAR_JAM,FEED_ACTIVE"
+CLEAR_JAM_NACK_NOT_JAMMED = "NACK,CLEAR_JAM,NOT_JAMMED"
+_CLEAR_JAM_RESPONSES = frozenset(
+    {
+        CLEAR_JAM_ACK,
+        CLEAR_JAM_NACK_FEED_ACTIVE,
+        CLEAR_JAM_NACK_NOT_JAMMED,
+    }
+)
+
+
+def _is_feeder_jam_protocol_line(line: str) -> bool:
+    """Keep latch state observable when routine serial logging is disabled."""
+
+    return (
+        line == "FEED_JAM"
+        or line.startswith("FEED_JAM,")
+        or line == "NACK,FEED,JAMMED"
+        or line in _CLEAR_JAM_RESPONSES
+    )
 
 
 def have_pyserial() -> bool:
@@ -89,6 +110,11 @@ class SerialHandle:
         self._ttl_seen = threading.Event()
         self._stop_ack_seen = threading.Event()
         self._stop_ack_count: int | None = None
+        self._clear_jam_lock = threading.Lock()
+        self._clear_jam_pending = False
+        self._clear_jam_response_seen = threading.Event()
+        self._clear_jam_response: str | None = None
+        self._clear_jam_error: str | None = None
         self._csv_lock = threading.Lock()
         self._csv_writer: csv.writer | None = None
         self._csv_file = None
@@ -170,6 +196,7 @@ class SerialHandle:
             self.last_error = detail
         if stop_reader:
             self._stop.set()
+        self._interrupt_clear_jam(detail)
         self.emit(f"[{timestamp()}] [SER] FATAL: {detail}")
         if self.on_fatal is not None:
             try:
@@ -264,6 +291,11 @@ class SerialHandle:
                 self._ttl_seen.clear()
             self._stop_ack_seen.clear()
             self._stop_ack_count = None
+            with self._clear_jam_lock:
+                self._clear_jam_pending = False
+                self._clear_jam_response = None
+                self._clear_jam_error = None
+                self._clear_jam_response_seen.clear()
             if run_dir is not None:
                 if not self.set_csv_path(run_dir):
                     raise OSError(self.fatal_error or "serial CSV setup failed")
@@ -321,7 +353,7 @@ class SerialHandle:
                                 "qualification-injected serial reader failure"
                             )
                         self._read_count += 1
-                        if self._emit_serial_logs:
+                        if self._emit_serial_logs or _is_feeder_jam_protocol_line(s):
                             self.emit(f"[{timestamp()}] 【SER】 {s}")
                         # Recording readiness requires evidence of an actual
                         # rising trigger edge, not arbitrary CAMERA_* status or
@@ -354,6 +386,7 @@ class SerialHandle:
                             except (IndexError, TypeError, ValueError):
                                 self._stop_ack_count = None
                             self._stop_ack_seen.set()
+                        self._ingest_clear_jam_response(s)
                         self._maybe_send_alert(s)
                     if len(buf) > self._max_line_bytes:
                         raise ValueError(
@@ -481,6 +514,62 @@ class SerialHandle:
         if type(fps) is not int or fps <= 0:
             raise ValueError("controller FPS must be a positive integer")
         self._send_line(f"START,{fps}", marker_before="START_SENT")
+
+    def _ingest_clear_jam_response(self, line: str) -> bool:
+        """Publish one exact CLEAR_JAM reply from the existing reader."""
+
+        if line not in _CLEAR_JAM_RESPONSES:
+            return False
+        with self._clear_jam_lock:
+            if self._clear_jam_pending and not self._clear_jam_response_seen.is_set():
+                self._clear_jam_response = line
+                self._clear_jam_response_seen.set()
+        return True
+
+    def _interrupt_clear_jam(self, error: str) -> None:
+        with self._clear_jam_lock:
+            if self._clear_jam_pending and not self._clear_jam_response_seen.is_set():
+                self._clear_jam_error = str(error).strip() or "serial connection lost"
+                self._clear_jam_response_seen.set()
+
+    def clear_feeder_jam(self, *, timeout_s: float = 2.0) -> str:
+        """Send one CLEAR_JAM command and await its exact response.
+
+        This method is called by a backend worker. The existing serial reader
+        fulfills the acknowledgement event; no second reader is created.
+        """
+
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+            raise ValueError("CLEAR_JAM timeout must be numeric")
+        timeout = float(timeout_s)
+        if not 0.0 < timeout <= 30.0:
+            raise ValueError("CLEAR_JAM timeout must be greater than zero and at most 30 seconds")
+        with self._clear_jam_lock:
+            if self._clear_jam_pending:
+                raise RuntimeError("CLEAR_JAM is already awaiting a controller response")
+            self._clear_jam_pending = True
+            self._clear_jam_response = None
+            self._clear_jam_error = None
+            self._clear_jam_response_seen.clear()
+        try:
+            self._send_line("CLEAR_JAM")
+            if not self._clear_jam_response_seen.wait(timeout=timeout):
+                raise TimeoutError(
+                    f"controller did not respond to CLEAR_JAM within {timeout:g}s"
+                )
+            with self._clear_jam_lock:
+                response = self._clear_jam_response
+                error = self._clear_jam_error
+            if error is not None:
+                raise ConnectionError(
+                    f"serial connection was lost while clearing the feeder jam: {error}"
+                )
+            if response not in _CLEAR_JAM_RESPONSES:
+                raise RuntimeError("CLEAR_JAM completed without a recognized response")
+            return response
+        finally:
+            with self._clear_jam_lock:
+                self._clear_jam_pending = False
 
     def wait_for_ttl(self, timeout_s: float = 3.0) -> bool:
         self.emit(f"[{timestamp()}] [SER] Waiting for camera TTL line (timeout {timeout_s:.1f}s) …")
@@ -633,6 +722,7 @@ class SerialHandle:
             self._unregister_atexit()
             return
         self.emit(f"[{timestamp()}] [SER] closing …")
+        self._interrupt_clear_jam("serial port closed")
         if self._watchdog_session is not None:
             self._watchdog_session.stop_worker()
         self._stop.set()

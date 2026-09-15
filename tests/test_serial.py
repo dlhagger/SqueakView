@@ -125,6 +125,172 @@ class SerialCsvTests(unittest.TestCase):
         self.assertEqual(self.handle.stop_ack_count, 3)
         self.assertIsNone(self.handle.fatal_error)
 
+    def test_clear_feeder_jam_writes_exact_command_and_returns_ack(self) -> None:
+        class ReplyingPort:
+            is_open = True
+
+            def __init__(self, handle: serial_util.SerialHandle) -> None:
+                self.handle = handle
+                self.writes: list[bytes] = []
+
+            def write(self, payload: bytes) -> None:
+                self.writes.append(payload)
+                self.handle._ingest_clear_jam_response("ACK_CLEAR_JAM")
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                self.is_open = False
+
+        port = ReplyingPort(self.handle)
+        self.handle.ser = port
+        self.handle._closed = False
+
+        self.assertEqual(self.handle.clear_feeder_jam(), "ACK_CLEAR_JAM")
+        self.assertEqual(port.writes, [b"CLEAR_JAM\n"])
+
+    def test_clear_feeder_jam_returns_each_firmware_nack(self) -> None:
+        for reply in (
+            "NACK,CLEAR_JAM,FEED_ACTIVE",
+            "NACK,CLEAR_JAM,NOT_JAMMED",
+        ):
+            with self.subTest(reply=reply):
+                handle = serial_util.SerialHandle("/dev/test", 115200, self.logs.append)
+
+                class ReplyingPort:
+                    is_open = True
+
+                    def write(self, _payload: bytes) -> None:
+                        handle._ingest_clear_jam_response(reply)
+
+                    def flush(self) -> None:
+                        pass
+
+                    def close(self) -> None:
+                        self.is_open = False
+
+                handle.ser = ReplyingPort()
+                handle._closed = False
+                try:
+                    self.assertEqual(handle.clear_feeder_jam(), reply)
+                finally:
+                    handle.close()
+
+    def test_clear_feeder_jam_timeout_and_disconnect_are_failures(self) -> None:
+        class SilentPort:
+            is_open = True
+
+            def write(self, _payload: bytes) -> None:
+                pass
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                self.is_open = False
+
+        self.handle.ser = SilentPort()
+        self.handle._closed = False
+        with self.assertRaises(TimeoutError):
+            self.handle.clear_feeder_jam(timeout_s=0.01)
+
+        def disconnect() -> None:
+            time.sleep(0.01)
+            self.handle._interrupt_clear_jam("USB disconnected")
+
+        thread = threading.Thread(target=disconnect)
+        thread.start()
+        with self.assertRaisesRegex(ConnectionError, "USB disconnected"):
+            self.handle.clear_feeder_jam(timeout_s=1.0)
+        thread.join()
+
+    def test_clear_feeder_jam_rejects_duplicate_pending_command(self) -> None:
+        wrote = threading.Event()
+
+        class SilentPort:
+            is_open = True
+
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, payload: bytes) -> None:
+                self.writes.append(payload)
+                wrote.set()
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                self.is_open = False
+
+        port = SilentPort()
+        self.handle.ser = port
+        self.handle._closed = False
+        result: list[str] = []
+
+        def first_request() -> None:
+            result.append(self.handle.clear_feeder_jam(timeout_s=1.0))
+
+        thread = threading.Thread(target=first_request)
+        thread.start()
+        self.assertTrue(wrote.wait(1.0))
+        with self.assertRaisesRegex(RuntimeError, "already awaiting"):
+            self.handle.clear_feeder_jam(timeout_s=1.0)
+        self.handle._ingest_clear_jam_response("ACK_CLEAR_JAM")
+        thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, ["ACK_CLEAR_JAM"])
+        self.assertEqual(port.writes, [b"CLEAR_JAM\n"])
+
+    def test_clear_feeder_jam_write_failure_is_not_success(self) -> None:
+        class BrokenPort:
+            is_open = True
+
+            def write(self, _payload: bytes) -> None:
+                raise OSError("write failed")
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                self.is_open = False
+
+        self.handle.ser = BrokenPort()
+        self.handle._closed = False
+        with self.assertRaisesRegex(RuntimeError, "serial write failed"):
+            self.handle.clear_feeder_jam()
+
+    def test_jam_protocol_reaches_event_path_when_routine_logging_is_disabled(self) -> None:
+        class JamPort:
+            is_open = True
+
+            def __init__(self, handle: serial_util.SerialHandle) -> None:
+                self.handle = handle
+                self.sent = False
+
+            def read(self, _size: int) -> bytes:
+                if not self.sent:
+                    self.sent = True
+                    return (
+                        b"CAMERA_HIGH,1,2,nan,1\n"
+                        b"FEED_JAM,10,20,nan,1,69420,69420,69420,Feeding,stuck\n"
+                    )
+                self.handle._stop.set()
+                return b""
+
+            def close(self) -> None:
+                self.is_open = False
+
+        self.handle._emit_serial_logs = False
+        self.handle.ser = JamPort(self.handle)
+        self.handle._closed = False
+        self.handle._pump()
+
+        self.assertFalse(any("CAMERA_HIGH" in line for line in self.logs))
+        self.assertTrue(any("FEED_JAM" in line for line in self.logs))
+
     def test_only_camera_high_confirms_trigger_readiness(self) -> None:
         self.handle.set_csv_path(self.run_dir)
 

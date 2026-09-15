@@ -47,6 +47,7 @@ _MAX_PENDING_HEARTBEATS = 1
 _MUTATING_COMMANDS = {
     "start_run",
     "stop_run",
+    "clear_feeder_jam",
     "save_bottle_measurements",
     "shutdown_server",
 }
@@ -420,6 +421,19 @@ class SupervisorBackendProxy:
         if not isinstance(result, Mapping):
             raise RuntimeError("supervisor returned invalid bottle metadata")
         return dict(result)
+
+    def clear_feeder_jam(self) -> str:
+        result = self._command("clear_feeder_jam", {})
+        if not isinstance(result, Mapping) or set(result) != {"response"}:
+            raise RuntimeError("supervisor returned an invalid CLEAR_JAM result")
+        response = result["response"]
+        if response not in {
+            "ACK_CLEAR_JAM",
+            "NACK,CLEAR_JAM,FEED_ACTIVE",
+            "NACK,CLEAR_JAM,NOT_JAMMED",
+        }:
+            raise RuntimeError("supervisor returned an unknown CLEAR_JAM response")
+        return str(response)
 
     def shutdown(self) -> None:
         if self._closed.is_set():
