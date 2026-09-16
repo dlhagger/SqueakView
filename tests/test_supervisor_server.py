@@ -28,12 +28,41 @@ from squeakview.apps.operator.backend.supervisor.server import (
     _json_value,
 )
 from squeakview.common.dashboard import DashboardEvent
+from squeakview.project import (
+    AppPaths,
+    Project,
+    ProjectMetadata,
+    ProjectPaths,
+    RuntimeContext,
+    UserPaths,
+)
+
+
+def _runtime_context(root: Path) -> RuntimeContext:
+    app_root = root / "app"
+    project_root = root / "project"
+    app_root.mkdir(exist_ok=True)
+    project_root.mkdir(exist_ok=True)
+    return RuntimeContext(
+        app=AppPaths.from_root(app_root),
+        project=Project(
+            paths=ProjectPaths.from_existing_root(project_root),
+            metadata=ProjectMetadata.create("Test"),
+        ),
+        user=UserPaths(
+            config=root / "user/config",
+            state=root / "user/state",
+            runtime=root / "user/runtime",
+            projects_parent=root / "projects",
+        ),
+    )
 
 
 class FakeBackend:
-    def __init__(self, emit, ingest, *, acquisition_owner) -> None:
+    def __init__(self, emit, ingest, *, runtime_context, acquisition_owner) -> None:
         self.emit = emit
         self.ingest = ingest
+        self.runtime_context = runtime_context
         self.acquisition_owner = acquisition_owner
         self.subscriber = None
         self.phase = RunPhase.IDLE
@@ -117,7 +146,12 @@ class SupervisorServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.socket_path = Path(self.temp_dir.name) / "operator.sock"
-        self.server = SupervisorServer(self.socket_path, backend_factory=FakeBackend)
+        self.runtime_context = _runtime_context(Path(self.temp_dir.name))
+        self.server = SupervisorServer(
+            self.socket_path,
+            runtime_context=self.runtime_context,
+            backend_factory=FakeBackend,
+        )
         self.backend: FakeBackend = self.server.backend
 
     def tearDown(self) -> None:
@@ -432,6 +466,7 @@ class SupervisorServerTests(unittest.TestCase):
         clock = [0.0]
         server = SupervisorServer(
             self.socket_path,
+            runtime_context=self.runtime_context,
             backend_factory=FakeBackend,
             gui_lease_timeout_s=5.0,
             monotonic=lambda: clock[0],
@@ -590,6 +625,7 @@ class SupervisorServerTests(unittest.TestCase):
         clock = [0.0]
         server = SupervisorServer(
             self.socket_path,
+            runtime_context=self.runtime_context,
             backend_factory=FakeBackend,
             gui_lease_timeout_s=1.0,
             monotonic=lambda: clock[0],
@@ -630,7 +666,10 @@ class SupervisorServerTests(unittest.TestCase):
         self.assertEqual(self.server.last_error, "supervisor IPC send failed")
 
     def test_backend_abort_seam_wakes_startup_and_fails_active_run(self) -> None:
-        backend = OperatorBackend(lambda _line: None)
+        backend = OperatorBackend(
+            lambda _line: None,
+            runtime_context=self.runtime_context,
+        )
         backend._state_machine.transition(RunPhase.CREATED)
         backend._run_finalized = False
         with mock.patch.object(backend, "_finalize_run", return_value=True) as finalize:
@@ -644,7 +683,10 @@ class SupervisorServerTests(unittest.TestCase):
         )
 
     def test_backend_abort_waits_through_nonterminal_finalization_phase(self) -> None:
-        backend = OperatorBackend(lambda _line: None)
+        backend = OperatorBackend(
+            lambda _line: None,
+            runtime_context=self.runtime_context,
+        )
         backend._state_machine.transition(RunPhase.CREATED)
         backend._state_machine.transition(RunPhase.STARTING)
         backend._state_machine.transition(RunPhase.STOPPING)
@@ -657,7 +699,10 @@ class SupervisorServerTests(unittest.TestCase):
         )
 
     def test_lease_loss_during_successful_finalizer_forces_failed_terminal_state(self) -> None:
-        backend = OperatorBackend(lambda _line: None)
+        backend = OperatorBackend(
+            lambda _line: None,
+            runtime_context=self.runtime_context,
+        )
         backend._state_machine.transition(RunPhase.CREATED)
         backend._run_finalized = False
         backend.state.run_dir = self.socket_path.parent / "run"

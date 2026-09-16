@@ -210,7 +210,7 @@ class PreviewWidget(QtWidgets.QWidget):
 
     def _load_logo(self) -> QtGui.QPixmap | None:
         try:
-            logo_path = squeakview_config.WORKSPACE / "SqueakView_logo.png"
+            logo_path = squeakview_config.APP_ROOT / "SqueakView_logo.png"
             if logo_path.exists():
                 pix = QtGui.QPixmap(str(logo_path))
                 return pix if not pix.isNull() else None

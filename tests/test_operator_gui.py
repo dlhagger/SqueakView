@@ -241,7 +241,11 @@ class SessionLauncherSubjectScopeTest(unittest.TestCase):
             SubjectProfile(name="Assigned", subject_id="assigned"),
             SubjectProfile(name="Unassigned", subject_id="unassigned"),
         ]
-        dialog = SessionLauncherDialog(base_config={}, profile_store=store)
+        dialog = SessionLauncherDialog(
+            base_config={},
+            profile_store=store,
+            project=mock.Mock(),
+        )
         dialog.experiment_combo.setCurrentIndex(1)
         return dialog
 

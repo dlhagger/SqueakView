@@ -82,7 +82,9 @@ class StartupServiceTests(unittest.TestCase):
 
         return startup.StartupHooks(
             log=lambda message: self.events.append(f"log:{message}"),
-            resolve_workspace_path=lambda path: Path(path).resolve(),
+            resolve_task_path=lambda path: Path(path).resolve(),
+            resolve_model_path=lambda path: Path(path).resolve(),
+            resolve_failure_plan_path=lambda path: Path(path).resolve(),
             load_failure_plan=lambda _path: (_ for _ in ()).throw(AssertionError("unexpected failure plan")),
             validate_model=lambda _path: (_ for _ in ()).throw(AssertionError("unexpected model")),
             assert_storage_ready=lambda: self.events.append("storage") or {"free_bytes": 1_000_000},
@@ -348,7 +350,7 @@ class StartupServiceTests(unittest.TestCase):
         )
 
         self.assertFalse(result.started)
-        self.assertIn("build_engine/build_engine.ipynb", result.error)
+        self.assertIn("Project Setup", result.error)
         self.assertNotIn("storage", self.events)
         self.assertNotIn("lock-acquire", self.events)
 

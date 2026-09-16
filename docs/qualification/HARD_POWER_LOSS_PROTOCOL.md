@@ -7,8 +7,9 @@ software paths rather than loss of input power.
 
 ## Preconditions
 
-1. Commit the exact candidate build and rebuild the model engine with the
-   schema-3 notebook manifest. Confirm ordinary short GUI runs qualify first.
+1. Commit the exact candidate build and rebuild the model engine through
+   Project Setup to produce its schema-3 manifest. Confirm ordinary short GUI
+   runs qualify first.
 2. Launch the GUI from a standalone terminal, with the serial controller and
    camera connected exactly as they will be in production.
 3. Record the Jetson supply, storage device/filesystem, power mode, model hash,

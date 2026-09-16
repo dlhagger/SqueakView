@@ -7,6 +7,14 @@ time is 136 hours 40 minutes (eight five-minute, eight one-hour, and eight
 16-hour runs), before startup, finalization, review, reruns, and storage-copy
 time. Plan capacity and operator coverage accordingly.
 
+All `qualification/...` paths below are relative to the active scientific
+project, not the application repository. Before running the commands, use the
+application root as the working directory and export the project explicitly:
+
+```bash
+export SQUEAKVIEW_PROJECT="/absolute/path/to/My Project"
+```
+
 ## Prepare the checklist
 
 List the canonical case IDs and all required factors without accessing a camera
@@ -20,7 +28,7 @@ Create a checklist containing every case ID. Existing files are never replaced:
 
 ```bash
 .venv/bin/python scripts/qualify_matrix.py \
-  --init-assignments qualification/assignments.local.yaml
+  --init-assignments "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml"
 ```
 
 Each value initially is `null`, which means unassigned. Keep this file for the
@@ -31,7 +39,7 @@ Print the first unassigned case as a read-only worksheet:
 
 ```bash
 .venv/bin/python scripts/qualify_matrix.py \
-  qualification/assignments.local.yaml \
+  "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
   --next-case
 ```
 
@@ -93,7 +101,7 @@ Record the run with the canonical case ID printed by `--list-cases`:
 
 ```bash
 .venv/bin/python scripts/qualify_matrix.py \
-  qualification/assignments.local.yaml \
+  "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
   --assign '<case-id>' '/absolute/path/to/completed/run'
 ```
 
@@ -104,7 +112,7 @@ directory remains untouched.
 
 ## Limits and evaluation
 
-`qualification/limits.v1.yaml` is deliberately measurement-only. Evaluating
+`$SQUEAKVIEW_PROJECT/qualification/limits.v1.yaml` is deliberately measurement-only. Evaluating
 against it produces `incomplete`, even when capture integrity passes. Use the
 short and sustained baseline evidence to create a separately reviewed,
 versioned limits file, fill every required finite threshold, and set
@@ -117,9 +125,9 @@ default report:
 
 ```bash
 .venv/bin/python scripts/qualify_matrix.py \
-  qualification/assignments.local.yaml \
-  --limits qualification/<reviewed-validated-limits>.yaml \
-  --output qualification/results/<campaign>-matrix-report.json
+  "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
+  --limits "$SQUEAKVIEW_PROJECT/qualification/<reviewed-validated-limits>.yaml" \
+  --output "$SQUEAKVIEW_PROJECT/qualification/results/<campaign>-matrix-report.json"
 ```
 
 Exit status is `0` only for a fully passed matrix, `1` for any failed cell, and
@@ -150,10 +158,10 @@ command never copies, archives, or changes run data:
 
 ```bash
 .venv/bin/python scripts/archive_qualification_campaign.py \
-  --matrix qualification/matrix.v1.yaml \
-  --assignments qualification/assignments.local.yaml \
-  --report qualification/results/<campaign>-matrix-report.json \
-  --limits qualification/<reviewed-validated-limits>.yaml \
+  --matrix "$SQUEAKVIEW_PROJECT/qualification/matrix.v1.yaml" \
+  --assignments "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
+  --report "$SQUEAKVIEW_PROJECT/qualification/results/<campaign>-matrix-report.json" \
+  --limits "$SQUEAKVIEW_PROJECT/qualification/<reviewed-validated-limits>.yaml" \
   --inventory /absolute/archive-staging/<campaign>-inventory.json
 ```
 

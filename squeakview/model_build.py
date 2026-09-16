@@ -151,6 +151,40 @@ def cleanup_staging_package(path: Path) -> None:
     shutil.rmtree(container, ignore_errors=True)
 
 
+def cleanup_stale_staging_packages(
+    models_dir: Path,
+    model_name: str,
+) -> tuple[Path, ...]:
+    """Remove unpublished containers for one model while its project is locked.
+
+    Callers must hold the project ownership lock. Refusing symlinks and special
+    files keeps recovery bounded to real children of the selected models root.
+    """
+
+    models_dir = Path(models_dir).resolve(strict=True)
+    if not models_dir.is_dir():
+        raise ValueError(f"models directory must be a directory: {models_dir}")
+    if not model_name or Path(model_name).name != model_name:
+        raise ValueError("model_name must be one path component")
+    prefix = f".{model_name}.build-"
+    removed: list[Path] = []
+    for candidate in sorted(models_dir.iterdir()):
+        if not candidate.name.startswith(prefix):
+            continue
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise ValueError(
+                f"refusing unsafe stale staging entry: {candidate}"
+            )
+        resolved = candidate.resolve(strict=True)
+        if resolved.parent != models_dir:
+            raise ValueError(
+                f"stale staging entry escapes models directory: {candidate}"
+            )
+        shutil.rmtree(resolved)
+        removed.append(resolved)
+    return tuple(removed)
+
+
 def _fsync_tree(root: Path) -> None:
     for directory, _subdirs, files in os.walk(root):
         directory_path = Path(directory)
@@ -248,6 +282,7 @@ def promote_model_package(
 
 __all__ = [
     "cleanup_staging_package",
+    "cleanup_stale_staging_packages",
     "create_staging_package",
     "promote_model_package",
     "run_trtexec_validation",

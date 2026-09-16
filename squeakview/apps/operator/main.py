@@ -7,7 +7,7 @@ from typing import Callable
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from squeakview import config as squeakview_config
+from squeakview.project import AppPaths
 from .gui.main_window import MainWindow
 
 
@@ -66,7 +66,7 @@ def main() -> int:
 
     splash = None
     app_icon = None
-    logo_path = squeakview_config.WORKSPACE / "SqueakView_logo.png"
+    logo_path = AppPaths.discover().logo
     if logo_path.exists():
         app_icon = QtGui.QIcon(str(logo_path))
         if not app_icon.isNull():

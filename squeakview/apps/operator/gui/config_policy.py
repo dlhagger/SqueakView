@@ -53,7 +53,9 @@ def collect_config(
     fields: ConfigFields,
     *,
     include_mode: bool,
-    resolve_path: Callable[[str], Path | None],
+    resolve_path: Callable[[str], Path | None] | None = None,
+    resolve_model_path: Callable[[str], Path | None] | None = None,
+    resolve_task_path: Callable[[str], Path | None] | None = None,
     validate_model: Callable[[Path], object],
 ) -> ConfigCollection:
     """Normalize a form snapshot and fail closed on invalid acquisition inputs."""
@@ -72,8 +74,19 @@ def collect_config(
             "Please enter valid numeric values for size, FPS, bitrate, and baud.",
         )
 
-    ds_cfg = resolve_path(fields.ds_cfg.strip()) if fields.inference_enabled else None
-    task_cfg = resolve_path(fields.task_cfg.strip())
+    model_resolver = resolve_model_path or resolve_path
+    task_resolver = resolve_task_path or resolve_path
+    if model_resolver is None or task_resolver is None:
+        raise TypeError("model and task path resolvers are required")
+    try:
+        ds_cfg = (
+            model_resolver(fields.ds_cfg.strip())
+            if fields.inference_enabled
+            else None
+        )
+        task_cfg = task_resolver(fields.task_cfg.strip())
+    except ValueError as exc:
+        return _failure("Invalid project path", str(exc))
     result: dict[str, Any] = {
         "width": width,
         "height": height,

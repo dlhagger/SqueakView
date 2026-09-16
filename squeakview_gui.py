@@ -9,11 +9,17 @@ import time
 from pathlib import Path
 
 from squeakview.common.log_mirror import LineBufferedLogMirror
+from squeakview.project import (
+    PROJECT_ENV,
+    AppPaths,
+    ProjectPaths,
+    UserPaths,
+    validate_external_output_path,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 LOG_ENV = "SQUEAKVIEW_LOGFILE"
-RUN_ENV = "SQUEAKVIEW_RUN_DIR"
 
 
 def _setup_logging() -> None:
@@ -26,19 +32,46 @@ def _setup_logging() -> None:
     print(f"[squeakview] Logging to {path}", flush=True)
 
 
-# Ensure the repo root is importable and set up logging in the current process.
-sys.path.insert(0, str(ROOT))
-if LOG_ENV not in os.environ:
-    ts = time.strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir_env = os.environ.get(RUN_ENV)
-    if run_dir_env:
-        os.environ[LOG_ENV] = str(Path(run_dir_env) / "squeakview_gui.log")
-    else:
-        os.environ[LOG_ENV] = str(ROOT / "runs" / "logs" / f"squeakview_gui_{ts}.log")
-_setup_logging()
+def _configure_logging() -> None:
+    app_paths = AppPaths.discover()
+    user_paths = UserPaths.discover()
+    user_paths.validate_for_app(app_paths)
+    raw_project = os.environ.get(PROJECT_ENV, "").strip()
+    project_paths = (
+        ProjectPaths.from_existing_root(Path(raw_project)) if raw_project else None
+    )
+    if project_paths is not None:
+        app_paths.validate_for_project(project_paths)
+        user_paths.validate_for_project(project_paths)
+    if not os.environ.get(LOG_ENV, "").strip():
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+        user_paths.ensure()
+        os.environ[LOG_ENV] = str(
+            user_paths.launch_logs / f"squeakview_gui_{ts}.log"
+        )
+    log_path = validate_external_output_path(
+        Path(os.environ[LOG_ENV]),
+        app=app_paths,
+        project=project_paths,
+        label="GUI launch log",
+    )
+    os.environ[LOG_ENV] = str(log_path)
+    _setup_logging()
 
-from squeakview.apps.operator import main as operator_main  # noqa: E402
+
+def main() -> int:
+    try:
+        _configure_logging()
+    except Exception as exc:
+        print(
+            f"[FATAL] SqueakView GUI logging configuration is invalid: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    from squeakview.apps.operator import main as operator_main
+
+    return operator_main.main()
 
 
 if __name__ == "__main__":
-    raise SystemExit(operator_main.main())
+    raise SystemExit(main())

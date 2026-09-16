@@ -535,6 +535,9 @@ class BackendFactoryPolicyTest(unittest.TestCase):
 
         backend = mock.sentinel.backend
         emit = mock.Mock()
+        project = mock.Mock()
+        project.paths.root = Path("/tmp/test-project")
+        session = mock.Mock(project=project)
         with (
             mock.patch.dict(
                 os.environ,
@@ -544,6 +547,15 @@ class BackendFactoryPolicyTest(unittest.TestCase):
             mock.patch.object(
                 main_window, "OperatorBackend", return_value=backend
             ) as backend_constructor,
+            mock.patch.object(
+                main_window, "project_from_environment", return_value=project
+            ),
+            mock.patch.object(
+                main_window.ProjectSession, "open", return_value=session
+            ),
+            mock.patch.object(main_window.UserPaths, "discover") as user_paths,
+            mock.patch.object(main_window.AppPaths, "discover"),
+            mock.patch.object(main_window, "RuntimeContext"),
         ):
             result = main_window._production_backend_factory(emit)
 
@@ -553,6 +565,7 @@ class BackendFactoryPolicyTest(unittest.TestCase):
             backend_constructor.call_args.kwargs["acquisition_owner"],
             "in_process_dev",
         )
+        user_paths.return_value.ensure.assert_called_once_with()
 
 
 if __name__ == "__main__":

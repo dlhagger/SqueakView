@@ -8,7 +8,6 @@ from typing import Callable, Mapping, Protocol
 
 from squeakview.apps.operator.backend.events import BackendEvent, RunSnapshot
 
-from squeakview import config as squeakview_config
 from squeakview.common.immutable import deep_freeze
 
 
@@ -21,7 +20,7 @@ class RunRequest:
     pixel_format: str | None = "Mono8"
     trigger_on: bool = False
     trigger_activation: str = "rising"
-    ds_cfg: Path | None = squeakview_config.DEFAULT_INFER_CONFIG
+    ds_cfg: Path | None = None
     inference_enabled: bool = True
     num_cameras: int = 1
     camera_serials: tuple[str, ...] = ()

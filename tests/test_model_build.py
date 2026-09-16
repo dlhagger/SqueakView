@@ -49,6 +49,37 @@ class ModelBuildPromotionTests(unittest.TestCase):
         self.assertEqual(config.read_text(), "valid\n")
         self.assertFalse(staging.exists())
 
+    def test_stale_cleanup_is_limited_to_selected_model_containers(self) -> None:
+        selected = self.stage()
+        other = model_build.create_staging_package(self.models, "other")
+        published = self.models / "mousehouse"
+        published.mkdir()
+
+        removed = model_build.cleanup_stale_staging_packages(
+            self.models,
+            "mousehouse",
+        )
+
+        self.assertEqual(removed, (selected.parent.resolve(),))
+        self.assertFalse(selected.parent.exists())
+        self.assertTrue(other.parent.is_dir())
+        self.assertTrue(published.is_dir())
+
+    def test_stale_cleanup_refuses_matching_symlink(self) -> None:
+        outside = Path(self.temp_dir.name) / "outside"
+        outside.mkdir()
+        link = self.models / ".mousehouse.build-unsafe"
+        link.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(ValueError, "unsafe stale staging entry"):
+            model_build.cleanup_stale_staging_packages(
+                self.models,
+                "mousehouse",
+            )
+
+        self.assertTrue(outside.is_dir())
+        self.assertTrue(link.is_symlink())
+
     def test_invalid_staging_never_replaces_existing_package(self) -> None:
         destination = self.models / "mousehouse"
         (destination / "configs").mkdir(parents=True)

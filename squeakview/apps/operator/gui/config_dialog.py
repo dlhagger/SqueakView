@@ -5,7 +5,6 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from squeakview import config as squeakview_config
 from squeakview import model_package
 from squeakview.apps.operator.gui.config_policy import ConfigFields, collect_config
 from squeakview.apps.operator.gui.model_catalog import (
@@ -18,6 +17,7 @@ from squeakview.apps.operator.gui.config_view import (
 )
 from squeakview.apps.operator.gui.dialog_style import fit_window_to_available_area
 from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile, slugify
+from squeakview.project import Project
 
 from squeakview.apps.operator.gui.session_dialog import (
     DARK_DIALOG_STYLE,
@@ -37,6 +37,8 @@ class ConfigDialog(QtWidgets.QDialog):
         self,
         parent=None,
         *,
+        project: Project,
+        profile_store: ProfileStore,
         title: str = "Configure SqueakView",
         config: Optional[dict] = None,
         show_session_setup: bool = True,
@@ -50,8 +52,9 @@ class ConfigDialog(QtWidgets.QDialog):
         self.resize(700, 760)
 
         self.setStyleSheet(DARK_DIALOG_STYLE)
+        self.project = project
         cfg = config or {}
-        self._profile_store = ProfileStore()
+        self._profile_store = profile_store
         self._experiments = self._profile_store.list_experiments()
         self._subjects = self._profile_store.list_subjects()
         self._camera_count = 1
@@ -73,7 +76,7 @@ class ConfigDialog(QtWidgets.QDialog):
                 accept=self.accept,
                 reject=self.reject,
             ),
-            tasks_dir=squeakview_config.TASKS_DIR,
+            tasks_dir=self.project.paths.tasks,
             show_session_setup=show_session_setup,
             experiment_profile_name=experiment_profile_name,
             show_experiment_profile_editor=show_experiment_profile_editor,
@@ -100,6 +103,10 @@ class ConfigDialog(QtWidgets.QDialog):
         self.cfg_browse_btn = view.cfg_browse_btn
         self.cfg_label = view.cfg_label
         self.cfg_row_widget = view.cfg_row_widget
+        # Model packages are project-managed and validated. Arbitrary paths
+        # would bypass Project Setup and make experiment profiles non-portable.
+        self.cfg_edit.setVisible(False)
+        self.cfg_browse_btn.setVisible(False)
         self.model_combo = QtWidgets.QComboBox(self.cfg_row_widget)
         self.model_combo.setMinimumContentsLength(24)
         self.cfg_row_widget.layout().insertWidget(0, self.model_combo, 1)
@@ -145,13 +152,18 @@ class ConfigDialog(QtWidgets.QDialog):
     def _populate_model_combo(self) -> None:
         """Offer complete local packages without exposing build staging dirs."""
 
-        current = squeakview_config.resolve_workspace_path(self.cfg_edit.text())
+        try:
+            current = self.project.paths.resolve_path(
+                self.cfg_edit.text(), within=self.project.paths.models
+            )
+        except ValueError:
+            current = None
         self.model_combo.blockSignals(True)
         try:
             self.model_combo.clear()
             self.model_combo.addItem("Select validated model…", "")
             selected = -1
-            for choice in enumerate_model_configs(squeakview_config.MODEL_ROOT):
+            for choice in enumerate_model_configs(self.project.paths.models):
                 if choice.eligible:
                     label = f"{choice.name} — {choice.config.name}"
                     self.model_combo.addItem(label, str(choice.config))
@@ -172,18 +184,15 @@ class ConfigDialog(QtWidgets.QDialog):
                     item = self.model_combo.model().item(index)
                     if item is not None:
                         item.setEnabled(False)
-            self.model_combo.addItem("Manual path / Browse…", "__manual__")
             if selected >= 0:
                 self.model_combo.setCurrentIndex(selected)
-            elif current is not None:
-                self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
         finally:
             self.model_combo.blockSignals(False)
 
     @QtCore.Slot(int)
     def _on_model_selected(self, index: int) -> None:
         selected = str(self.model_combo.itemData(index) or "")
-        if selected and selected != "__manual__":
+        if selected:
             self.cfg_edit.setText(selected)
 
     def _current_mode(self) -> str:
@@ -450,8 +459,13 @@ class ConfigDialog(QtWidgets.QDialog):
             self.existing_subject_combo.blockSignals(False)
 
     def _on_browse_cfg(self) -> None:
-        cfg_path = squeakview_config.resolve_workspace_path(self.cfg_edit.text())
-        start_dir = cfg_path.parent if cfg_path else squeakview_config.MODEL_ROOT
+        try:
+            cfg_path = self.project.paths.resolve_path(
+                self.cfg_edit.text(), within=self.project.paths.models
+            )
+        except ValueError:
+            cfg_path = None
+        start_dir = cfg_path.parent if cfg_path else self.project.paths.models
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select DeepStream nvinfer config",
@@ -462,8 +476,13 @@ class ConfigDialog(QtWidgets.QDialog):
             self.cfg_edit.setText(path)
 
     def _on_browse_task_cfg(self) -> None:
-        task_path = squeakview_config.resolve_workspace_path(self.task_cfg_edit.text())
-        start_dir = task_path.parent if task_path else squeakview_config.TASKS_DIR
+        try:
+            task_path = self.project.paths.resolve_path(
+                self.task_cfg_edit.text(), within=self.project.paths.tasks
+            )
+        except ValueError:
+            task_path = None
+        start_dir = task_path.parent if task_path else self.project.paths.tasks
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select task config",
@@ -497,7 +516,12 @@ class ConfigDialog(QtWidgets.QDialog):
                 experiment_name=str(self.existing_experiment_combo.currentData() or ""),
             ),
             include_mode=include_mode,
-            resolve_path=squeakview_config.resolve_workspace_path,
+            resolve_model_path=lambda value: self.project.paths.resolve_path(
+                value, within=self.project.paths.models
+            ),
+            resolve_task_path=lambda value: self.project.paths.resolve_path(
+                value, within=self.project.paths.tasks
+            ),
             validate_model=lambda path: validate_production_model(
                 path, validator=model_package.validate_model_package
             ),

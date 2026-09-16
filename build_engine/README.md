@@ -1,127 +1,51 @@
-# Build Engine Notebook
+# Project Model Builder
 
-Notebook-first workflow for importing YOLO26 pose models into `SqueakView`.
+Model construction is part of SqueakView's pre-acquisition Project Setup UI.
+The former notebook implementation has been retired so build behavior cannot
+diverge from the operator workflow.
 
-Source `.pt` and YAML inputs under `build_me/` are shipped with the repository.
-Generated packages under `models/` are device-local, ignored by Git, and must be
-built on each fresh Jetson before inference can be enabled.
-
-Primary file:
-
-- `build_engine.ipynb`
-
-The notebook is intentionally scoped to YOLO26 pose packages. Given a `.pt`
-model and its training/data `.yaml`, it builds the files expected by the
-runtime:
-
-```text
-models/<model_name>/
-  model.yaml
-  weights/<model>.pt
-  onnx/<model>_<precision>_b<batch>.onnx
-  engines/<model>_<precision>_b<batch>.engine
-  labels/classes.txt
-  labels/labels.txt
-  lib/libnvdsinfer_custom_impl_Yolo.so
-  configs/<model_name>.txt
-  configs/<model_name>.pose.json
-  validation/import_report.json
-```
-
-## What It Does
-
-1. Reads classes, keypoint labels, and keypoint shape from the dataset YAML.
-2. Treats the dataset YAML as read-only ground truth; no SqueakView-specific fields are required or written. No model-specific labels or indices live in the notebook.
-3. Validates those values against the source `.pt` checkpoint.
-4. Passes the same YAML to the Ultralytics exporter with `data=...`.
-5. Exports a static, NMS-free one-to-one TensorRT engine directly on the target
-   Jetson with the current Ultralytics `nms=False` API. A loaded YOLO26
-   checkpoint normally starts in its one-to-many mode; the builder validates
-   that its selectable one-to-one head exists and verifies the exported engine
-   metadata instead of requiring the checkpoint's initial `end2end` flag.
-6. Validates the ONNX model and `(batch, 300, 6 + 3*kpts)` output contract.
-7. Removes the Ultralytics JSON prefix from the engine, deserializes the raw
-   TensorRT plan, and runs one bounded `trtexec` synthetic inference before
-   giving it to DeepStream. The command, return code, timeout, truncation state,
-   and bounded output are retained in `validation/import_report.json`.
-8. Writes a detector config with clustering disabled because YOLO26 end-to-end
-   output already contains final detections.
-9. Writes the complete pose schema v2 with tensor/input contracts, a global confidence threshold, all keypoints assigned to each class, and class zero tracked by default.
-10. Writes `model.yaml` and `validation/import_report.json` with portable
-    dataset provenance plus the exact TensorRT, CUDA, Jetson Linux, device, and
-    compute-capability identity used to build the engine. Schema-3 packages are
-    rejected when that identity does not match the acquisition runtime.
-11. Records path-bound SHA-256 identities for every runtime artifact, including
-    `validation/import_report.json`, preventing either mixed build files or
-    edited engine-execution/build-environment evidence from passing preflight.
-12. Builds in a hidden staging directory on the `models/` filesystem, validates
-    the complete package there, then publishes it with one atomic directory
-    rename. When overwrite is enabled, Linux atomic exchange preserves the old
-    complete package until the new package has passed validation; failed builds
-    never modify the selected package.
-
-Hidden `.build-*` directories are incomplete staging output, never selectable
-model packages. They are cleaned when the notebook kernel exits and before a
-rerun. If the machine loses power during export, they can be removed safely;
-the existing non-hidden package remains intact.
-
-For an automated, non-destructive candidate build, set a new single-component
-package name before executing the notebook, for example
-`SQUEAKVIEW_BUILD_MODEL_NAME=mousehouse_jp721`. Existing packages are never
-replaced unless `SQUEAKVIEW_BUILD_OVERWRITE=1` is explicitly set; the only
-accepted overwrite values are `0` and `1`.
-
-Current upstream CUDA 13.2 PyTorch wheels may print an Orin compute-capability
-8.7 warning even when CUDA operations work; NVIDIA has acknowledged this
-warning for JetPack 7.2 upstream wheels. The notebook does not hide it. Package
-acceptance instead requires the CUDA export, TensorRT deserialization, and a
-bounded real `trtexec` inference to succeed. Treat an actual CUDA or `trtexec`
-failure as fatal. See NVIDIA's [JetPack 7.2 Orin PyTorch guidance](https://forums.developer.nvidia.com/t/how-do-i-correctly-install-pytorch-on-jetpack-7-2/372773/5).
-
-At model selection, SqueakView hashes `model.yaml`, the pose sidecar, ONNX
-graph, DeepStream config, and TensorRT engine into the run manifest so a
-qualified run identifies both its portable model inputs and device-local plan.
-
-## Dataset Metadata
-
-The builder reads standard `names`, `kpt_shape`, and any of `kp_names`, `keypoint_names`, or Ultralytics `kpt_names`. The checkpoint supplies classes, shape, and named keypoints when the YAML omits them. The source YAML is never modified.
-
-## Environment
-
-From the repo root, use the existing SqueakView environment:
+Launch SqueakView normally:
 
 ```bash
-uv run jupyter lab build_engine/build_engine.ipynb
+bash squeakview.sh
 ```
 
-You can also open the notebook from an already-active environment if it has
-Ultralytics, PyTorch, ONNX, PyYAML, and TensorRT available.
+After choosing or creating a project, Project Setup displays the checkpoint/YAML
+pairs under that project's `model_sources/` directory. Select a source and press
+**Build Model**. New projects contain independent MouseHouse v2 and stock YOLO
+pose sources, with MouseHouse v2 preselected.
 
-## Runtime Assumptions
+The setup application starts a separate worker process which:
 
-- DeepStream is installed on the Jetson.
-- The TensorRT Python bindings installed by JetPack are importable.
-- The generated DeepStream config uses package-relative paths for the ONNX,
-  engine, labels, and a package-local copy of the custom parser library, keeping
-  each validated package internally consistent across clone locations.
-- The generated config is for YOLO26 pose only:
-  `parse-bbox-func-name=NvDsInferParseYolo26Pose`.
-- Build the native parser after system CUDA/TensorRT updates and before running
-  the notebook. Close Jupyter after engine builds before long acquisition runs.
+1. acquires the project's exclusive writer lock;
+2. removes only stale staging for the selected package;
+3. exports the device-local FP16 TensorRT engine and ONNX graph;
+4. validates the YOLO26 pose contract and executes one bounded `trtexec` pass;
+5. writes schema-3 package provenance and artifact identities;
+6. atomically publishes the complete package; and
+7. selects it as the project default.
 
-## Before Selecting The Model In The GUI
+The existing published package is preserved if export or validation fails.
+Cancellation terminates the complete worker process group; an unpublished
+staging directory is safely recovered on the next attempt.
 
-Check these values in the generated package:
+The setup UI does not import PyTorch, Ultralytics, TensorRT, or CUDA. After a
+successful build it waits for the worker to exit, reports that GPU resources
+have been released, and only then allows the acquisition supervisor to start.
+No manual kernel restart, cache clearing, swap manipulation, or reboot is
+required. Bounded build logs are retained under
+`~/.local/state/SqueakView/logs/` and can also be copied directly from Project
+Setup.
 
-1. `model.yaml` batch size matches the intended camera count.
-2. `configs/<model_name>.txt` points to an existing ONNX and engine.
-3. `labels/classes.txt` and `labels/labels.txt` are correct.
-4. `validation/import_report.json` has no failed checks.
-
-Then run the strict package validation used by preflight:
+The retained `build_engine.ipynb` contains only a migration notice and no
+executable build path. For diagnostics or automation, the same isolated worker
+can be invoked directly:
 
 ```bash
-uv run python -m squeakview.model_package \
-  --config models/<model_name>/configs/<model_name>.txt \
-  --require-engine-identity
+.venv/bin/python -m squeakview.apps.model_builder \
+  --project "$HOME/Documents/SqueakView Projects/My Project" \
+  --source mousehouse_v2 \
+  --model-name mousehouse_v2
 ```
+
+Normal operators should use Project Setup rather than this command.

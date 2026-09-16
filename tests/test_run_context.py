@@ -15,14 +15,8 @@ class RunContextTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name) / "runs"
-        self.runs_patch = mock.patch.object(run_context, "RUNS_DIR", self.root)
-        self.marker_patch = mock.patch.object(run_context, "RUN_MARKER", self.root / ".latest_run")
-        self.runs_patch.start()
-        self.marker_patch.start()
 
     def tearDown(self) -> None:
-        self.marker_patch.stop()
-        self.runs_patch.stop()
         self.temp_dir.cleanup()
 
     def test_create_run_dir_slugifies_names_and_retries_collision(self) -> None:
@@ -35,13 +29,14 @@ class RunContextTests(unittest.TestCase):
             mock.patch.object(run_context.os, "urandom", side_effect=[b"\x01" * 3, b"\x02" * 3]),
         ):
             path, run_id = run_context.create_run_dir(
+                runs_dir=self.root,
                 experiment_name="Experiment One",
                 mouse_id="Mouse 1",
             )
 
         self.assertEqual(run_id, "Mouse_1_2026-01-02_03-04-05_020202")
         self.assertEqual(path, base / run_id)
-        self.assertEqual(run_context.latest_run_dir(), path)
+        self.assertEqual(run_context.latest_run_dir(self.root), path)
 
     def test_status_history_keeps_first_lifecycle_timestamps(self) -> None:
         run_dir = self.root / "run"
@@ -156,7 +151,7 @@ class RunContextTests(unittest.TestCase):
         usage = run_context.shutil._ntuple_diskusage(total=1_000, used=900, free=100)
         with mock.patch.object(run_context.shutil, "disk_usage", return_value=usage):
             with self.assertRaisesRegex(OSError, "low on free space"):
-                run_context.assert_runs_dir_ready(min_free_bytes=101)
+                run_context.assert_runs_dir_ready(self.root, min_free_bytes=101)
         self.assertFalse(list(self.root.glob(".write_test_*")))
 
     def test_bottle_summary_rejects_invalid_numbers_and_calculates_intake(self) -> None:

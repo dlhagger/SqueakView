@@ -53,7 +53,13 @@ from squeakview.apps.operator.gui.session_controller import (
     resolve_config_paths,
 )
 from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile
-from squeakview import config as squeakview_config
+from squeakview.project import (
+    AppPaths,
+    ProjectSession,
+    RuntimeContext,
+    UserPaths,
+    project_from_environment,
+)
 
 
 GUI_HEARTBEAT_INTERVAL_MS = 1_000
@@ -94,13 +100,30 @@ def _production_backend_factory(
         emit_log(
             "[GUI] WARNING: explicit development mode uses an in-process backend"
         )
-        return OperatorBackend(
+        project = project_from_environment()
+        user_paths = UserPaths.discover()
+        app_paths = AppPaths.discover()
+        app_paths.validate_for_project(project.paths)
+        user_paths.validate_for_app(app_paths)
+        user_paths.validate_for_project(project.paths)
+        user_paths.ensure()
+        session = ProjectSession.open(project.paths.root)
+        backend = OperatorBackend(
             emit_log,
             ingest_dashboard,
             on_run_started=on_run_started,
             on_run_failed=on_run_failed,
+            runtime_context=RuntimeContext(
+                app=app_paths,
+                project=session.project,
+                user=user_paths,
+            ),
             acquisition_owner=manifest.IN_PROCESS_DEV_OWNER,
         )
+        # The explicit development backend owns the same lifetime lock as the
+        # production supervisor; process exit is its final fallback release.
+        backend._development_project_session = session
+        return backend
     # Raise the actionable error from the shared environment parser.  A GUI
     # started outside the durable launcher must never acquire cameras itself.
     supervisor_socket_from_environment()
@@ -123,13 +146,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, *, backend_factory=None) -> None:
         super().__init__()
         self.log_msg.connect(self._append_log)
-        self.setWindowTitle("SqueakView")
+        self.project = project_from_environment()
+        self.setWindowTitle(f"SqueakView — {self.project.metadata.name}")
         self.resize(1280, 820)
         self.setMinimumSize(1024, 700)
 
         self._config_data: dict | None = None
         self._preview_window_id: int | None = None
-        self._profile_store = ProfileStore()
+        self._profile_store = ProfileStore(
+            self.project.paths.profiles,
+            project_paths=self.project.paths,
+        )
         self._experiments: list[ExperimentProfile] = []
         self._subjects: list[SubjectProfile] = []
         self._profile_selection_updating = False
@@ -165,6 +192,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             self.experiment_combo,
             self.subject_combo,
+            project=self.project,
             store=self._profile_store,
             commit=self._apply_config,
             emit=self._emit_log,
@@ -359,7 +387,7 @@ class MainWindow(QtWidgets.QMainWindow):
         apply_main_window_theme(self)
 
     def _default_config_data(self) -> dict:
-        return default_config_data()
+        return default_config_data(self.project)
 
     def _make_fluid_combo(self) -> QtWidgets.QComboBox:
         return self.bottle_panel._make_fluid_combo()
@@ -490,7 +518,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _apply_config(self, data: dict) -> None:
-        resolved = resolve_config_paths(data)
+        resolved = resolve_config_paths(data, project=self.project)
         data = resolved.data
         ds_cfg = resolved.ds_cfg
         task_cfg = resolved.task_cfg
@@ -516,6 +544,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._config_data,
             bottles=self._collect_bottle_payload(include_final=False, strict=False),
             preview_window_id=self._preview_window_id,
+            project=self.project,
         )
 
     # ---- Helpers --------------------------------------------------------
@@ -616,7 +645,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _open_run_folder(self) -> None:
-        target = self.backend.current_snapshot.run_dir or squeakview_config.RUNS_DIR
+        target = self.backend.current_snapshot.run_dir or self.project.paths.runs
         path = Path(target)
         if not path.exists():
             self._emit_log(f"[GUI] Run folder does not exist: {path}")

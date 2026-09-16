@@ -42,7 +42,7 @@ class DebugOverheadTests(unittest.TestCase):
 
     def test_checked_in_threshold_template_is_strict_and_unapproved(self) -> None:
         template = load_debug_thresholds(
-            Path("qualification/debug_overhead_thresholds.v1.yaml")
+            Path("resources/project_template/qualification/debug_overhead_thresholds.v1.yaml")
         )
 
         self.assertIs(template["approved"], False)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,9 +18,35 @@ from squeakview.apps.operator.gui.session_controller import (
     resolve_config_paths,
 )
 from squeakview.common.profiles import ExperimentProfile, SubjectProfile
+from squeakview.project import Project, ProjectMetadata, ProjectPaths
+
+
+def _make_project(root: Path) -> Project:
+    project_root = root / "project"
+    for relative in (
+        "runs",
+        "models/mousehouse",
+        "tasks",
+        "profiles/experiments",
+        "profiles/subjects",
+        "qualification",
+    ):
+        (project_root / relative).mkdir(parents=True, exist_ok=True)
+    (project_root / "tasks/default.yaml").write_text("task_name: test\n")
+    return Project(
+        paths=ProjectPaths.from_existing_root(project_root),
+        metadata=ProjectMetadata.create("Test"),
+    )
 
 
 class SessionConfigHelpersTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.project = _make_project(Path(self.temporary.name))
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
     def test_profile_merge_copies_input_and_applies_scientific_identity(self) -> None:
         original = {"fps": 30, "experiment_name": "old", "mouse_id": "old"}
         experiment = ExperimentProfile(
@@ -34,7 +61,12 @@ class SessionConfigHelpersTest(unittest.TestCase):
         )
         subject = SubjectProfile(name="Mouse 7", subject_id="mouse_7")
 
-        merged = merge_profile_selection(original, experiment, subject)
+        merged = merge_profile_selection(
+            original,
+            experiment,
+            subject,
+            project=self.project,
+        )
 
         self.assertEqual(original["fps"], 30)
         self.assertEqual(merged["experiment_name"], "study_a")
@@ -42,10 +74,16 @@ class SessionConfigHelpersTest(unittest.TestCase):
         self.assertEqual(merged["fps"], 60)
         self.assertTrue(merged["trigger_on"])
 
+    def test_fresh_project_defaults_to_explicit_inference_off(self) -> None:
+        data = default_config_data(self.project)
+
+        self.assertFalse(data["inference_enabled"])
+        self.assertEqual(data["ds_cfg"], "")
+
     def test_path_resolution_does_not_mutate_dialog_result(self) -> None:
         original = {"ds_cfg": "models/mousehouse/config.txt", "task_cfg": "tasks/default.yaml"}
 
-        resolved = resolve_config_paths(original)
+        resolved = resolve_config_paths(original, project=self.project)
 
         self.assertEqual(original["ds_cfg"], "models/mousehouse/config.txt")
         self.assertTrue(resolved.ds_cfg.is_absolute())
@@ -53,10 +91,10 @@ class SessionConfigHelpersTest(unittest.TestCase):
         self.assertEqual(resolved.data["ds_cfg"], str(resolved.ds_cfg))
 
     def test_launch_mapping_honors_qualification_environment(self) -> None:
-        data = default_config_data()
+        data = default_config_data(self.project)
         data["inference_enabled"] = False
         environment = {
-            "SQUEAKVIEW_FAILURE_PLAN": "/tmp/fault.json",
+            "SQUEAKVIEW_FAILURE_PLAN": "qualification/fault.json",
             "SQUEAKVIEW_DISABLE_PREVIEW": "yes",
         }
 
@@ -64,12 +102,16 @@ class SessionConfigHelpersTest(unittest.TestCase):
             data,
             bottles={"left": {"initial_weight_g": 25.0}},
             preview_window_id=42,
+            project=self.project,
             environment=environment,
         )
 
         self.assertEqual(request.preview_window_id, 42)
         self.assertFalse(request.preview_enabled)
-        self.assertEqual(request.failure_plan, Path("/tmp/fault.json"))
+        self.assertEqual(
+            request.failure_plan,
+            self.project.paths.qualification / "fault.json",
+        )
         self.assertEqual(request.bottles["left"]["initial_weight_g"], 25.0)
 
     def test_launch_mapping_rejects_missing_configuration(self) -> None:
@@ -78,6 +120,7 @@ class SessionConfigHelpersTest(unittest.TestCase):
                 None,
                 bottles={},
                 preview_window_id=None,
+                project=self.project,
                 environment={},
             )
 
@@ -88,6 +131,8 @@ class SessionConfigControllerTest(unittest.TestCase):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
     def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.project = _make_project(Path(self.temporary.name))
         self.parent = QtWidgets.QWidget()
         self.experiment_combo = QtWidgets.QComboBox(self.parent)
         self.subject_combo = QtWidgets.QComboBox(self.parent)
@@ -109,6 +154,7 @@ class SessionConfigControllerTest(unittest.TestCase):
             self.parent,
             self.experiment_combo,
             self.subject_combo,
+            project=self.project,
             store=self.store,
             commit=self.commits.append,
             emit=mock.Mock(),
@@ -116,6 +162,7 @@ class SessionConfigControllerTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.parent.close()
+        self.temporary.cleanup()
 
     def test_reload_populates_selectors_and_preserves_no_selection(self) -> None:
         self.controller.reload()

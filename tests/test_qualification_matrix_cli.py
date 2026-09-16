@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -16,6 +17,7 @@ from scripts.qualify_matrix import (
     _write_new_assignment_checklist,
     main,
 )
+from squeakview.project import AppPaths, create_project
 from squeakview.common.diagnostics.qualification_matrix import (
     expand_cases,
     load_assignments,
@@ -27,7 +29,18 @@ class QualificationMatrixCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.matrix_path = self.root / "matrix.yaml"
+        app_root = self.root / "app"
+        task = app_root / "resources/project_template/tasks/default.yaml"
+        task.parent.mkdir(parents=True)
+        task.write_text("task_name: Test\n", encoding="utf-8")
+        projects = self.root / "projects"
+        projects.mkdir()
+        self.project = create_project(
+            projects / "qualification",
+            name="Qualification",
+            app=AppPaths.from_root(app_root),
+        )
+        self.matrix_path = self.project.paths.qualification / "matrix.yaml"
         self.matrix_path.write_text(
             yaml.safe_dump(
                 {
@@ -61,7 +74,11 @@ class QualificationMatrixCliTests(unittest.TestCase):
         self.matrix = load_matrix(self.matrix_path)
         self.case_ids = [case["case_id"] for case in expand_cases(self.matrix)]
         self.case_id = self.case_ids[0]
-        self.assignments_path = self.root / "assignments.yaml"
+        self.assignments_path = self.project.paths.qualification / "assignments.yaml"
+        (self.project.paths.qualification / "limits.v1.yaml").write_text(
+            "schema_version: '1.0'\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -199,6 +216,8 @@ class QualificationMatrixCliTests(unittest.TestCase):
                     str(self.assignments_path),
                     "--matrix",
                     str(self.matrix_path),
+                    "--project",
+                    str(self.project.paths.root),
                     "--next-case",
                 ],
             ),
@@ -210,6 +229,39 @@ class QualificationMatrixCliTests(unittest.TestCase):
         self.assertEqual(self.assignments_path.read_bytes(), before)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["next_case"]["case_id"], self.case_ids[0])
+
+    def test_cli_requires_project_and_rejects_state_outside_it(self) -> None:
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("sys.argv", ["qualify_matrix.py", "--list-cases"]),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main(), 2)
+        self.assertIn("SQUEAKVIEW_PROJECT is required", output.getvalue())
+
+        outside = self.root / "outside-assignments.yaml"
+        _write_new_assignment_checklist(outside, self.matrix)
+        before = outside.read_bytes()
+        output = io.StringIO()
+        with (
+            mock.patch(
+                "sys.argv",
+                [
+                    "qualify_matrix.py",
+                    str(outside),
+                    "--project",
+                    str(self.project.paths.root),
+                    "--matrix",
+                    str(self.matrix_path),
+                    "--next-case",
+                ],
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main(), 2)
+        self.assertIn("escapes the project root", output.getvalue())
+        self.assertEqual(outside.read_bytes(), before)
 
 
 if __name__ == "__main__":

@@ -28,7 +28,14 @@ class BehaviorDashboard(QtWidgets.QWidget):
     clear_jam_requested = QtCore.Signal()
     jam_state_changed = QtCore.Signal(bool)
 
-    def __init__(self, window_sec: float = 300.0, pellet_mode: str = "auto", parent=None) -> None:
+    def __init__(
+        self,
+        window_sec: float = 300.0,
+        pellet_mode: str = "auto",
+        parent=None,
+        *,
+        disk_root: Path | None = None,
+    ) -> None:
         super().__init__(parent)
         self.window_sec = float(max(30.0, window_sec))
         self.pellet_mode = pellet_mode
@@ -94,7 +101,11 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self._timer.timeout.connect(self._refresh)
         self._timer.start(100)
 
-        self._meters = JetsonMeters(self, interval_ms=500)
+        self._meters = JetsonMeters(
+            self,
+            interval_ms=500,
+            disk_root=disk_root,
+        )
         self._meters.updated.connect(self._on_meters)
 
     def apply_task_config(self, path: Path) -> None:

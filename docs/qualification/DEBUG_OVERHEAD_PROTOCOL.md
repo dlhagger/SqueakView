@@ -10,16 +10,24 @@ not create, simulate, launch, resume, or modify a scientific run.
   `.venv/bin/python scripts/qualify_matrix.py --list-cases`.
 - Use one reviewed `validated: true` qualification-limits file for both runs.
 - Use the same Jetson, software commit, model package, native plugins, camera,
-  controller, capture configuration, preview state, named nvpmodel mode, and
-  qualification case.
+controller, capture configuration, preview state, named nvpmodel mode, and
+qualification case.
+- Treat every `qualification/...` path in this procedure as relative to the
+  active scientific project, never the application repository.
 - Plan comparable durations. The default comparison tolerance is the larger of
   five seconds or 1% of the longer run.
+
+Select the project before using any command in this protocol:
+
+```bash
+export SQUEAKVIEW_PROJECT="/absolute/path/to/My Project"
+```
 
 The checked-in limits profile is measurement-only and cannot satisfy these
 preconditions. Do not mark it validated simply to obtain a result.
 
 The checked-in
-`qualification/debug_overhead_thresholds.v1.yaml` is likewise an unapproved,
+`$SQUEAKVIEW_PROJECT/qualification/debug_overhead_thresholds.v1.yaml` is likewise an unapproved,
 measurement-only template. Its seven exact metric keys each show the supported
 `max_increase` and `max_percent_increase` bounds. Leave unused bounds null, but
 an approved profile must provide at least one finite nonnegative bound for every
@@ -49,7 +57,7 @@ its environment. Qualify the completed baseline:
 
 ```bash
 .venv/bin/python scripts/qualify_run.py /absolute/path/to/baseline-run \
-  --limits qualification/<validated-limits>.yaml
+  --limits "$SQUEAKVIEW_PROJECT/qualification/<validated-limits>.yaml"
 ```
 
 Launch a new GUI/supervisor with the debug profile on, reproduce the same bound
@@ -59,7 +67,7 @@ case and duration, and wait for terminal finalization:
 export SQUEAKVIEW_DEEPSTREAM_DEBUG_PROFILE=1
 bash squeakview.sh
 .venv/bin/python scripts/qualify_run.py /absolute/path/to/debug-run \
-  --limits qualification/<validated-limits>.yaml \
+  --limits "$SQUEAKVIEW_PROJECT/qualification/<validated-limits>.yaml" \
   --allow-debug-profile
 ```
 
@@ -86,8 +94,8 @@ Run the Qt-free checker with an explicit case guard and durable output path:
   /absolute/path/to/baseline-run \
   /absolute/path/to/debug-run \
   --case-id '<case-id>' \
-  --thresholds qualification/<reviewed-approved-debug-overhead-thresholds>.yaml \
-  --output qualification/results/<pair-id>-debug-overhead.json
+  --thresholds "$SQUEAKVIEW_PROJECT/qualification/<reviewed-approved-debug-overhead-thresholds>.yaml" \
+  --output "$SQUEAKVIEW_PROJECT/qualification/results/<pair-id>-debug-overhead.json"
 ```
 
 The checker fails closed unless both runs are successfully terminal, owned by

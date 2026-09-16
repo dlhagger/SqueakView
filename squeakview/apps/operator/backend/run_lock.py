@@ -2,48 +2,27 @@
 
 from __future__ import annotations
 
-import fcntl
-import os
 from pathlib import Path
+
+from squeakview.project.locking import OwnershipLock
 
 
 class AcquisitionLock:
-    """Hold an advisory lock for at most one acquisition on this run store."""
+    """Compatibility facade over the hardened device-runtime ownership lock."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self._handle = None
+        self._lock = OwnershipLock(self.path, purpose="scientific acquisition")
 
     @property
     def held(self) -> bool:
-        return self._handle is not None
+        return self._lock.held
 
     def acquire(self) -> bool:
-        if self._handle is not None:
-            return True
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            handle.close()
-            return False
-        handle.seek(0)
-        handle.truncate()
-        handle.write(f"pid={os.getpid()}\n")
-        handle.flush()
-        self._handle = handle
-        return True
+        return self._lock.acquire()
 
     def release(self) -> None:
-        handle = self._handle
-        self._handle = None
-        if handle is None:
-            return
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
+        self._lock.release()
 
     def __enter__(self) -> "AcquisitionLock":
         if not self.acquire():

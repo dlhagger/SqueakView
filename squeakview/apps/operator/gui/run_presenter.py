@@ -9,7 +9,6 @@ from typing import Any, Callable
 
 from PySide6 import QtCore, QtWidgets
 
-from squeakview import config as squeakview_config
 from squeakview.apps.operator.backend import process
 from squeakview.apps.operator.backend.events import BackendEvent, RunPhase
 from squeakview.apps.operator.gui.run_presentation import (
@@ -127,7 +126,11 @@ class RunLifecycleController(QtCore.QObject):
         if not self.active:
             return
         run_dir = self.view.backend.current_snapshot.run_dir
-        disk_target = Path(run_dir) if run_dir is not None else squeakview_config.RUNS_DIR
+        disk_target = (
+            Path(run_dir)
+            if run_dir is not None
+            else self.view.project.paths.runs
+        )
         current_disk_text = disk_free_text(disk_target)
         if not self.recording_active:
             if self.start_in_progress or self.stop_in_progress:

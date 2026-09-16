@@ -15,6 +15,38 @@ from squeakview.apps.operator.backend.events import RunPhase
 from squeakview.common.child_events import EVENT_PREFIX, encode_child_event
 from squeakview.common import run_context
 from squeakview.common.dashboard import DashboardEvent
+from squeakview.project import (
+    AppPaths,
+    Project,
+    ProjectMetadata,
+    ProjectPaths,
+    RuntimeContext,
+    UserPaths,
+)
+
+
+def _runtime_context(root: Path) -> RuntimeContext:
+    app_root = root / "app"
+    project_root = root / "project"
+    app_root.mkdir(exist_ok=True)
+    project_root.mkdir(exist_ok=True)
+    (project_root / "runs").mkdir(exist_ok=True)
+    (project_root / "models").mkdir(exist_ok=True)
+    (project_root / "tasks").mkdir(exist_ok=True)
+    (project_root / "qualification").mkdir(exist_ok=True)
+    return RuntimeContext(
+        app=AppPaths.from_root(app_root),
+        project=Project(
+            paths=ProjectPaths.from_existing_root(project_root),
+            metadata=ProjectMetadata.create("Test"),
+        ),
+        user=UserPaths(
+            config=root / "user/config",
+            state=root / "user/state",
+            runtime=root / "user/runtime",
+            projects_parent=root / "projects",
+        ),
+    )
 
 
 class FakeProcessHandle:
@@ -130,10 +162,11 @@ class BackendTimeoutPolicyTests(unittest.TestCase):
 class ManifestPersistenceTests(unittest.TestCase):
     def test_post_run_bottle_save_preserves_immutable_manifest_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            run_dir = Path(temp_dir) / "run"
-            run_dir.mkdir()
+            runtime_context = _runtime_context(Path(temp_dir))
+            run_dir = runtime_context.project.paths.runs / "run"
+            run_dir.mkdir(parents=True)
             original = {
-                "schema_version": "2.0",
+                "schema_version": "3.0",
                 "run_id": "run",
                 "created_at": "2026-07-28T17:41:50",
                 "updated_at": "2026-07-29T09:37:57",
@@ -152,7 +185,10 @@ class ManifestPersistenceTests(unittest.TestCase):
                 run_dir / run_context.RUN_STATUS_FILENAME,
                 {"state": "finalized"},
             )
-            backend = manager.OperatorBackend(lambda _message: None)
+            backend = manager.OperatorBackend(
+                lambda _message: None,
+                runtime_context=runtime_context,
+            )
             backend.state.run_dir = run_dir
 
             summary = backend.save_bottle_measurements(
@@ -188,7 +224,8 @@ class BackendLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
-        self.task_cfg = self.root / "task.yaml"
+        self.task_cfg = self.root / "project" / "tasks" / "task.yaml"
+        self.task_cfg.parent.mkdir(parents=True)
         self.task_cfg.write_text("task_name: test\n")
         self.run_dir = self.root / "run"
         self.run_dir.mkdir()
@@ -212,6 +249,7 @@ class BackendLifecycleTests(unittest.TestCase):
             self.logs.append,
             on_run_started=lambda: self.started.append(True),
             on_run_failed=on_run_failed,
+            runtime_context=_runtime_context(self.root),
         )
         self.backend._acquisition_lock = manager.AcquisitionLock(
             self.root / ".acquisition.lock"
@@ -278,7 +316,11 @@ class BackendLifecycleTests(unittest.TestCase):
 
     def test_serial_dashboard_line_is_parsed_once_into_typed_event(self) -> None:
         received: list[DashboardEvent] = []
-        backend = manager.OperatorBackend(self.logs.append, received.append)
+        backend = manager.OperatorBackend(
+            self.logs.append,
+            received.append,
+            runtime_context=_runtime_context(self.root),
+        )
 
         with mock.patch.object(
             manager.dashboard_util.DashboardEvent,
@@ -316,7 +358,7 @@ class BackendLifecycleTests(unittest.TestCase):
         self.assertIn("starting_at", status)
 
     def _inference_model_fixture(self):
-        package = self.root / "models/selected"
+        package = self.root / "project/models/selected"
         config = package / "configs/selected.txt"
         parser = package / "lib/parser.so"
         config.parent.mkdir(parents=True)
@@ -741,7 +783,9 @@ power_modes: [25W]
         self.assertIn("before controller START", self.status()["error"])
 
     def test_invalid_model_is_rejected_before_run_creation(self) -> None:
-        missing_config = self.root / "models" / "missing" / "configs" / "missing.txt"
+        missing_config = (
+            self.root / "project" / "models" / "missing" / "configs" / "missing.txt"
+        )
         (self.run_dir / run_context.RUN_STATUS_FILENAME).unlink()
 
         result = self.backend.start_run(self.config(inference_enabled=True, ds_cfg=missing_config))
@@ -1105,7 +1149,7 @@ power_modes: [25W]
         self.assertEqual(self.handle.terminate_calls, 1)
 
     def test_serial_failure_plan_is_gated_and_passed_to_controller(self) -> None:
-        plan_path = self.root / "serial-failure.json"
+        plan_path = self.root / "project/qualification/serial-failure.json"
         plan_path.write_text(
             '{"schema_version":"1.0","target":"serial_controller",'
             '"kind":"read_error","after_frames":3}'
@@ -1131,7 +1175,7 @@ power_modes: [25W]
         self.assertFalse(self.status()["production_eligible"])
 
     def test_shutdown_stop_ack_timeout_is_deterministic_and_fails_run(self) -> None:
-        plan_path = self.root / "shutdown-failure.json"
+        plan_path = self.root / "project/qualification/shutdown-failure.json"
         plan_path.write_text(
             '{"schema_version":"1.0","target":"shutdown",'
             '"kind":"stop_ack_timeout","after_frames":1}'
@@ -1158,7 +1202,7 @@ power_modes: [25W]
         self.assertIn("STOP was not acknowledged", self.status()["error"])
 
     def test_shutdown_capture_exit_unconfirmed_skips_artifact_validation(self) -> None:
-        plan_path = self.root / "capture-exit-failure.json"
+        plan_path = self.root / "project/qualification/capture-exit-failure.json"
         plan_path.write_text(
             '{"schema_version":"1.0","target":"shutdown",'
             '"kind":"capture_exit_unconfirmed","after_frames":1}'
@@ -1401,11 +1445,6 @@ class ProcessHandleTests(unittest.TestCase):
         cfg = process.LaunchConfig(ds_cfg=original, run_dir=localized.parents[1])
 
         with (
-            mock.patch.object(
-                process.squeakview_config,
-                "resolve_workspace_path",
-                return_value=original,
-            ),
             mock.patch.object(
                 process,
                 "_localize_deepstream_config",

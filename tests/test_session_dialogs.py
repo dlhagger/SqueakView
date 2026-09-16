@@ -64,7 +64,11 @@ class FocusedSessionDialogTests(unittest.TestCase):
         store = mock.Mock()
         store.list_experiments.return_value = []
         store.list_subjects.return_value = []
-        dialog = SessionLauncherDialog(base_config={"fps": 30}, profile_store=store)
+        dialog = SessionLauncherDialog(
+            base_config={"fps": 30},
+            profile_store=store,
+            project=mock.Mock(),
+        )
         try:
             self.assertIs(dialog._profile_store, store)
             store.list_experiments.assert_called()
@@ -94,6 +98,7 @@ class FocusedSessionDialogTests(unittest.TestCase):
         dialog = SessionLauncherDialog(
             base_config={"fps": 30, "width": 1920},
             profile_store=store,
+            project=mock.Mock(),
         )
         try:
             dialog.experiment_combo.setCurrentIndex(1)

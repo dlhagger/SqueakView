@@ -16,6 +16,7 @@ from squeakview.apps.operator.gui.config_view import (
     build_config_view,
 )
 from squeakview.apps.operator.gui.model_catalog import ModelChoice
+from squeakview.project import Project, ProjectMetadata, ProjectPaths
 from squeakview.common.profiles import ExperimentProfile, SubjectProfile
 from squeakview import model_package
 
@@ -112,7 +113,21 @@ class ConfigDialogCompatibilityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
-        self.task = self.root / "task.yaml"
+        self.project_root = self.root / "project"
+        for relative in (
+            "runs",
+            "models",
+            "tasks",
+            "profiles/experiments",
+            "profiles/subjects",
+            "qualification",
+        ):
+            (self.project_root / relative).mkdir(parents=True, exist_ok=True)
+        self.project = Project(
+            ProjectPaths.from_existing_root(self.project_root),
+            ProjectMetadata.create("Test"),
+        )
+        self.task = self.project.paths.tasks / "task.yaml"
         self.task.write_text("plots: []\n")
         self.store = mock.Mock()
         self.store.list_experiments.return_value = []
@@ -140,7 +155,11 @@ class ConfigDialogCompatibilityTest(unittest.TestCase):
             "experiment_mode": "sandbox",
         }
         config.update(updates)
-        return ConfigDialog(config=config)
+        return ConfigDialog(
+            config=config,
+            project=self.project,
+            profile_store=self.store,
+        )
 
     def test_dialog_preserves_widget_api_and_collects_through_policy(self) -> None:
         dialog = self._dialog(width=1920, height=1080)
@@ -155,8 +174,8 @@ class ConfigDialogCompatibilityTest(unittest.TestCase):
             dialog.close()
 
     def test_dialog_selects_valid_catalog_model_and_disables_invalid_choice(self) -> None:
-        valid = self.root / "models" / "mouse" / "configs" / "mouse.txt"
-        broken = self.root / "models" / "broken" / "configs" / "broken.txt"
+        valid = self.project.paths.models / "mouse" / "configs" / "mouse.txt"
+        broken = self.project.paths.models / "broken" / "configs" / "broken.txt"
         choices = (
             ModelChoice("Mouse", valid, True, "Schema 3; device matched"),
             ModelChoice("Broken", broken, False, "engine hash mismatch"),
@@ -184,10 +203,15 @@ class ConfigDialogCompatibilityTest(unittest.TestCase):
                     invalid_index, QtCore.Qt.ItemDataRole.ToolTipRole
                 ),
             )
-            self.assertEqual(
-                dialog.model_combo.itemData(dialog.model_combo.count() - 1),
+            self.assertNotIn(
                 "__manual__",
+                [
+                    dialog.model_combo.itemData(index)
+                    for index in range(dialog.model_combo.count())
+                ],
             )
+            self.assertTrue(dialog.cfg_edit.isHidden())
+            self.assertTrue(dialog.cfg_browse_btn.isHidden())
         finally:
             dialog.close()
 
@@ -203,7 +227,7 @@ class ConfigDialogCompatibilityTest(unittest.TestCase):
                 "Please enter valid numeric values for size, FPS, bitrate, and baud.",
             )
 
-            model_cfg = self.root / "model.txt"
+            model_cfg = self.project.paths.models / "model.txt"
             model_cfg.write_text("model")
             dialog.width_edit.setText("1440")
             dialog.inference_enable.setChecked(True)
@@ -229,6 +253,8 @@ class ConfigDialogCompatibilityTest(unittest.TestCase):
         dialog = self._dialog()
         editor = ConfigDialog(
             config={"inference_enabled": False, "task_cfg": str(self.task)},
+            project=self.project,
+            profile_store=self.store,
             experiment_profile_name="  Study A  ",
             show_experiment_profile_editor=True,
         )

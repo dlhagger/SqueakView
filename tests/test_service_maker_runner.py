@@ -140,11 +140,6 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         )
         with (
             mock.patch.object(inference_main, "parse_args", return_value=args),
-            mock.patch.object(
-                inference_main.squeakview_config,
-                "resolve_workspace_path",
-                return_value=self.infer_config,
-            ),
             mock.patch.object(inference_main.runner, "run", return_value=7) as run,
         ):
             returncode = inference_main.main()

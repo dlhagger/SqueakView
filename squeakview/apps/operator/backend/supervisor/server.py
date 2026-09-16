@@ -24,6 +24,7 @@ from squeakview.apps.operator.backend.events import BackendEvent, RunPhase
 from squeakview.apps.operator.backend import manifest
 from squeakview.apps.operator.backend.manager import OperatorBackend
 from squeakview.common.dashboard import DashboardEvent
+from squeakview.project import PROJECT_ENV, RuntimeContext
 
 from .protocol import (
     CommandEnvelope,
@@ -174,12 +175,14 @@ class SupervisorServer:
         self,
         socket_path: Path,
         *,
+        runtime_context: RuntimeContext,
         backend_factory: Callable[..., OperatorBackend] = OperatorBackend,
         gui_connect_timeout_s: float = DEFAULT_GUI_CONNECT_TIMEOUT_S,
         gui_lease_timeout_s: float = DEFAULT_GUI_LEASE_TIMEOUT_S,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.socket_path = Path(socket_path).resolve()
+        self.runtime_context = runtime_context
         self._client: socket.socket | None = None
         self._client_lock = threading.Lock()
         self._sequence = 0
@@ -221,6 +224,7 @@ class SupervisorServer:
         self.backend = backend_factory(
             self._emit_log,
             self._emit_dashboard,
+            runtime_context=runtime_context,
             acquisition_owner=manifest.DURABLE_SUPERVISOR_OWNER,
         )
         self.backend.subscribe(self._emit_backend_event)
@@ -647,6 +651,7 @@ class SupervisorServer:
         listener = self._prepare_listener()
         gui_env = os.environ.copy()
         gui_env[SOCKET_ENV] = str(self.socket_path)
+        gui_env[PROJECT_ENV] = str(self.runtime_context.project.paths.root)
         gui: subprocess.Popen[bytes] | None = None
         worker: threading.Thread | None = None
         client: socket.socket | None = None

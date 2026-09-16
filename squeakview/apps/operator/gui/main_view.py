@@ -132,7 +132,15 @@ def build_main_view(
     preview_host = AspectRatioPreviewHost(preview, parent=preview_group)
     preview_layout.addWidget(preview_host, 1)
 
-    dashboard = BehaviorDashboard(window_sec=300.0, pellet_mode="auto")
+    dashboard = BehaviorDashboard(
+        window_sec=300.0,
+        pellet_mode="auto",
+        disk_root=(
+            window.project.paths.runs
+            if getattr(window, "project", None) is not None
+            else None
+        ),
+    )
     meters_only = dashboard.detach_meters()
     task_state_panel = dashboard.detach_task_panel()
     meters_group = QtWidgets.QWidget()

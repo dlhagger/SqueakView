@@ -10,8 +10,8 @@ from pathlib import Path
 import yaml
 from unittest import mock
 
-from squeakview import config as squeakview_config
 from squeakview import model_package
+from squeakview.apps.operator.backend.contracts import RunRequest
 from squeakview.model_package import ModelPackageError, validate_model_package
 
 
@@ -41,7 +41,7 @@ class ModelPackageTests(unittest.TestCase):
             "keypoints": ["nose"],
             "export": {
                 "builder": "ultralytics",
-                "data": "build_me/test.yaml",
+                "data": "model_sources/test.yaml",
                 "end2end": True,
             },
         }, sort_keys=False))
@@ -367,9 +367,8 @@ class ModelPackageTests(unittest.TestCase):
         ):
             self.assertEqual(model_package.main(), 2)
 
-    def test_default_model_is_not_selected_by_directory_order(self) -> None:
-        self.assertEqual(squeakview_config.DEFAULT_MODEL_NAME, "")
-        self.assertIsNone(squeakview_config.DEFAULT_INFER_CONFIG)
+    def test_run_request_never_selects_a_model_by_directory_order(self) -> None:
+        self.assertIsNone(RunRequest().ds_cfg)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,6 @@ from typing import Callable, Type
 
 from PySide6 import QtWidgets
 
-from squeakview import config as squeakview_config
 from squeakview.apps.operator.backend import process
 from squeakview.apps.operator.gui.config_dialog import ConfigDialog
 from squeakview.apps.operator.gui.session_dialog import (
@@ -28,21 +27,34 @@ from squeakview.common.profiles import (
     SubjectProfile,
     slugify,
 )
+from squeakview.project import Project
 
 
 ConfigCommit = Callable[[dict], None]
 LogEmitter = Callable[[str], None]
 
 
-def default_config_data() -> dict[str, object]:
+def default_config_data(project: Project) -> dict[str, object]:
     """Return the initial GUI configuration without requiring a widget."""
 
     defaults = process.LaunchConfig()
-    default_task = squeakview_config.TASKS_DIR / "default.yaml"
+    default_task_name = project.metadata.default_task
     task_cfg = (
-        default_task
-        if default_task.exists()
-        else squeakview_config.TASKS_DIR / "gonogo_auto.yaml"
+        project.paths.resolve_path(
+            Path("tasks") / default_task_name,
+            within=project.paths.tasks,
+        )
+        if default_task_name
+        else None
+    )
+    default_model_name = project.metadata.default_model
+    default_model_cfg = (
+        project.paths.models
+        / default_model_name
+        / "configs"
+        / f"{default_model_name}.txt"
+        if default_model_name
+        else None
     )
     return {
         "width": int(defaults.width or 1440),
@@ -56,9 +68,12 @@ def default_config_data() -> dict[str, object]:
         "serial_enabled": defaults.serial_enabled,
         "serial_port": defaults.serial_port,
         "serial_baud": defaults.serial_baud,
-        "ds_cfg": str(defaults.ds_cfg) if defaults.ds_cfg else "",
-        "inference_enabled": defaults.inference_enabled,
-        "task_cfg": str(task_cfg),
+        "ds_cfg": str(default_model_cfg) if default_model_cfg else "",
+        # A fresh project deliberately starts without a deployable TensorRT
+        # package. Project Setup enables the normal inference default only
+        # after a validated package has been built and selected.
+        "inference_enabled": bool(default_model_cfg) and defaults.inference_enabled,
+        "task_cfg": str(task_cfg) if task_cfg else "",
         "num_cameras": max(1, defaults.num_cameras),
         "bitrate": defaults.bitrate,
         "mouse_id": "",
@@ -71,10 +86,12 @@ def merge_profile_selection(
     config: dict | None,
     experiment: ExperimentProfile | None,
     subject: SubjectProfile | None,
+    *,
+    project: Project,
 ) -> dict:
     """Overlay a selected experiment and subject on a copied config."""
 
-    data = dict(config or default_config_data())
+    data = dict(config or default_config_data(project))
     if experiment is not None:
         data.update(dict(experiment.config or {}))
         # Identity comes from the selected profile, never from a stale value
@@ -93,16 +110,26 @@ class ResolvedConfig:
     task_cfg: Path | None
 
 
-def resolve_config_paths(config: dict) -> ResolvedConfig:
-    """Resolve workspace-relative paths on a copy of the dialog result."""
+def resolve_config_paths(config: dict, *, project: Project) -> ResolvedConfig:
+    """Resolve and category-bound project-relative paths on a copied config."""
 
     data = dict(config)
     ds_cfg = (
-        squeakview_config.resolve_workspace_path(data.get("ds_cfg"))
+        project.paths.resolve_path(
+            data["ds_cfg"],
+            within=project.paths.models,
+        )
         if data.get("ds_cfg")
         else None
     )
-    task_cfg = squeakview_config.resolve_workspace_path(data.get("task_cfg"))
+    task_cfg = (
+        project.paths.resolve_path(
+            data["task_cfg"],
+            within=project.paths.tasks,
+        )
+        if data.get("task_cfg")
+        else None
+    )
     if ds_cfg is not None:
         data["ds_cfg"] = str(ds_cfg)
     if task_cfg is not None:
@@ -115,16 +142,25 @@ def build_launch_config(
     *,
     bottles: dict[str, object],
     preview_window_id: int | None,
+    project: Project,
     environment: dict[str, str] | None = None,
 ) -> process.LaunchConfig:
     """Translate GUI configuration into an immutable backend request."""
 
     if not config:
         raise RuntimeError("Configuration not set")
-    resolved = resolve_config_paths(config)
+    resolved = resolve_config_paths(config, project=project)
     data = resolved.data
     env = os.environ if environment is None else environment
-    failure_plan = env.get("SQUEAKVIEW_FAILURE_PLAN")
+    failure_plan_value = env.get("SQUEAKVIEW_FAILURE_PLAN")
+    failure_plan = (
+        project.paths.resolve_path(
+            failure_plan_value,
+            within=project.paths.qualification,
+        )
+        if failure_plan_value
+        else None
+    )
     controller_protocol = env.get("SQUEAKVIEW_CONTROLLER_PROTOCOL", "legacy").strip()
     try:
         watchdog_lease_ms = int(
@@ -161,7 +197,7 @@ def build_launch_config(
         mouse_id=data.get("mouse_id", ""),
         experiment_name=data.get("experiment_name", ""),
         task_cfg=resolved.task_cfg,
-        failure_plan=Path(failure_plan) if failure_plan else None,
+        failure_plan=failure_plan,
         bottles=bottles,
         preview_window_id=preview_window_id,
         preview_enabled=not preview_disabled,
@@ -177,6 +213,7 @@ class SessionConfigController:
         experiment_combo: QtWidgets.QComboBox,
         subject_combo: QtWidgets.QComboBox,
         *,
+        project: Project,
         store: ProfileStore,
         commit: ConfigCommit,
         emit: LogEmitter,
@@ -186,6 +223,7 @@ class SessionConfigController:
         subject_dialog: Type[CreateSubjectDialog] = CreateSubjectDialog,
     ) -> None:
         self.parent = parent
+        self.project = project
         self.experiment_combo = experiment_combo
         self.subject_combo = subject_combo
         self.store = store
@@ -258,6 +296,7 @@ class SessionConfigController:
             config,
             self.find_experiment(self.current_experiment_slug()),
             self.find_subject(self.current_subject_id()),
+            project=self.project,
         )
         self.commit(result)
         return result
@@ -285,7 +324,7 @@ class SessionConfigController:
         dialog = self.experiment_dialog(self.parent)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
-        data = config or default_config_data()
+        data = config or default_config_data(self.project)
         experiment_slug = slugify(dialog.experiment_name)
         profile_config = {
             key: str(value) if isinstance(value, Path) else value
@@ -322,7 +361,12 @@ class SessionConfigController:
             self.subject_combo.setCurrentIndex(index)
 
     def show_launcher(self, config: dict | None) -> dict | None:
-        dialog = self.launcher_dialog(self.parent, base_config=config)
+        dialog = self.launcher_dialog(
+            self.parent,
+            project=self.project,
+            base_config=config,
+            profile_store=self.store,
+        )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return None
         return dict(dialog.result_config) if dialog.result_config else None
@@ -331,6 +375,8 @@ class SessionConfigController:
         dialog = self.config_dialog(
             self.parent,
             config=config,
+            profile_store=self.store,
+            project=self.project,
             show_session_setup=False,
         )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:

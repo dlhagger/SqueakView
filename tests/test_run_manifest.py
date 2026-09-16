@@ -35,7 +35,11 @@ class RunManifestServiceTests(unittest.TestCase):
                 experiment_name="study",
                 mouse_id="mouse-1",
             ),
-            workspace=self.root,
+            application_root=self.root,
+            project_root=self.root,
+            project_id="00000000-0000-0000-0000-000000000001",
+            project_name="Test",
+            runs_root=self.root,
             created_at="2026-09-02T10:00:00",
             storage={"free_bytes": 1234},
             model_snapshot=None,
@@ -92,6 +96,17 @@ class RunManifestServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(result["created_at"], "2026-09-02T10:00:00")
+        self.assertEqual(result["schema_version"], "3.0")
+        self.assertEqual(result["application"], {"root": str(self.root)})
+        self.assertNotIn("workspace", result)
+        self.assertEqual(
+            result["project"],
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "Test",
+                "root": str(self.root),
+            },
+        )
         self.assertEqual(result["platform"], {"jetson_model": "test-device"})
         self.assertEqual(result["git"], {"commit": "abc", "dirty": False})
         self.assertEqual(result["storage"]["free_bytes"], 1234)
@@ -183,7 +198,11 @@ class RunManifestServiceTests(unittest.TestCase):
                 inference_enabled=True,
                 serial_enabled=False,
             ),
-            workspace=self.context.workspace,
+            application_root=self.context.application_root,
+            project_root=self.context.project_root,
+            project_id=self.context.project_id,
+            project_name=self.context.project_name,
+            runs_root=self.context.runs_root,
             created_at=self.context.created_at,
             storage=self.context.storage,
             model_snapshot=model_snapshot,
@@ -260,7 +279,7 @@ class RunManifestServiceTests(unittest.TestCase):
         )
         self.assertNotEqual(
             result["native_plugins"]["deepstream_yolo_parser"]["sha256"],
-            result["native_plugins"]["workspace_deepstream_yolo_parser_build"]["sha256"],
+            result["native_plugins"]["application_deepstream_yolo_parser_build"]["sha256"],
         )
         self.assertEqual(result["capture"]["exposure_us"], 4321.0)
         self.assertEqual(
@@ -285,7 +304,11 @@ class RunManifestServiceTests(unittest.TestCase):
                 inference_enabled=False,
                 task_cfg=source,
             ),
-            workspace=self.context.workspace,
+            application_root=self.context.application_root,
+            project_root=self.context.project_root,
+            project_id=self.context.project_id,
+            project_name=self.context.project_name,
+            runs_root=self.context.runs_root,
             created_at=self.context.created_at,
             storage=self.context.storage,
             model_snapshot=None,
@@ -318,7 +341,11 @@ class RunManifestServiceTests(unittest.TestCase):
     def test_in_process_owner_is_explicitly_nonproduction(self) -> None:
         context = RunManifestContext(
             config=self.context.config,
-            workspace=self.context.workspace,
+            application_root=self.context.application_root,
+            project_root=self.context.project_root,
+            project_id=self.context.project_id,
+            project_name=self.context.project_name,
+            runs_root=self.context.runs_root,
             created_at=self.context.created_at,
             storage=self.context.storage,
             model_snapshot=None,
@@ -343,7 +370,7 @@ class RunManifestServiceTests(unittest.TestCase):
 
     def test_terminal_update_preserves_acquisition_provenance(self) -> None:
         original = {
-            "schema_version": "2.0",
+            "schema_version": "3.0",
             "created_at": "original-time",
             "platform": {"jetson_model": "original-device"},
             "git": {"commit": "original", "dirty": False},
@@ -445,7 +472,11 @@ class RunManifestServiceTests(unittest.TestCase):
         plan = FailurePlan("1.0", "serial_controller", "read_error", 10)
         context = RunManifestContext(
             config=self.context.config,
-            workspace=self.context.workspace,
+            application_root=self.context.application_root,
+            project_root=self.context.project_root,
+            project_id=self.context.project_id,
+            project_name=self.context.project_name,
+            runs_root=self.context.runs_root,
             created_at=self.context.created_at,
             storage=self.context.storage,
             model_snapshot=None,

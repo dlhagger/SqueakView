@@ -570,8 +570,8 @@ def main() -> int:
         info = validate_model_package(args.config)
         if args.require_engine_identity and info.engine_build_identity is None:
             raise ModelPackageError(
-                "Model package uses migration-only schema 2; rebuild it with the "
-                "current engine notebook before scientific acquisition"
+                "Model package uses migration-only schema 2; rebuild it from "
+                "Project Setup before scientific acquisition"
             )
     except ModelPackageError as exc:
         print(f"[FAIL] {exc}")

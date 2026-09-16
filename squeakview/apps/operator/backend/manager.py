@@ -30,7 +30,6 @@ from squeakview.apps.operator.backend.events import (
     RunSnapshot,
     RunStateMachine,
 )
-from squeakview import config as squeakview_config
 from squeakview import model_package
 from squeakview.common import dashboard as dashboard_util, run_context
 from squeakview.common import qualification_barrier
@@ -40,6 +39,7 @@ from squeakview.common.diagnostics.qualification_matrix import (
 )
 from squeakview.common.failure_injection import FailurePlan, load_failure_plan
 from squeakview.common import serial as serial_util
+from squeakview.project import PROJECT_ENV, RuntimeContext
 
 
 def _now() -> str:
@@ -75,6 +75,7 @@ class OperatorBackend:
         on_run_started: Callable[[], None] | None = None,
         on_run_failed: Callable[[str], None] | None = None,
         *,
+        runtime_context: RuntimeContext,
         acquisition_owner: str = manifest.IN_PROCESS_DEV_OWNER,
     ):
         if acquisition_owner not in {
@@ -83,6 +84,7 @@ class OperatorBackend:
         }:
             raise ValueError(f"unsupported acquisition owner: {acquisition_owner!r}")
         self._acquisition_owner = acquisition_owner
+        self.runtime_context = runtime_context
         self.emit = emit_log
         self.ingest = ingest_dashboard
         self.on_run_started = on_run_started
@@ -118,7 +120,7 @@ class OperatorBackend:
         self._capture_drain_coordinator = capture_drain.CaptureDrainCoordinator()
         self._failure_plan: FailurePlan | None = None
         self._acquisition_lock = AcquisitionLock(
-            run_context.RUNS_DIR / ".acquisition.lock"
+            runtime_context.user.acquisition_lock
         )
 
     def _log(self, message: str) -> None:
@@ -402,7 +404,11 @@ class OperatorBackend:
     def _manifest_context(self) -> manifest.RunManifestContext:
         return manifest.RunManifestContext(
             config=self.launch_cfg,
-            workspace=process.WORKSPACE,
+            application_root=self.runtime_context.app.root,
+            project_root=self.runtime_context.project.paths.root,
+            project_id=self.runtime_context.project.metadata.project_id,
+            project_name=self.runtime_context.project.metadata.name,
+            runs_root=self.runtime_context.project.paths.runs,
             created_at=self._run_started_at,
             storage=self._run_storage_info,
             model_snapshot=self._model_snapshot,
@@ -436,7 +442,7 @@ class OperatorBackend:
 
     @staticmethod
     def _git_snapshot() -> dict[str, Any]:
-        return manifest.RunManifestService.git_snapshot(process.WORKSPACE)
+        return manifest.RunManifestService.git_snapshot(process.APPLICATION_ROOT)
 
     def _run_output_snapshot(self, run_dir: Path) -> dict[str, Any]:
         return self._manifest_service.output_snapshot(run_dir)
@@ -478,6 +484,11 @@ class OperatorBackend:
         target = Path(run_dir) if run_dir is not None else self.state.run_dir
         if target is None:
             raise RuntimeError("no active run directory for bottle metadata")
+        target = self.runtime_context.project.paths.resolve_path(
+            target,
+            within=self.runtime_context.project.paths.runs,
+            must_exist=True,
+        )
         summary = self._write_bottle_measurements(target, bottles)
         self._write_run_manifest(target)
         try:
@@ -859,16 +870,32 @@ class OperatorBackend:
 
         return startup.StartupHooks(
             log=self._log,
-            resolve_workspace_path=squeakview_config.resolve_workspace_path,
+            resolve_task_path=lambda path: self.runtime_context.project.paths.resolve_path(
+                path,
+                within=self.runtime_context.project.paths.tasks,
+            ),
+            resolve_model_path=lambda path: self.runtime_context.project.paths.resolve_path(
+                path,
+                within=self.runtime_context.project.paths.models,
+            ),
+            resolve_failure_plan_path=lambda path: self.runtime_context.project.paths.resolve_path(
+                path,
+                within=self.runtime_context.project.paths.qualification,
+            ),
             load_failure_plan=load_failure_plan,
             validate_model=validate_model,
-            assert_storage_ready=run_context.assert_runs_dir_ready,
+            assert_storage_ready=lambda: run_context.assert_runs_dir_ready(
+                self.runtime_context.project.paths.runs
+            ),
             acquire_lock=acquire_lock,
             release_lock=self._acquisition_lock.release,
             now_iso=lambda: time.strftime("%Y-%m-%dT%H:%M:%S"),
             device_context=device_context_snapshot,
             set_fan_max=self._set_fan_max,
-            create_run_dir=run_context.create_run_dir,
+            create_run_dir=lambda **kwargs: run_context.create_run_dir(
+                runs_dir=self.runtime_context.project.paths.runs,
+                **kwargs,
+            ),
             preview_socket_paths=process.preview_socket_paths,
             initialize_runtime=initialize_runtime,
             establish_run=establish_run,
@@ -901,7 +928,8 @@ class OperatorBackend:
                     cfg,
                     device,
                     default_matrix_path=(
-                        process.WORKSPACE / "qualification/matrix.v1.yaml"
+                        self.runtime_context.project.paths.qualification
+                        / "matrix.v1.yaml"
                     ),
                     environ=os.environ,
                 )
@@ -924,9 +952,13 @@ class OperatorBackend:
                     serial_enabled=cfg.serial_enabled,
                     serial_port=cfg.serial_port,
                 ),
-                workspace=process.WORKSPACE,
+                workspace=self.runtime_context.app.root,
                 python_bin=os.fsdecode(os.environ.get("PYTHON_BIN") or sys.executable),
                 emit=self._log,
+                environ={
+                    **os.environ,
+                    PROJECT_ENV: str(self.runtime_context.project.paths.root),
+                },
             )
             self._preflight_evidence = preflight.evidence_snapshot(result)
             if not result.passed:

@@ -108,7 +108,9 @@ class StartupResult:
 @dataclass(frozen=True, slots=True)
 class StartupHooks:
     log: Callable[[str], None]
-    resolve_workspace_path: Callable[[Path], Path | None]
+    resolve_task_path: Callable[[Path], Path]
+    resolve_model_path: Callable[[Path], Path]
+    resolve_failure_plan_path: Callable[[Path], Path]
     load_failure_plan: Callable[[Path], FailurePlan]
     validate_model: Callable[[Path], ModelSelection]
     assert_storage_ready: Callable[[], Mapping[str, Any]]
@@ -261,16 +263,23 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
     if not cfg.task_cfg:
         return _reject(hooks, "task config required; aborting run", prefix="BACKEND")
 
-    cfg = replace(
-        cfg,
-        task_cfg=hooks.resolve_workspace_path(cfg.task_cfg),
-        ds_cfg=(hooks.resolve_workspace_path(cfg.ds_cfg) if cfg.ds_cfg else None),
-        failure_plan=(
-            hooks.resolve_workspace_path(cfg.failure_plan)
-            if cfg.failure_plan
-            else None
-        ),
-    )
+    try:
+        cfg = replace(
+            cfg,
+            task_cfg=hooks.resolve_task_path(cfg.task_cfg),
+            ds_cfg=(hooks.resolve_model_path(cfg.ds_cfg) if cfg.ds_cfg else None),
+            failure_plan=(
+                hooks.resolve_failure_plan_path(cfg.failure_plan)
+                if cfg.failure_plan
+                else None
+            ),
+        )
+    except (OSError, ValueError) as exc:
+        return _reject(
+            hooks,
+            f"scientific input path is outside the active project: {exc}",
+            prefix="BACKEND",
+        )
     if cfg.task_cfg is None or not Path(cfg.task_cfg).exists():
         return _reject(hooks, f"task config missing: {cfg.task_cfg}", prefix="BACKEND")
     try:
@@ -325,7 +334,7 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
             return _reject(
                 hooks,
                 "selected model package has no verified TensorRT engine build identity; "
-                "rebuild it on this device with build_engine/build_engine.ipynb to create "
+                "rebuild it on this device from the Project Setup screen to create "
                 "a schema-3 model manifest before starting inference",
                 prefix="MODEL",
             )

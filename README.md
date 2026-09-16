@@ -48,11 +48,11 @@ future release and is not part of the initial workflow.
 ## Repository layout
 
 ```text
-build_me/                         Tracked source checkpoints and dataset YAMLs
-build_engine/build_engine.ipynb  YOLO26 → ONNX/TensorRT model-package builder
+build_engine/                    Project Setup model-builder documentation
 configs/                         Runtime tracker configuration
 native/flir_gst_source/          Scientific Spinnaker GStreamer source
 native/nvdsinfer_custom_impl_yolo/ DeepStream YOLO26 detector parser
+resources/project_template/      New-project tasks, qualification, and model seeds
 squeakview/apps/inference/        Live and offline PyServiceMaker pipelines
 squeakview/apps/operator/         Qt operator GUI and run lifecycle
 squeakview/common/                Run, profile, serial, and dashboard utilities
@@ -63,13 +63,56 @@ data_viz/analysis_demo_viz.ipynb Scientific run analysis and visualization
 tests/                            Pure-Python and on-device pipeline tests
 ```
 
-Device-local state is written under `models/`, `profiles/`, and `runs/`. Those
-directories are ignored by Git. `build_me/` is intentionally tracked and its
-source YAML files are treated as read-only ground truth by the builder.
+Application code and scientific data have separate ownership. Each project owns
+its `runs/`, `models/`, `model_sources/`, `tasks/`, `profiles/`, and
+`qualification/` directories outside this repository. The application install
+is replaceable and normal operation does not write to it. New projects receive
+independent copies of MouseHouse v2, stock YOLO pose, the default task, and the
+qualification templates from `resources/project_template/`.
 
-To build and deploy a custom model, place its `.pt` checkpoint and corresponding
-dataset YAML under `build_me/`, then run `build_engine/build_engine.ipynb` to
-generate a device-specific package.
+To build a model, put any additional `.pt` checkpoint and dataset YAML together
+in a direct child of the project's `model_sources/` directory. Launch
+SqueakView, select the project, and use the pre-acquisition **Project Setup**
+screen. Generated device-specific packages are published only into that
+project's `models/` directory.
+
+## Install and update layout
+
+Keep the Git checkout in Documents and let SqueakView create projects beside it:
+
+```text
+~/Documents/
+├── SqueakView/           application code, `.venv`, and native builds
+└── SqueakView Projects/  project settings, models, profiles, and runs
+```
+
+For a fresh checkout:
+
+```bash
+cd "$HOME/Documents"
+git clone https://github.com/dlhagger/SqueakView.git
+cd SqueakView
+uv venv --python 3.12 --system-site-packages
+uv sync
+bash scripts/setup_jetson.sh
+```
+
+Reboot after the one-time setup. To update later, finish any active run, close
+SqueakView, and update only the application checkout:
+
+```bash
+cd "$HOME/Documents/SqueakView"
+git pull --ff-only
+uv sync
+bash scripts/build_native.sh
+.venv/bin/python -m pytest -q
+bash squeakview.sh
+```
+
+Routine application updates do not require a reboot. Git, dependency, and
+native-build operations never target `~/Documents/SqueakView Projects`, so they
+cannot replace scientific data. See [the project workflow](docs/PROJECT_WORKFLOW.md)
+for project creation, model building, rollback, and acceptance checks.
 
 ## Jetson device setup
 
@@ -83,10 +126,16 @@ The script installs NVIDIA's Jetson FFmpeg package (including `ffprobe`) and
 the complete GStreamer runtime/plugin and native build prerequisites, builds
 both the FLIR GStreamer source and the
 DeepStream YOLO parser against the installed CUDA toolkit, and adds that user
-to the `dialout` group for RP2040/USB serial access. It can be launched from any
-working directory. Reboot after it completes because a group change cannot
-affect an already-running login session. Do not run the application itself
-with `sudo`.
+to the `dialout` group for RP2040/USB serial access. It also creates
+`~/Documents/SqueakView Projects` when absent and leaves an existing directory
+untouched. It can be launched from any working directory. Reboot after it
+completes because a group change cannot affect an already-running login session.
+If the whole setup script is invoked through `sudo`, it deliberately drops back
+to the desktop user for native compilation so the checkout does not acquire
+root-owned build files. Do not run the application itself with `sudo`.
+
+After the one-time privileged setup, checkout updates rebuild their native
+components without sudo through `bash scripts/build_native.sh`.
 
 ## Platform prerequisites
 
@@ -190,31 +239,32 @@ Spinnaker upgrades.
 
 ## Build a YOLO26 pose model package
 
-Fresh clones contain model inputs but no generated TensorRT packages. Start
-Jupyter from the repository root:
+Fresh projects contain model inputs but no generated TensorRT packages. Launch
+SqueakView normally:
 
 ```bash
-uv run jupyter lab build_engine/build_engine.ipynb
+bash squeakview.sh
 ```
 
-Edit only the first notebook cell for the source checkpoint, dataset YAML,
-package name, precision, batch size, image size, and confidence thresholds.
-The remaining cells:
+After project selection, Project Setup defaults to the project-owned MouseHouse
+v2 source package. Its isolated builder worker holds the project's exclusive
+writer lock and:
 
-1. Read standard class names, keypoint names, and keypoint shape from the YAML
+1. Reads standard class names, keypoint names, and keypoint shape from the YAML
    and checkpoint without modifying the YAML.
-2. Pass the YAML to `Ultralytics.export(data=...)`.
-3. Export an NMS-free, end-to-end FP16 or FP32 TensorRT engine on the target
+2. Passes the YAML to `Ultralytics.export(data=...)`.
+3. Exports an NMS-free, end-to-end FP16 or FP32 TensorRT engine on the target
    Jetson using Ultralytics `nms=False`.
-4. Strip the Ultralytics metadata prefix to produce the raw TensorRT plan
+4. Strips the Ultralytics metadata prefix to produce the raw TensorRT plan
    expected by DeepStream.
-5. Validate ONNX and TensorRT input/output shapes.
-6. Write and validate a schema-3 model package with a schema-2 pose sidecar.
+5. Validates ONNX and TensorRT input/output shapes.
+6. Writes and validates a schema-3 model package with a schema-2 pose sidecar.
+7. Exits and releases its CUDA context before the acquisition supervisor starts.
 
 Generated layout:
 
 ```text
-models/<model_name>/
+$SQUEAKVIEW_PROJECT/models/<model_name>/
   weights/<source>.pt
   onnx/<model>_<precision>_b<batch>.onnx
   engines/<model>_<precision>_b<batch>.engine
@@ -247,6 +297,7 @@ Select a generated model explicitly and run preflight with the project
 interpreter:
 
 ```bash
+export SQUEAKVIEW_PROJECT="$HOME/Documents/SqueakView Projects/My Project"
 PYTHON_BIN=.venv/bin/python \
 SQUEAKVIEW_MODEL_NAME=<model_name> \
 bash scripts/preflight.sh
@@ -256,14 +307,14 @@ You can provide the config directly instead:
 
 ```bash
 PYTHON_BIN=.venv/bin/python \
-DS_CFG=models/<model_name>/configs/<model_name>.txt \
+DS_CFG="$SQUEAKVIEW_PROJECT/models/<model_name>/configs/<model_name>.txt" \
 bash scripts/preflight.sh
 ```
 
 Run the same check remotely:
 
 ```bash
-ssh -t jetson@<jetson-host> 'cd ~/Documents/SqueakView && PYTHON_BIN=.venv/bin/python SQUEAKVIEW_MODEL_NAME=<model_name> bash scripts/preflight.sh'
+ssh -t jetson@<jetson-host> 'cd ~/Documents/SqueakView && export SQUEAKVIEW_PROJECT="$HOME/Documents/SqueakView Projects/My Project" && PYTHON_BIN=.venv/bin/python SQUEAKVIEW_MODEL_NAME=<model_name> bash scripts/preflight.sh'
 ```
 
 For camera-only testing without inference:
@@ -292,7 +343,7 @@ self-test. No readiness result is reused across recordings.
 Inference preflight requires a schema-3 engine build identity matching the
 current TensorRT, CUDA, Jetson Linux, GPU capability, and device. A schema-2
 package remains readable for migration inspection but is blocked from
-scientific acquisition; rebuild it with `build_engine/build_engine.ipynb`.
+scientific acquisition; rebuild it from the Project Setup screen.
 
 DeepStream may print plugin-scanner warnings for unused optional plugins when an
 OpenTelemetry library is absent. They do not affect SqueakView if every required
@@ -313,13 +364,22 @@ easily achieved by installing jtop.
 bash squeakview.sh
 ```
 
+The small project chooser appears on every launch and preselects the most
+recently opened valid project. You can create a project, browse to another one,
+or confirm the preselected project. It creates the default projects parent when
+missing and never rewrites an existing one. Project Setup then lets you build or
+select the project default model before the supervisor, experiments, or subjects
+start. For automation or development, pass an existing project explicitly:
+`bash squeakview.sh /absolute/project/path`; Project Setup still appears.
+
 This detached launcher is the production path. It starts a Qt-free supervisor,
 which owns the controller, capture, run lock, and finalization while launching
 and monitoring the required GUI. If the GUI exits or loses its exclusive IPC
 lease during a run, the supervisor stops acquisition and completes fail-closed
 finalization; acquisition never continues headlessly. Terminal or VS Code loss
 does not end the supervised session. Separate bounded GUI and supervisor logs
-are written under `runs/logs/`; each mirror is capped at 32 MiB and partial
+are written under `${XDG_STATE_HOME:-$HOME/.local/state}/SqueakView/logs/`;
+each mirror is capped at 32 MiB and partial
 lines are capped at 64 KiB.
 Stop requests are acknowledged immediately by the supervisor. Capture closure
 and post-run analysis continue in a supervisor-owned worker while the responsive
@@ -349,26 +409,30 @@ The host includes an explicitly opt-in, production-disqualified experimental v1
 implementation for firmware development and bench testing. Legacy behavior is
 unchanged by default, and the application does not claim watchdog protection.
 
-Direct GUI startup is blocked by default because it would bypass durable
-supervision. For foreground development only, opt in visibly:
+The complete project layout, model-build handoff, path ownership rules, and
+short on-device acceptance pass are in
+[`docs/PROJECT_WORKFLOW.md`](docs/PROJECT_WORKFLOW.md).
+
+Direct GUI startup is blocked by default because it bypasses durable
+supervision. For foreground development only, opt in visibly and provide an
+explicit project:
 
 ```bash
-SQUEAKVIEW_ALLOW_INPROCESS_BACKEND=1 uv run squeakview_gui.py
+SQUEAKVIEW_PROJECT="/absolute/path/to/My Project" \
+SQUEAKVIEW_ALLOW_INPROCESS_BACKEND=1 \
+.venv/bin/python squeakview_gui.py
 ```
 
-Create or select an experiment, select the model config explicitly, configure
-the FLIR camera and optional serial controller, and start the run. Serial
-capture defaults to `/dev/ttyACM0` at 115200 baud; choose the actual device shown
-by `ls /dev/ttyACM*`.
+Scientific operation must use `bash squeakview.sh`. Serial capture defaults to
+`/dev/ttyACM0` at 115200 baud; choose the actual device shown by
+`ls /dev/ttyACM*`.
 
 Useful path overrides:
 
 ```bash
-export SQUEAKVIEW_WORKSPACE=/path/to/SqueakView
 export SQUEAKVIEW_DEEPSTREAM_SDK=/opt/nvidia/deepstream/deepstream
-export SQUEAKVIEW_MODEL_ROOT=/path/to/models
-export SQUEAKVIEW_RUNS_DIR=/path/to/runs
-bash squeakview.sh
+export SQUEAKVIEW_PROJECTS_DIR="$HOME/Documents/SqueakView Projects"
+bash squeakview.sh /absolute/path/to/a/project
 ```
 
 The supervised backend launches inference first. For free-running capture, the
@@ -434,8 +498,9 @@ establish its acquisition overhead. Debug-profile runs are explicitly marked
 non-production. Qualify only the debug-on member with the narrow exception:
 
 ```bash
-.venv/bin/python scripts/qualify_run.py runs/<debug-off-run>
-.venv/bin/python scripts/qualify_run.py runs/<debug-on-run> --allow-debug-profile
+export SQUEAKVIEW_PROJECT="/absolute/path/to/My Project"
+.venv/bin/python scripts/qualify_run.py "$SQUEAKVIEW_PROJECT/runs/<debug-off-run>"
+.venv/bin/python scripts/qualify_run.py "$SQUEAKVIEW_PROJECT/runs/<debug-on-run>" --allow-debug-profile
 ```
 
 After both matched runs pass `scripts/qualify_run.py`, compare their bounded
@@ -443,13 +508,13 @@ recording and system metrics with:
 
 ```bash
 .venv/bin/python scripts/compare_debug_overhead.py \
-  runs/<debug-off-run> runs/<debug-on-run> \
-  --thresholds qualification/<approved-overhead-limits>.yaml \
-  --output qualification/debug-overhead.json
+  "$SQUEAKVIEW_PROJECT/runs/<debug-off-run>" "$SQUEAKVIEW_PROJECT/runs/<debug-on-run>" \
+  --thresholds "$SQUEAKVIEW_PROJECT/qualification/<approved-overhead-limits>.yaml" \
+  --output "$SQUEAKVIEW_PROJECT/qualification/debug-overhead.json"
 ```
 
 Follow the complete non-automating acquisition and evidence-retention procedure
-in [qualification/DEBUG_OVERHEAD_PROTOCOL.md](qualification/DEBUG_OVERHEAD_PROTOCOL.md).
+in [docs/qualification/DEBUG_OVERHEAD_PROTOCOL.md](docs/qualification/DEBUG_OVERHEAD_PROTOCOL.md).
 The checker accepts `--case-id` to require both GUI-launched runs to carry the
 same backend-enforced qualification binding, and rejects nonterminal or
 non-supervised runs.
@@ -577,7 +642,8 @@ explicit qualification option, not an automatic shutdown fallback.
 Generate a bounded-memory qualification summary after finalization with:
 
 ```bash
-.venv/bin/python scripts/qualify_run.py runs/<experiment>/<subject>/<run>
+export SQUEAKVIEW_PROJECT="/absolute/path/to/My Project"
+.venv/bin/python scripts/qualify_run.py "$SQUEAKVIEW_PROJECT/runs/<experiment>/<subject>/<run>"
 ```
 
 The checked-in JetPack 7.2.1 limits profile is intentionally marked
@@ -594,16 +660,16 @@ fails preview-enabled qualification, but preview loss and preview-observability
 failure never invalidate the independent scientific recording.
 
 The full 24-cell short/one-hour/full-duration matrix is defined in
-`qualification/matrix.v1.yaml` across inference, preview, and 25 W/MAXN_SUPER
+`$SQUEAKVIEW_PROJECT/qualification/matrix.v1.yaml` across inference, preview, and 25 W/MAXN_SUPER
 modes. The complete operator procedure, including hardware prerequisites,
 measurement-only limits, durable campaign outputs, and recovery from incomplete
-cells, is in [qualification/QUALIFICATION_WORKFLOW.md](qualification/QUALIFICATION_WORKFLOW.md).
+cells, is in [docs/qualification/QUALIFICATION_WORKFLOW.md](docs/qualification/QUALIFICATION_WORKFLOW.md).
 Enumerate the canonical IDs and create a non-overwriting assignment checklist:
 
 ```bash
 .venv/bin/python scripts/qualify_matrix.py --list-cases
 .venv/bin/python scripts/qualify_matrix.py \
-  --init-assignments qualification/assignments.local.yaml
+  --init-assignments "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml"
 ```
 
 Print the next unassigned case, its exact environment, and a copyable terminal
@@ -611,7 +677,7 @@ launcher command without changing the checklist or starting hardware:
 
 ```bash
 .venv/bin/python scripts/qualify_matrix.py \
-  qualification/assignments.local.yaml \
+  "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
   --next-case
 ```
 
@@ -620,9 +686,9 @@ coverage with:
 
 ```bash
 .venv/bin/python scripts/qualify_matrix.py \
-  qualification/assignments.local.yaml \
+  "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
   --assign '<case-id>' '/absolute/path/to/completed/run'
-.venv/bin/python scripts/qualify_matrix.py qualification/assignments.local.yaml
+.venv/bin/python scripts/qualify_matrix.py "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml"
 ```
 
 For the acquisition itself, export
@@ -654,9 +720,9 @@ archive tree byte-for-byte.
 
 The destructive bench procedure for validating behavior after sudden input
 power loss is documented in
-[`qualification/HARD_POWER_LOSS_PROTOCOL.md`](qualification/HARD_POWER_LOSS_PROTOCOL.md).
+[`docs/qualification/HARD_POWER_LOSS_PROTOCOL.md`](docs/qualification/HARD_POWER_LOSS_PROTOCOL.md).
 The gated boundary-fault procedure and supported plan schema are documented in
-[`qualification/FAILURE_INJECTION_PROTOCOL.md`](qualification/FAILURE_INJECTION_PROTOCOL.md).
+[`docs/qualification/FAILURE_INJECTION_PROTOCOL.md`](docs/qualification/FAILURE_INJECTION_PROTOCOL.md).
 
 The FLIR chunk `FrameID` is stored as `camera_frame_id`. It increments for
 every acquired image. The aligner derives a per-run offset between that hardware
@@ -800,13 +866,13 @@ SQUEAKVIEW_DISABLE_PREVIEW=1 bash squeakview.sh
 Run the test suite without changing the environment:
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m pytest -q
 ```
 
 ## Git policy
 
 Commit source code, tests, documentation, notebooks without saved outputs,
-configuration, native build recipes, and the tracked `build_me/` model inputs.
+configuration, native build recipes, and shipped project-template model inputs.
 Do not commit device-local or generated state:
 
 ```text
