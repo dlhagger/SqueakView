@@ -31,6 +31,7 @@ from squeakview.apps.operator.backend.events import (
     RunStateMachine,
 )
 from squeakview import model_package
+from squeakview.common import clock_validation
 from squeakview.common import dashboard as dashboard_util, run_context
 from squeakview.common import qualification_barrier
 from squeakview.common.device_context import device_context_snapshot
@@ -115,6 +116,7 @@ class OperatorBackend:
         self._device_context: dict[str, object] | None = None
         self._task_config_snapshot: dict[str, object] | None = None
         self._preflight_evidence: dict[str, object] | None = None
+        self._clock_validation_evidence: dict[str, object] | None = None
         self._qualification_case: dict[str, Any] | None = None
         self._manifest_service = manifest.RunManifestService(self._log)
         self._capture_drain_coordinator = capture_drain.CaptureDrainCoordinator()
@@ -171,6 +173,22 @@ class OperatorBackend:
             run_dir=self.state.run_dir,
             message=message,
             payload={"previous_phase": previous.value, **payload},
+        )
+        for callback in tuple(self._subscribers):
+            try:
+                callback(event)
+            except Exception as exc:
+                self._log(f"[BACKEND] event subscriber failed: {exc}")
+
+    def _publish_event(
+        self, event_type: str, *, message: str | None = None, **payload: object
+    ) -> None:
+        event = BackendEvent(
+            type=event_type,
+            phase=self._state_machine.phase,
+            run_dir=self.state.run_dir,
+            message=message,
+            payload=payload,
         )
         for callback in tuple(self._subscribers):
             try:
@@ -426,6 +444,7 @@ class OperatorBackend:
             acquisition_owner=self._acquisition_owner,
             task_config_snapshot=self._task_config_snapshot,
             preflight_evidence=self._preflight_evidence,
+            clock_validation=self._clock_validation_evidence,
             qualification_case=self._qualification_case,
             controller_watchdog=(
                 self.state.serial.watchdog_snapshot
@@ -725,6 +744,7 @@ class OperatorBackend:
                     else None
                 )
                 self._task_config_snapshot = None
+                self._clock_validation_evidence = None
                 self._inference_ready.clear()
                 self._stop_requested.clear()
             self._recording_started = False
@@ -836,6 +856,75 @@ class OperatorBackend:
             holder["handle"] = handle
             return handle
 
+        def validate_clock(
+            handle: serial_util.SerialHandle, prepared: startup.PreparedRun
+        ) -> dict[str, Any]:
+            evidence_path = prepared.run_dir / "diagnostics" / "clock_validation.json"
+
+            def publish(state: str, snapshot: dict[str, Any]) -> None:
+                summary = snapshot.get("after") or snapshot.get("before") or {}
+                self._publish_event(
+                    "clock_preflight",
+                    message=state,
+                    validation_state=state,
+                    ntp_synchronized=bool(
+                        dict(snapshot.get("host") or {}).get("ntp_synchronized", False)
+                    ),
+                    rtc_valid=(
+                        summary.get("all_rtc_valid")
+                        if isinstance(summary, dict)
+                        else None
+                    ),
+                    median_offset_seconds=(
+                        summary.get("median_offset_seconds")
+                        if isinstance(summary, dict)
+                        else None
+                    ),
+                    median_round_trip_ms=(
+                        summary.get("median_round_trip_ms")
+                        if isinstance(summary, dict)
+                        else None
+                    ),
+                    correction_requested=bool(snapshot.get("correction_requested")),
+                    correction_applied=bool(snapshot.get("correction_applied")),
+                    validation_timestamp=snapshot.get("completed_utc")
+                    or snapshot.get("started_utc"),
+                    evidence_path=str(evidence_path),
+                    reason=snapshot.get("reason"),
+                    detail=snapshot.get("detail"),
+                )
+
+            try:
+                host_status = clock_validation.host_time_status()
+            except Exception as exc:
+                host_status = {
+                    "ntp_synchronized": False,
+                    "timezone": None,
+                    "checked_utc": clock_validation.utc_now(),
+                    "query_error": f"{type(exc).__name__}: {exc}",
+                }
+            record = clock_validation.validate_clock(
+                handle,
+                host_status=host_status,
+                correct=prepared.config.allow_rtc_correction,
+                controller_identifier=prepared.config.serial_port,
+                progress=publish,
+            )
+            record["evidence_path"] = str(evidence_path)
+            run_context.atomic_write_json(evidence_path, record)
+            self._clock_validation_evidence = dict(record)
+            run_context.update_status(
+                prepared.run_dir,
+                clock_validation=self._clock_validation_evidence,
+            )
+            self._write_run_manifest(prepared.run_dir, required=True)
+            publish(str(record.get("validation_state") or "VALIDATION_ERROR"), record)
+            self._log(
+                "[CLOCK] preflight "
+                f"{record.get('result')}: {record.get('reason')} → {evidence_path}"
+            )
+            return record
+
         def ready_timeout() -> float:
             return _bounded_ready_timeout()
 
@@ -904,6 +993,7 @@ class OperatorBackend:
             create_serial=create_serial,
             set_serial=lambda handle: setattr(self.state, "serial", handle),
             arm_serial_runtime=lambda: setattr(self, "_serial_runtime_armed", True),
+            validate_clock=validate_clock,
             spawn_capture=spawn_capture,
             set_capture=lambda handle: setattr(self.state, "inference", handle),
             after_capture_spawn=lambda run_dir: qualification_barrier.wait_at_barrier(

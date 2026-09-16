@@ -29,6 +29,7 @@ class RunRequest:
     serial_enabled: bool = True
     serial_port: str = "/dev/ttyACM0"
     serial_baud: int = 115200
+    allow_rtc_correction: bool = False
     controller_protocol: str = "legacy"
     controller_watchdog_lease_ms: int = 1500
     arduino_fps: int = 30

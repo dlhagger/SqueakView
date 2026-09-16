@@ -453,6 +453,30 @@ FFmpeg check, skipped/failed preflight, or indeterminate automatic-suspend
 policy cannot qualify as scientific production. This also prevents direct IPC
 clients from bypassing the check.
 
+For every controller-backed experiment, startup also validates the MouseHouse
+controller RTC through the already-open serial transport before capture is
+launched or controller `START` is sent. The controller uses the PCF8523 as its
+sole RTC. Never attach a DS3231 at the same time: both chips have the fixed I²C
+address `0x68`. SqueakView first requires the Jetson to report NTP
+synchronization, then collects seven `TIME_SYNC` exchanges approximately 100 ms
+apart. All seven must report `RTC_VALID`; the median offset of the three
+lowest-round-trip samples must be within ±1.5 seconds.
+
+If the clock is invalid or outside tolerance, acquisition remains blocked. RTC
+correction is available only when **Allow one pre-run controller RTC correction**
+was explicitly enabled in run configuration. SqueakView then sends one
+whole-second `SET_RTC`, requires its acknowledgement, and validates a completely
+new seven-sample burst. An already-passing clock is never corrected. Validation
+and correction are prohibited while a controller session or feed is active;
+`DEVICE_BUSY`, timeouts, malformed responses, and NACKs all fail closed. The
+complete record is saved as `diagnostics/clock_validation.json`, referenced by
+run status and `run_manifest.json`, and summarized in the GUI's Clock Preflight
+section.
+
+The RTC establishes UTC only before the experiment. During acquisition, event
+timestamps remain anchored to the RP2040 monotonic clock; SqueakView performs no
+continuous RTC synchronization and does not alter session timestamp formats.
+
 Startup and the capture child enforce the same free-space reserve (1 GB by
 default). During long runs the child rechecks it every five seconds and requests
 a fatal but orderly EOS/container close before the filesystem is exhausted.

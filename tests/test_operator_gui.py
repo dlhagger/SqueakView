@@ -303,6 +303,27 @@ class BehaviorDashboardTests(unittest.TestCase):
         finally:
             dashboard.close()
 
+    def test_reset_run_data_clears_raster_and_counts_but_preserves_jam(self) -> None:
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        try:
+            dashboard.ingest("POKE_START,1000000,1,L,1")
+            dashboard.ingest(
+                "FEED_JAM,1000001,2,nan,1,69420,69420,69420,Feeding,jammed"
+            )
+
+            dashboard.reset_run_data()
+
+            self.assertTrue(dashboard.feeder_jammed)
+            self.assertIsNone(dashboard._first_event_at)
+            self.assertTrue(all(value == 0 for value in dashboard.counters.values()))
+            self.assertTrue(
+                all(not timestamps for timestamps in dashboard.series_events.values())
+            )
+        finally:
+            dashboard.close()
+
     def test_auto_pellet_mode_detects_retrieval_events(self) -> None:
         from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
 

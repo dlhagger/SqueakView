@@ -94,6 +94,7 @@ class ConfigDialog(QtWidgets.QDialog):
         self.trigger_chk = view.trigger_chk
         self.arduino_fps_edit = view.arduino_fps_edit
         self.serial_enable = view.serial_enable
+        self.rtc_correction_enable = view.rtc_correction_enable
         self.inference_enable = view.inference_enable
         self.task_cfg_edit = view.task_cfg_edit
         self.serial_port_edit = view.serial_port_edit
@@ -122,11 +123,13 @@ class ConfigDialog(QtWidgets.QDialog):
         existing_slug = str(cfg.get("experiment_name", ""))
         self._result: dict | None = None
         self.inference_enable.toggled.connect(self._on_inference_toggled)
+        self.serial_enable.toggled.connect(self.rtc_correction_enable.setEnabled)
         self.model_combo.currentIndexChanged.connect(self._on_model_selected)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self.existing_experiment_combo.currentIndexChanged.connect(self._on_existing_experiment_changed)
         self.existing_subject_combo.currentIndexChanged.connect(self._on_existing_subject_changed)
         self._on_inference_toggled(self.inference_enable.isChecked())
+        self.rtc_correction_enable.setEnabled(self.serial_enable.isChecked())
         if existing_slug:
             idx = self.existing_experiment_combo.findData(existing_slug)
             if idx >= 0:
@@ -436,6 +439,8 @@ class ConfigDialog(QtWidgets.QDialog):
             self.trigger_chk.setChecked(bool(cfg["trigger_on"]))
         if "serial_enabled" in cfg:
             self.serial_enable.setChecked(bool(cfg["serial_enabled"]))
+        if "allow_rtc_correction" in cfg:
+            self.rtc_correction_enable.setChecked(bool(cfg["allow_rtc_correction"]))
         if "inference_enabled" in cfg:
             self.inference_enable.setChecked(bool(cfg["inference_enabled"]))
         self._on_inference_toggled(self.inference_enable.isChecked())
@@ -506,6 +511,7 @@ class ConfigDialog(QtWidgets.QDialog):
                 capture_backend=self._capture_backend,
                 trigger_enabled=self.trigger_chk.isChecked(),
                 serial_enabled=self.serial_enable.isChecked(),
+                allow_rtc_correction=self.rtc_correction_enable.isChecked(),
                 serial_port=self.serial_port_edit.text(),
                 inference_enabled=self.inference_enable.isChecked(),
                 ds_cfg=self.cfg_edit.text(),

@@ -50,6 +50,7 @@ class DockWorkspaceTests(unittest.TestCase):
         for card_id in (
             "preview",
             "system",
+            "clock",
             "task",
             "bottles",
             "behavior",
@@ -61,8 +62,9 @@ class DockWorkspaceTests(unittest.TestCase):
 
     def test_default_is_locked_complete_and_hides_optional_events(self) -> None:
         self.assertFalse(self.workspace.layout_editable)
-        self.assertEqual(len(self.workspace.cards), 6)
+        self.assertEqual(len(self.workspace.cards), 7)
         self.assertTrue(self.workspace.cards["events"].isHidden())
+        self.assertTrue(self.workspace.cards["clock"].isHidden())
         for dock in self.workspace.cards.values():
             self.assertEqual(
                 dock.features(),
@@ -106,6 +108,7 @@ class DockWorkspaceTests(unittest.TestCase):
                 QtCore.Qt.DockWidgetArea.LeftDockWidgetArea,
             )
             self.assertTrue(restored.cards["events"].isHidden())
+            self.assertTrue(restored.cards["clock"].isHidden())
         finally:
             restored._host.close()
             restored.deleteLater()
@@ -115,6 +118,7 @@ class DockWorkspaceTests(unittest.TestCase):
         try:
             self.assertFalse(fallback.restore_layout())
             self.assertTrue(fallback.cards["events"].isHidden())
+            self.assertTrue(fallback.cards["clock"].isHidden())
         finally:
             fallback._host.close()
             fallback.deleteLater()

@@ -244,6 +244,89 @@ class SerialCsvTests(unittest.TestCase):
         self.assertEqual(result, ["ACK_CLEAR_JAM"])
         self.assertEqual(port.writes, [b"CLEAR_JAM\n"])
 
+    def test_clock_exchange_uses_existing_reader_route_and_exact_commands(self) -> None:
+        class ReplyingPort:
+            is_open = True
+
+            def __init__(self, handle: serial_util.SerialHandle) -> None:
+                self.handle = handle
+                self.writes: list[bytes] = []
+
+            def write(self, payload: bytes) -> None:
+                self.writes.append(payload)
+                command = payload.decode().strip()
+                if command.startswith("TIME_SYNC,"):
+                    _, sequence, sent = command.split(",")
+                    self.handle._ingest_clock_response(
+                        f"CLOCK_SYNC,{sequence},{sent},10,20,30,RTC_VALID", 44
+                    )
+                else:
+                    _, epoch = command.split(",")
+                    self.handle._ingest_clock_response(
+                        f"ACK_SET_RTC,{epoch},50,60", 77
+                    )
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                self.is_open = False
+
+        port = ReplyingPort(self.handle)
+        self.handle.ser = port
+        self.handle._closed = False
+        self.assertEqual(
+            self.handle.exchange_time_sync(3, 123, timeout_s=1),
+            ("CLOCK_SYNC,3,123,10,20,30,RTC_VALID", 44),
+        )
+        self.assertEqual(
+            self.handle.exchange_set_rtc(456, timeout_s=1),
+            "ACK_SET_RTC,456,50,60",
+        )
+        self.assertEqual(port.writes, [b"TIME_SYNC,3,123\n", b"SET_RTC,456\n"])
+
+    def test_clock_router_preserves_unrelated_serial_events(self) -> None:
+        with self.handle._clock_lock:
+            self.handle._clock_pending_command = "TIME_SYNC"
+            self.handle._clock_response_seen.clear()
+        self.assertFalse(
+            self.handle._ingest_clock_response(
+                "POKE_START,10,20,L,1,2,3,4,Eligible,nan", 99
+            )
+        )
+        self.assertFalse(self.handle._clock_response_seen.is_set())
+        self.assertIsNone(self.handle._clock_response)
+        with self.handle._clock_lock:
+            self.handle._clock_pending_command = None
+
+    def test_clock_exchange_timeout_and_disconnect_fail_closed(self) -> None:
+        class SilentPort:
+            is_open = True
+
+            def write(self, _payload: bytes) -> None:
+                pass
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                self.is_open = False
+
+        self.handle.ser = SilentPort()
+        self.handle._closed = False
+        with self.assertRaises(TimeoutError):
+            self.handle.exchange_time_sync(0, 1, timeout_s=0.01)
+
+        def disconnect() -> None:
+            time.sleep(0.01)
+            self.handle._interrupt_clock_exchange("USB disconnected")
+
+        thread = threading.Thread(target=disconnect)
+        thread.start()
+        with self.assertRaisesRegex(ConnectionError, "USB disconnected"):
+            self.handle.exchange_time_sync(1, 2, timeout_s=1)
+        thread.join()
+
     def test_clear_feeder_jam_write_failure_is_not_success(self) -> None:
         class BrokenPort:
             is_open = True

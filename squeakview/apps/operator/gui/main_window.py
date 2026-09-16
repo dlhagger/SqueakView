@@ -361,6 +361,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.subject_combo = view.subject_combo
         self.new_subject_btn = view.new_subject_btn
         self.summary_label = view.summary_label
+        self.clock_labels = view.clock_labels
         self.bottle_panel = view.bottle_panel
         self.task_state_group = view.task_state_group
         self.stop_overlay = view.stop_overlay
@@ -531,6 +532,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.summary_label.setText(presentation.summary_html)
         self.preview.set_info(presentation.preview_info)
         self._emit_log("[GUI] Configuration committed.")
+        self._reset_clock_preflight_display()
         try:
             if task_cfg is not None:
                 self.dashboard.apply_task_config(task_cfg)
@@ -538,6 +540,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self._emit_log(f"[GUI] Task config load failed: {exc}")
 
         self.run_btn.setEnabled(True)
+
+    def _reset_clock_preflight_display(self) -> None:
+        values = {
+            "validation_state": "NOT_CHECKED",
+            "ntp_synchronized": "Not checked",
+            "rtc_valid": "Not checked",
+            "median_offset_seconds": "—",
+            "median_round_trip_ms": "—",
+            "correction_state": "Authorized" if bool(
+                self._config_data.get("allow_rtc_correction", False)
+            ) else "Not authorized",
+            "validation_timestamp": "—",
+            "evidence_path": "—",
+        }
+        for key, text in values.items():
+            label = self.clock_labels.get(key)
+            if label is not None:
+                label.setText(text)
 
     def _build_launch_config(self) -> process.LaunchConfig:
         return build_launch_config(

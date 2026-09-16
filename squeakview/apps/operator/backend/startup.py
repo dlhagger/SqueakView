@@ -34,6 +34,12 @@ class SerialHandle(Protocol):
         self, *, requested_lease_ms: int, timeout_s: float
     ) -> object: ...
 
+    def exchange_time_sync(
+        self, sequence: int, jetson_send_ns: int, *, timeout_s: float
+    ) -> tuple[str, int]: ...
+
+    def exchange_set_rtc(self, unix_seconds: int, *, timeout_s: float) -> str: ...
+
 
 class CaptureHandle(Protocol):
     def is_running(self) -> bool: ...
@@ -139,6 +145,7 @@ class StartupHooks:
     create_serial: Callable[[RunRequest, FailurePlan | None], SerialHandle]
     set_serial: Callable[[SerialHandle | None], None]
     arm_serial_runtime: Callable[[], None]
+    validate_clock: Callable[[SerialHandle, PreparedRun], Mapping[str, Any]]
     spawn_capture: Callable[[RunRequest], CaptureHandle]
     set_capture: Callable[[CaptureHandle | None], None]
     after_capture_spawn: Callable[[Path], None]
@@ -172,6 +179,7 @@ def validate_startup_policy(config: RunRequest) -> None:
         "trigger_on",
         "inference_enabled",
         "serial_enabled",
+        "allow_rtc_correction",
         "preview_enabled",
     )
     for name in bool_fields:
@@ -489,6 +497,51 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
             hooks.log(f"[SER] {error}")
             hooks.finalize_failure(error, True)
             return StartupResult(started=False, prepared=prepared, serial=serial_handle, error=error)
+        try:
+            clock_record = hooks.validate_clock(serial_handle, prepared)
+        except Exception as exc:
+            error = f"controller clock preflight failed: {type(exc).__name__}: {exc}"
+            hooks.log(f"[CLOCK] {error}")
+            hooks.finalize_failure(error, False)
+            return StartupResult(
+                started=False, prepared=prepared, serial=serial_handle, error=error
+            )
+        if clock_record.get("result") != "PASS":
+            reason = str(clock_record.get("reason") or "VALIDATION_ERROR")
+            detail = str(clock_record.get("detail") or "").strip()
+            error = f"controller clock preflight failed: {reason}"
+            guidance = {
+                "JETSON_NTP_NOT_SYNCHRONIZED": (
+                    "Synchronize the Jetson clock with NTP before retrying; RTC correction "
+                    "is unsafe while the host clock is unsynchronized."
+                ),
+                "CONTROLLER_RTC_INVALID": (
+                    "The controller RTC is unset or invalid. Inspect the PCF8523 and enable "
+                    "explicit RTC correction authorization in Configure before retrying."
+                ),
+                "CLOCK_OFFSET_OUT_OF_TOLERANCE": (
+                    "The controller RTC exceeds the ±1.5-second limit. Enable explicit RTC "
+                    "correction authorization in Configure before retrying."
+                ),
+                "DEVICE_BUSY": (
+                    "Wait until the current controller session or feed has stopped, then retry."
+                ),
+                "TIME_SYNC_TIMEOUT": (
+                    "The controller did not answer TIME_SYNC; check the USB connection and retry."
+                ),
+                "SET_RTC_TIMEOUT": (
+                    "The controller did not acknowledge SET_RTC; its clock was not accepted."
+                ),
+            }.get(reason)
+            if detail:
+                error += f" — {detail}"
+            if guidance:
+                error += f" {guidance}"
+            hooks.log(f"[CLOCK] {error}")
+            hooks.finalize_failure(error, False)
+            return StartupResult(
+                started=False, prepared=prepared, serial=serial_handle, error=error
+            )
         if cfg.controller_protocol == "watchdog_v1_experimental":
             try:
                 serial_handle.negotiate_watchdog_v1(

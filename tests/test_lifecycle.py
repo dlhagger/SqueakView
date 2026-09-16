@@ -283,6 +283,34 @@ class BackendLifecycleTests(unittest.TestCase):
                     "[PASS] Automatic desktop suspend on AC power is disabled",
                 ),
             ),
+            mock.patch.object(
+                manager.clock_validation,
+                "host_time_status",
+                return_value={
+                    "ntp_synchronized": True,
+                    "timezone": "UTC",
+                    "checked_utc": "2026-09-16T12:00:00+00:00",
+                },
+            ),
+            mock.patch.object(
+                manager.clock_validation,
+                "validate_clock",
+                return_value={
+                    "schema_version": "1.0",
+                    "result": "PASS",
+                    "reason": "CLOCK_WITHIN_TOLERANCE",
+                    "validation_state": "WITHIN_TOLERANCE",
+                    "host": {"ntp_synchronized": True, "timezone": "UTC"},
+                    "before": {
+                        "all_rtc_valid": True,
+                        "median_offset_seconds": 0.1,
+                        "median_round_trip_ms": 1.0,
+                    },
+                    "correction_requested": False,
+                    "correction_applied": False,
+                    "completed_utc": "2026-09-16T12:00:01+00:00",
+                },
+            ),
             mock.patch.object(manager.run_context, "assert_runs_dir_ready", return_value={"free_bytes": 10_000}),
             mock.patch.object(manager.run_context, "create_run_dir", return_value=(self.run_dir, self.run_dir.name)),
             mock.patch.object(manager.process, "spawn_inference", side_effect=spawn),
@@ -335,6 +363,22 @@ class BackendLifecycleTests(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertIsInstance(received[0], DashboardEvent)
         self.assertEqual(received[0].event_uc, "POKE_START")
+
+    def test_clock_preflight_evidence_is_persisted_and_associated_with_run(self) -> None:
+        FakeSerialHandle.instances.clear()
+        with (
+            mock.patch.object(manager.serial_util, "have_pyserial", return_value=True),
+            mock.patch.object(manager.serial_util, "SerialHandle", FakeSerialHandle),
+        ):
+            self.assertTrue(
+                self.backend.start_run(self.config(serial_enabled=True))
+            )
+        evidence_path = self.run_dir / "diagnostics" / "clock_validation.json"
+        evidence = run_context.read_json(evidence_path)
+        self.assertEqual(evidence["result"], "PASS")
+        self.assertEqual(evidence["reason"], "CLOCK_WITHIN_TOLERANCE")
+        self.assertEqual(evidence["evidence_path"], str(evidence_path))
+        self.assertEqual(self.status()["clock_validation"]["result"], "PASS")
 
     def test_ready_marker_transitions_starting_to_recording(self) -> None:
         self.assertTrue(self.backend.start_run(self.config()))

@@ -164,19 +164,25 @@ Do this before an overnight or weekend acquisition:
    resources were released and the package is selected as the project default.
 4. Create one experiment and subject, close SqueakView normally, relaunch, and
    verify the chooser and project-local profiles restore correctly.
-5. Run a two-minute triggered recording with inference and preview enabled.
+5. Confirm the Jetson reports NTP synchronization. With the PCF8523-equipped
+   controller idle, run clock preflight and confirm seven samples pass the
+   ±1.5-second gate. If correction is deliberately authorized, confirm one
+   `SET_RTC` acknowledgement is followed by a new seven-sample passing burst and
+   inspect `diagnostics/clock_validation.json`. Never attach a DS3231 alongside
+   the PCF8523 because both occupy fixed I²C address `0x68`.
+6. Run a two-minute triggered recording with inference and preview enabled.
    Confirm the header frame count advances, recording gaps stay at zero, serial
    events remain live, and the project `runs/` directory receives the run.
-6. Stop normally. Wait for finalization and confirm `run_status.json` is
+7. Stop normally. Wait for finalization and confirm `run_status.json` is
    terminal, `run_manifest.json` identifies the project, `raw.mp4` plays, and
    the recording/camera/controller counts pass.
-7. On a safe bench setup, trigger a feeder jam. Confirm the persistent warning,
+8. On a safe bench setup, trigger a feeder jam. Confirm the persistent warning,
    disabled feeding, exact `CLEAR_JAM` acknowledgement behavior, and successful
    later shutdown.
-8. In a separate disposable run, close the GUI during acquisition. Confirm the
+9. In a separate disposable run, close the GUI during acquisition. Confirm the
    supervisor stops acquisition and produces a failed, terminal run rather than
    continuing headlessly.
-9. Open a second project and verify the first project's profiles, models, and
+10. Open a second project and verify the first project's profiles, models, and
    runs are not offered as the second project's assets.
 
 Keep the short-run directories as acceptance evidence until their manifests and

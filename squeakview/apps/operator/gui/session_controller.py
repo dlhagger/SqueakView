@@ -191,6 +191,7 @@ def build_launch_config(
         serial_enabled=data["serial_enabled"],
         serial_port=data["serial_port"],
         serial_baud=data["serial_baud"],
+        allow_rtc_correction=bool(data.get("allow_rtc_correction", False)),
         controller_protocol=controller_protocol,
         controller_watchdog_lease_ms=watchdog_lease_ms,
         arduino_fps=data["arduino_fps"],

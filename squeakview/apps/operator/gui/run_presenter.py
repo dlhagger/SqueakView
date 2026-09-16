@@ -75,6 +75,8 @@ class RunLifecycleController(QtCore.QObject):
     def handle_backend_event(self, event: BackendEvent) -> None:
         if not self.active:
             return
+        if getattr(event, "type", None) == "clock_preflight":
+            self._present_clock_preflight(event)
         presentation = present_run_phase(event.phase)
         if self.stop_in_progress and event.phase == RunPhase.FINALIZED:
             # The backend has persisted its terminal phase, but the stop worker
@@ -88,6 +90,54 @@ class RunLifecycleController(QtCore.QObject):
         self.view._set_run_state(presentation.badge_state)
         self.view.preview.set_status(presentation.preview_status)
         self._set_buttons(presentation)
+
+    def _present_clock_preflight(self, event: BackendEvent) -> None:
+        labels = getattr(self.view, "clock_labels", {})
+        payload = event.payload
+
+        def show(key: str, text: str) -> None:
+            label = labels.get(key)
+            if label is not None:
+                label.setText(text)
+
+        show("validation_state", str(payload.get("validation_state") or "VALIDATION_ERROR"))
+        ntp = payload.get("ntp_synchronized")
+        show("ntp_synchronized", "Synchronized" if ntp is True else "Not synchronized")
+        rtc = payload.get("rtc_valid")
+        show(
+            "rtc_valid",
+            "RTC_VALID" if rtc is True else "RTC_INVALID" if rtc is False else "Not checked",
+        )
+        offset = payload.get("median_offset_seconds")
+        show(
+            "median_offset_seconds",
+            f"{float(offset):+.6f} s" if isinstance(offset, (int, float)) else "—",
+        )
+        rtt = payload.get("median_round_trip_ms")
+        show(
+            "median_round_trip_ms",
+            f"{float(rtt):.3f} ms" if isinstance(rtt, (int, float)) else "—",
+        )
+        state = str(payload.get("validation_state") or "")
+        if state == "CORRECTING":
+            correction = "In progress"
+        elif payload.get("correction_applied"):
+            correction = (
+                "Applied and verified"
+                if state == "CORRECTED_AND_VERIFIED"
+                else "Applied; verification failed"
+            )
+        elif payload.get("correction_requested"):
+            correction = (
+                "Authorized; not needed"
+                if state == "WITHIN_TOLERANCE"
+                else "Authorized; not applied"
+            )
+        else:
+            correction = "Not authorized"
+        show("correction_state", correction)
+        show("validation_timestamp", str(payload.get("validation_timestamp") or "—"))
+        show("evidence_path", str(payload.get("evidence_path") or "—"))
 
     def _set_buttons(self, presentation: RunPresentation) -> None:
         self.view.run_btn.setEnabled(presentation.run_enabled)
@@ -191,6 +241,11 @@ class RunLifecycleController(QtCore.QObject):
                     f"[GUI] blocked: camera count ({cam_count}) != config batch-size ({cfg_batch})"
                 )
                 return
+        # A window can supervise multiple consecutive runs. Clear only the
+        # presentation history before startup so counters and raster bounds
+        # cannot leak from the preceding run. Authoritative device state such
+        # as the feeder-jam latch is intentionally retained.
+        view.dashboard.reset_run_data()
         self.start_in_progress = True
         self.start_failure_reported = False
         self.pending_start_config = config

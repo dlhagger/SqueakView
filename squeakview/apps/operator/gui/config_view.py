@@ -38,6 +38,7 @@ class ConfigView:
     trigger_chk: QtWidgets.QCheckBox
     arduino_fps_edit: QtWidgets.QLineEdit
     serial_enable: QtWidgets.QCheckBox
+    rtc_correction_enable: QtWidgets.QCheckBox
     inference_enable: QtWidgets.QCheckBox
     task_cfg_edit: QtWidgets.QLineEdit
     task_browse_btn: QtWidgets.QPushButton
@@ -161,6 +162,14 @@ def build_config_view(
     serial_enable = QtWidgets.QCheckBox("Enable Arduino serial logging")
     serial_enable.setChecked(config.get("serial_enabled", True))
     form.addRow("", serial_enable)
+    rtc_correction_enable = QtWidgets.QCheckBox(
+        "Allow one pre-run controller RTC correction when validation fails"
+    )
+    rtc_correction_enable.setChecked(config.get("allow_rtc_correction", False))
+    rtc_correction_enable.setToolTip(
+        "Uses the NTP-synchronized Jetson clock and SET_RTC only while the controller is idle."
+    )
+    form.addRow("", rtc_correction_enable)
     inference_enable = QtWidgets.QCheckBox("Enable YOLO inference (DeepStream)")
     inference_enable.setChecked(config.get("inference_enabled", True))
     form.addRow("", inference_enable)
@@ -330,6 +339,7 @@ def build_config_view(
         trigger_chk=trigger_chk,
         arduino_fps_edit=arduino_fps_edit,
         serial_enable=serial_enable,
+        rtc_correction_enable=rtc_correction_enable,
         inference_enable=inference_enable,
         task_cfg_edit=task_cfg_edit,
         task_browse_btn=task_browse_btn,

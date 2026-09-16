@@ -70,7 +70,15 @@ class DockWorkspace(QtCore.QObject):
     def establish_default_layout(self) -> None:
         """Arrange the canonical operator workspace and capture it for reset."""
 
-        required = {"preview", "system", "task", "bottles", "behavior", "events"}
+        required = {
+            "preview",
+            "system",
+            "clock",
+            "task",
+            "bottles",
+            "behavior",
+            "events",
+        }
         missing = required.difference(self._cards)
         if missing:
             raise RuntimeError(
@@ -80,6 +88,7 @@ class DockWorkspace(QtCore.QObject):
 
         preview = self._cards["preview"]
         system = self._cards["system"]
+        clock = self._cards["clock"]
         task = self._cards["task"]
         bottles = self._cards["bottles"]
         behavior = self._cards["behavior"]
@@ -87,6 +96,7 @@ class DockWorkspace(QtCore.QObject):
 
         self._host.splitDockWidget(preview, behavior, QtCore.Qt.Orientation.Vertical)
         self._host.splitDockWidget(preview, system, QtCore.Qt.Orientation.Horizontal)
+        self._host.splitDockWidget(system, clock, QtCore.Qt.Orientation.Vertical)
         self._host.splitDockWidget(system, task, QtCore.Qt.Orientation.Horizontal)
         self._host.splitDockWidget(task, bottles, QtCore.Qt.Orientation.Vertical)
         self._host.splitDockWidget(behavior, events, QtCore.Qt.Orientation.Vertical)
@@ -112,8 +122,9 @@ class DockWorkspace(QtCore.QObject):
             QtCore.Qt.Orientation.Vertical,
         )
         events.hide()
+        clock.hide()
         for card_id, dock in self._cards.items():
-            if card_id != "events":
+            if card_id not in {"events", "clock"}:
                 dock.show()
         self._default_state = self._host.saveState(LAYOUT_SCHEMA_VERSION)
 

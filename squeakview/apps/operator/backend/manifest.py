@@ -169,6 +169,7 @@ class RunManifestContext:
     acquisition_owner: str = IN_PROCESS_DEV_OWNER
     task_config_snapshot: Mapping[str, object] | None = None
     preflight_evidence: Mapping[str, object] | None = None
+    clock_validation: Mapping[str, object] | None = None
     qualification_case: Mapping[str, object] | None = None
     controller_watchdog: Mapping[str, object] | None = None
 
@@ -498,6 +499,11 @@ class RunManifestService:
             "preflight": (
                 dict(context.preflight_evidence)
                 if context.preflight_evidence is not None
+                else None
+            ),
+            "clock_validation": (
+                dict(context.clock_validation)
+                if context.clock_validation is not None
                 else None
             ),
             "serial": {

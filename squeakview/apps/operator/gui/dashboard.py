@@ -113,6 +113,21 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self._task_cfg_path = path
         self._build_from_task_config(cfg)
 
+    def reset_run_data(self) -> None:
+        """Clear display-only history before a new acquisition starts.
+
+        Feeder-jam state deliberately survives this reset because a new run does
+        not authoritatively clear the controller's hardware latch.
+        """
+
+        self._observed_pellet_mode = None
+        self.counters = {key: 0 for key in self.series_order}
+        self.series_x = {key: [] for key in self.series_order}
+        self.series_y = {key: [] for key in self.series_order}
+        self.series_events = {key: [] for key in self.series_order}
+        self._first_event_at = None
+        self._refresh()
+
     def clear_jam_alert(self) -> None:
         """Clear the latch presentation after an authoritative firmware ACK."""
 

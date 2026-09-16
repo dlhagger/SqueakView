@@ -115,6 +115,11 @@ class SerialHandle:
         self._clear_jam_response_seen = threading.Event()
         self._clear_jam_response: str | None = None
         self._clear_jam_error: str | None = None
+        self._clock_lock = threading.Lock()
+        self._clock_pending_command: str | None = None
+        self._clock_response_seen = threading.Event()
+        self._clock_response: tuple[str, int] | None = None
+        self._clock_error: str | None = None
         self._csv_lock = threading.Lock()
         self._csv_writer: csv.writer | None = None
         self._csv_file = None
@@ -197,6 +202,7 @@ class SerialHandle:
         if stop_reader:
             self._stop.set()
         self._interrupt_clear_jam(detail)
+        self._interrupt_clock_exchange(detail)
         self.emit(f"[{timestamp()}] [SER] FATAL: {detail}")
         if self.on_fatal is not None:
             try:
@@ -296,6 +302,11 @@ class SerialHandle:
                 self._clear_jam_response = None
                 self._clear_jam_error = None
                 self._clear_jam_response_seen.clear()
+            with self._clock_lock:
+                self._clock_pending_command = None
+                self._clock_response = None
+                self._clock_error = None
+                self._clock_response_seen.clear()
             if run_dir is not None:
                 if not self.set_csv_path(run_dir):
                     raise OSError(self.fatal_error or "serial CSV setup failed")
@@ -333,6 +344,9 @@ class SerialHandle:
                     buf += chunk
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
+                        # Capture host receipt before presentation logging or
+                        # ledger I/O can inflate a clock exchange's RTT.
+                        received_ns = time.time_ns()
                         if len(line) > self._max_line_bytes:
                             raise ValueError(
                                 "serial line exceeded bounded size of "
@@ -387,6 +401,7 @@ class SerialHandle:
                                 self._stop_ack_count = None
                             self._stop_ack_seen.set()
                         self._ingest_clear_jam_response(s)
+                        self._ingest_clock_response(s, received_ns)
                         self._maybe_send_alert(s)
                     if len(buf) > self._max_line_bytes:
                         raise ValueError(
@@ -571,6 +586,92 @@ class SerialHandle:
             with self._clear_jam_lock:
                 self._clear_jam_pending = False
 
+    def _ingest_clock_response(self, line: str, received_ns: int) -> bool:
+        """Route one clock reply without consuming unrelated serial input."""
+
+        with self._clock_lock:
+            command = self._clock_pending_command
+            if command is None or self._clock_response_seen.is_set():
+                return False
+            matches = (
+                command == "TIME_SYNC"
+                and (line.startswith("CLOCK_SYNC,") or line.startswith("NACK,TIME_SYNC,"))
+            ) or (
+                command == "SET_RTC"
+                and (line.startswith("ACK_SET_RTC,") or line.startswith("NACK,SET_RTC,"))
+            )
+            if not matches:
+                return False
+            self._clock_response = (line, received_ns)
+            self._clock_response_seen.set()
+            return True
+
+    def _interrupt_clock_exchange(self, error: str) -> None:
+        with self._clock_lock:
+            if self._clock_pending_command and not self._clock_response_seen.is_set():
+                self._clock_error = str(error).strip() or "serial connection lost"
+                self._clock_response_seen.set()
+
+    def _clock_exchange(
+        self, command: str, expected_command: str, *, timeout_s: float
+    ) -> tuple[str, int]:
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+            raise ValueError("clock exchange timeout must be numeric")
+        timeout = float(timeout_s)
+        if not 0.0 < timeout <= 30.0:
+            raise ValueError("clock exchange timeout must be greater than zero and at most 30 seconds")
+        with self._clock_lock:
+            if self._clock_pending_command is not None:
+                raise RuntimeError("another clock exchange is already pending")
+            self._clock_pending_command = expected_command
+            self._clock_response = None
+            self._clock_error = None
+            self._clock_response_seen.clear()
+        try:
+            self._send_line(command)
+            if not self._clock_response_seen.wait(timeout=timeout):
+                raise TimeoutError(
+                    f"controller did not respond to {expected_command} within {timeout:g}s"
+                )
+            with self._clock_lock:
+                response = self._clock_response
+                error = self._clock_error
+            if error is not None:
+                raise ConnectionError(
+                    f"serial connection was lost during {expected_command}: {error}"
+                )
+            if response is None:
+                raise RuntimeError(f"{expected_command} completed without a response")
+            return response
+        finally:
+            with self._clock_lock:
+                self._clock_pending_command = None
+
+    def exchange_time_sync(
+        self, sequence: int, jetson_send_ns: int, *, timeout_s: float = 3.0
+    ) -> tuple[str, int]:
+        """Send one TIME_SYNC through this handle's existing reader."""
+
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError("TIME_SYNC sequence must be a non-negative integer")
+        if type(jetson_send_ns) is not int or jetson_send_ns <= 0:
+            raise ValueError("TIME_SYNC host timestamp must be a positive integer")
+        return self._clock_exchange(
+            f"TIME_SYNC,{sequence},{jetson_send_ns}", "TIME_SYNC", timeout_s=timeout_s
+        )
+
+    def exchange_set_rtc(
+        self, unix_seconds: int, *, timeout_s: float = 3.0
+    ) -> str:
+        """Send one whole-second SET_RTC through this handle's existing reader."""
+
+        if type(unix_seconds) is not int or unix_seconds <= 0:
+            raise ValueError("SET_RTC Unix seconds must be a positive integer")
+        response, _received_ns = self._clock_exchange(
+            f"SET_RTC,{unix_seconds}", "SET_RTC", timeout_s=timeout_s
+        )
+        return response
+
     def wait_for_ttl(self, timeout_s: float = 3.0) -> bool:
         self.emit(f"[{timestamp()}] [SER] Waiting for camera TTL line (timeout {timeout_s:.1f}s) …")
         hit = self._ttl_seen.wait(timeout=timeout_s)
@@ -723,6 +824,7 @@ class SerialHandle:
             return
         self.emit(f"[{timestamp()}] [SER] closing …")
         self._interrupt_clear_jam("serial port closed")
+        self._interrupt_clock_exchange("serial port closed")
         if self._watchdog_session is not None:
             self._watchdog_session.stop_worker()
         self._stop.set()

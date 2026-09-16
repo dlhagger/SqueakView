@@ -23,6 +23,7 @@ class ConfigFields:
     capture_backend: str
     trigger_enabled: bool
     serial_enabled: bool
+    allow_rtc_correction: bool
     serial_port: str
     inference_enabled: bool
     ds_cfg: str
@@ -97,6 +98,7 @@ def collect_config(
         "exposure_us": exposure_us,
         "arduino_fps": arduino_fps,
         "serial_enabled": fields.serial_enabled,
+        "allow_rtc_correction": fields.allow_rtc_correction,
         "serial_port": fields.serial_port.strip() or "/dev/ttyACM0",
         "serial_baud": serial_baud,
         "ds_cfg": ds_cfg,

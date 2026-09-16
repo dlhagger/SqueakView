@@ -93,7 +93,13 @@ def _request_from_payload(payload: Mapping[str, object]) -> RunRequest:
         if missing:
             problems.append(f"missing fields: {', '.join(missing)}")
         raise ValueError("run configuration must contain exact fields; " + "; ".join(problems))
-    bool_fields = {"trigger_on", "inference_enabled", "serial_enabled", "preview_enabled"}
+    bool_fields = {
+        "trigger_on",
+        "inference_enabled",
+        "serial_enabled",
+        "allow_rtc_correction",
+        "preview_enabled",
+    }
     for name in bool_fields:
         if not isinstance(payload[name], bool):
             raise ValueError(f"run configuration {name} must be boolean")

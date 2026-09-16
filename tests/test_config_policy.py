@@ -22,6 +22,7 @@ def _fields(root: Path, **updates: object) -> ConfigFields:
         "capture_backend": "flir_direct",
         "trigger_enabled": True,
         "serial_enabled": True,
+        "allow_rtc_correction": False,
         "serial_port": "/dev/ttyACM0",
         "inference_enabled": True,
         "ds_cfg": str(root / "model.txt"),

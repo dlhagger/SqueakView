@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from squeakview.apps.operator.backend.events import RunPhase, RunSnapshot
+from squeakview.apps.operator.backend.events import BackendEvent, RunPhase, RunSnapshot
 from squeakview.apps.operator.gui.run_presenter import (
     RunLifecycleController,
     present_finalization,
@@ -36,6 +36,7 @@ def _lifecycle_view() -> SimpleNamespace:
         ),
         dashboard=SimpleNamespace(
             clear_jam_alert=mock.Mock(),
+            reset_run_data=mock.Mock(),
             follow_run_telemetry=mock.Mock(),
             resume_idle_system_sampling=mock.Mock(),
         ),
@@ -57,6 +58,50 @@ def _lifecycle_view() -> SimpleNamespace:
 
 
 class RunPresenterTests(unittest.TestCase):
+    def test_clock_preflight_event_populates_operator_evidence(self) -> None:
+        view = _lifecycle_view()
+        view.clock_labels = {
+            name: SimpleNamespace(setText=mock.Mock())
+            for name in (
+                "validation_state",
+                "ntp_synchronized",
+                "rtc_valid",
+                "median_offset_seconds",
+                "median_round_trip_ms",
+                "correction_state",
+                "validation_timestamp",
+                "evidence_path",
+            )
+        }
+        controller = RunLifecycleController(view)
+        controller.handle_backend_event(
+            BackendEvent(
+                type="clock_preflight",
+                phase=RunPhase.STARTING,
+                run_dir=None,
+                payload={
+                    "validation_state": "CORRECTED_AND_VERIFIED",
+                    "ntp_synchronized": True,
+                    "rtc_valid": True,
+                    "median_offset_seconds": 1.117,
+                    "median_round_trip_ms": 2.5,
+                    "correction_requested": True,
+                    "correction_applied": True,
+                    "validation_timestamp": "2026-09-16T12:00:00+00:00",
+                    "evidence_path": "/run/diagnostics/clock_validation.json",
+                },
+            )
+        )
+        view.clock_labels["validation_state"].setText.assert_called_with(
+            "CORRECTED_AND_VERIFIED"
+        )
+        view.clock_labels["median_offset_seconds"].setText.assert_called_with(
+            "+1.117000 s"
+        )
+        view.clock_labels["correction_state"].setText.assert_called_with(
+            "Applied and verified"
+        )
+
     def test_button_matrix_for_every_phase(self) -> None:
         expected = {
             RunPhase.IDLE: (True, False, True),
