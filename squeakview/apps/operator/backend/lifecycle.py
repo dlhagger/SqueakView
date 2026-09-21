@@ -41,6 +41,8 @@ class SerialHandle(Protocol):
 
     def wait_for_stop_ack(self, timeout_s: float = 2.0) -> bool: ...
 
+    def wait_for_camera_stop(self, timeout_s: float = 3.0) -> bool: ...
+
     def disarm_watchdog_v1(self, *, timeout_s: float = 2.0) -> None: ...
 
     def close(self) -> None: ...
@@ -61,7 +63,7 @@ class FinalizationRequest:
     controller_started: bool
     trigger_on: bool
     phase: RunPhase
-    controller_protocol: str = "legacy"
+    controller_protocol: str = "v2"
     alignment_required: bool = False
     failure_plan: FailurePlan | None = None
 
@@ -158,6 +160,13 @@ def finalize_run(
                 serial_handle.log_marker("STOP_SENT")
                 serial_handle.send_line("STOP")
                 if stopping_capture or request.controller_started:
+                    stop_failures: list[str] = []
+                    if (
+                        request.controller_protocol == "v2"
+                        and request.controller_started
+                        and not serial_handle.wait_for_camera_stop(timeout_s=3.0)
+                    ):
+                        stop_failures.append("CAMERA_STOP was not received")
                     stop_acked = not _injected(
                         request, "stop_ack_timeout"
                     ) and serial_handle.wait_for_stop_ack(timeout_s=2.0)
@@ -165,7 +174,9 @@ def finalize_run(
                         "CAPTURE_STOP_ACKED" if stop_acked else "CAPTURE_STOP_ACK_TIMEOUT"
                     )
                     if not stop_acked:
-                        controller_stop_error = "controller STOP was not acknowledged"
+                        stop_failures.append("controller STOP was not acknowledged")
+                    if stop_failures:
+                        controller_stop_error = "; ".join(stop_failures)
         except Exception as exc:
             action = (
                 "DISARM"

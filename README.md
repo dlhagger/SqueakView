@@ -445,7 +445,43 @@ timeout is 30 seconds and can be changed with
 Serial logging may remain enabled during free-running capture, but its data are
 auxiliary and no trigger/frame alignment is claimed. Exact TTL alignment is a
 mandatory finalization and qualification gate only when both serial logging and
-camera triggering are enabled.
+camera triggering are enabled under the legacy controller protocol. Protocol v2
+is the production default for controller-backed GUI runs. A deliberate
+`SQUEAKVIEW_CONTROLLER_PROTOCOL=legacy` override remains available only for
+non-production bench development with older firmware.
+
+Protocol v2 is negotiated before the clock preflight and capture launch. The
+idempotent negotiation supports a freshly booted v1 controller and a controller
+that remained in v2 after an earlier run; idle `TIME_SYNC` and `SET_RTC`
+responses then use reliable v2 framing. Controller frames are CRC checked and stored, with an `fsync`, in
+`diagnostics/controller_v2.jsonl` before SqueakView sends a cumulative
+`ACK_EVENTS`. The controller can then release the acknowledged RAM records.
+Camera timing uses `CAMERA_EPOCH`, periodic `CAMERA_CHECKPOINT`, and
+`CAMERA_STOP` rather than two serial lines per frame. A transport integrity
+fault, conflicting replay, unrecoverable sequence gap, or controller reboot
+during a run fails the run closed. `serial.csv` remains a compatibility export
+of decoded payloads; the JSONL journal is the v2 source of truth.
+
+Run the physical-controller qualification before production use:
+
+```bash
+uv run mousehouse-protocol-v2-test /dev/ttyACM0 \
+  --fps 30 --duration 60 --withhold-acks 5 \
+  --request-resend --status --correct-clock --verbose \
+  --output /tmp/mousehouse-protocol-v2-test
+```
+
+`--correct-clock` explicitly authorizes one idle `SET_RTC` if the initial clock
+burst is outside tolerance. The tool always collects and verifies a fresh
+seven-sample burst after correction before it may start acquisition.
+
+The controller remains in v2 until it reboots. SqueakView safely rejoins that
+mode on subsequent GUI runs, so a reboot between ordinary runs is unnecessary.
+Reboot after a standalone qualification before using a host build that predates
+this idempotent negotiation support.
+The separate `--exercise-overflow-failsafe` mode intentionally fills the queue,
+invalidates and stops the run, and also requires a reboot. Do not use it during
+an experiment.
 
 The durable backend, not the GUI, owns the required preflight gate. It records a
 hashed, structured result in both run status and manifest metadata; a missing
@@ -748,10 +784,11 @@ power loss is documented in
 The gated boundary-fault procedure and supported plan schema are documented in
 [`docs/qualification/FAILURE_INJECTION_PROTOCOL.md`](docs/qualification/FAILURE_INJECTION_PROTOCOL.md).
 
-The FLIR chunk `FrameID` is stored as `camera_frame_id`. It increments for
-every acquired image. The aligner derives a per-run offset between that hardware
-frame sequence and RP2040 `CAMERA_HIGH` counts. It validates frame continuity,
-MP4 length, inference mapping, PTS, and camera/controller elapsed-clock agreement.
+The FLIR chunk `FrameID` is stored as `camera_frame_id` and increments for every
+acquired image. The legacy aligner derives a per-run offset between that hardware
+frame sequence and RP2040 `CAMERA_HIGH` counts. Protocol-v2 runs preserve camera
+epoch/checkpoint/stop anchors for later pandas-based alignment on the analysis
+device without emitting per-frame controller edges.
 
 On stop, SqueakView asks the controller to stop before draining DeepStream and
 keeps the serial reader open for final acknowledgements. After the capture
@@ -760,10 +797,11 @@ last monotonic indices from the capture and non-leaky recording-admission
 ledgers, reads the MP4 sample-size/timing/sample-to-chunk/chunk-offset tables,
 and requires all totals (plus the controller total when triggered) to agree.
 These are bounded tail/table reads; normal shutdown does not hash or decode the
-complete video and never rebuilds `frames.csv`. Triggered runs then generate
-the controller/camera alignment summary automatically from the already-written
-manifest and serial ledger. Structural errors and count mismatches fail
-directly.
+complete video and never rebuilds `frames.csv`. Legacy triggered runs then
+generate the controller/camera alignment summary automatically from the
+already-written manifest and serial ledger. Protocol-v2 runs validate recording
+and acquisition counts on-device and leave detailed controller/camera alignment
+to the analysis workflow. Structural errors and count mismatches fail directly.
 Set
 `SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE=1` for qualification runs that require
 every pixel frame to be decoded. Add `SQUEAKVIEW_VIDEO_VALIDATION_AB_VERIFY=1`

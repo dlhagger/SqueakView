@@ -34,6 +34,8 @@ class SerialHandle(Protocol):
         self, *, requested_lease_ms: int, timeout_s: float
     ) -> object: ...
 
+    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None: ...
+
     def exchange_time_sync(
         self, sequence: int, jetson_send_ns: int, *, timeout_s: float
     ) -> tuple[str, int]: ...
@@ -239,9 +241,9 @@ def validate_startup_policy(config: RunRequest) -> None:
         raise ValueError(
             "serial_port must be non-empty when serial acquisition is enabled"
         )
-    if config.controller_protocol not in {"legacy", "watchdog_v1_experimental"}:
+    if config.controller_protocol not in {"legacy", "watchdog_v1_experimental", "v2"}:
         raise ValueError(
-            "controller_protocol must be 'legacy' or 'watchdog_v1_experimental'"
+            "controller_protocol must be 'legacy', 'watchdog_v1_experimental', or 'v2'"
         )
     if config.controller_protocol == "watchdog_v1_experimental" and not (
         config.serial_enabled and config.trigger_on
@@ -458,6 +460,11 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
 
     serial_handle: SerialHandle | None = None
     if cfg.serial_enabled:
+        if cfg.controller_protocol != "v2":
+            hooks.log(
+                "[SER] WARNING: legacy controller transport is a non-production "
+                "bench override; protocol v2 is required for scientific runs"
+            )
         if not hooks.serial_available():
             error = (
                 "Serial controller support was requested, but pyserial is not installed. "
@@ -497,6 +504,22 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
             hooks.log(f"[SER] {error}")
             hooks.finalize_failure(error, True)
             return StartupResult(started=False, prepared=prepared, serial=serial_handle, error=error)
+        if cfg.controller_protocol == "v2":
+            try:
+                # PROTO,2 is idempotent. Negotiating first supports both a
+                # freshly booted v1 controller and a controller that remained
+                # in v2 after an earlier run. TIME_SYNC/SET_RTC are accepted as
+                # framed command results while v2 is idle.
+                serial_handle.negotiate_protocol_v2(timeout_s=3.0)
+                serial_handle.log_marker("PROTOCOL_V2_NEGOTIATED")
+                hooks.log("[SER] controller protocol v2 active")
+            except Exception as exc:
+                error = f"controller protocol-v2 negotiation failed: {exc}"
+                hooks.log(f"[SER] {error}")
+                hooks.finalize_failure(error, False)
+                return StartupResult(
+                    started=False, prepared=prepared, serial=serial_handle, error=error
+                )
         try:
             clock_record = hooks.validate_clock(serial_handle, prepared)
         except Exception as exc:

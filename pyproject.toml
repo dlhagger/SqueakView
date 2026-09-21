@@ -28,6 +28,16 @@ dependencies = [
     "onnx>=1.22.0",
 ]
 
+[project.scripts]
+mousehouse-protocol-v2-test = "squeakview.tools.mousehouse_protocol_v2_test:main"
+
+[build-system]
+requires = ["setuptools>=84"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["squeakview*"]
+
 [tool.uv]
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64'",

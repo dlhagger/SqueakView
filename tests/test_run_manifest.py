@@ -142,7 +142,53 @@ class RunManifestServiceTests(unittest.TestCase):
         self.assertEqual(result["actual_outputs"], {"inventory": "snapshot"})
         self.assertEqual(result["bottles"], {"complete": True})
 
-    def test_triggered_serial_capture_declares_alignment_output(self) -> None:
+    def test_legacy_triggered_serial_capture_declares_alignment_output(self) -> None:
+        context = replace(
+            self.context,
+            config=replace(
+                self.context.config,
+                serial_enabled=True,
+                trigger_on=True,
+                controller_protocol="legacy",
+            ),
+        )
+
+        result = self.service.build(
+            self.run_dir,
+            context,
+            output_snapshot=lambda _path: {},
+            bottle_snapshot=lambda _path: {},
+        )
+
+        self.assertTrue(result["serial"]["alignment_required"])
+        self.assertEqual(
+            result["expected_outputs"]["alignment_summary"],
+            "alignment_summary.json",
+        )
+        self.assertIn(
+            "controller_protocol_not_v2",
+            result["production_disqualifiers"],
+        )
+
+    def test_v2_manifest_embeds_final_transport_summary(self) -> None:
+        diagnostics = self.run_dir / "diagnostics"
+        diagnostics.mkdir()
+        summary = {
+            "schema_version": 1,
+            "protocol": "mousehouse_v2",
+            "boot_id": 99,
+            "session_id": 2,
+            "integrity_latched": False,
+            "counts": {
+                "frames_received": 12,
+                "frames_stored": 12,
+                "duplicates": 0,
+            },
+        }
+        run_context.atomic_write_json(
+            diagnostics / "controller_v2_summary.json",
+            summary,
+        )
         context = replace(
             self.context,
             config=replace(
@@ -159,10 +205,12 @@ class RunManifestServiceTests(unittest.TestCase):
             bottle_snapshot=lambda _path: {},
         )
 
-        self.assertTrue(result["serial"]["alignment_required"])
-        self.assertEqual(
-            result["expected_outputs"]["alignment_summary"],
-            "alignment_summary.json",
+        self.assertEqual(result["serial"]["controller_protocol"], "v2")
+        self.assertFalse(result["serial"]["alignment_required"])
+        self.assertEqual(result["serial"]["v2_transport"], summary)
+        self.assertNotIn(
+            "controller_protocol_not_v2",
+            result["production_disqualifiers"],
         )
 
     def test_build_persists_qualification_case_binding(self) -> None:

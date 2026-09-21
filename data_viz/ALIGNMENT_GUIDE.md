@@ -1,294 +1,138 @@
-# Aligning SqueakView Outputs on the Analysis Device
+# Aligning Protocol-v2 SqueakView Outputs
 
-This guide describes how to combine a finalized SqueakView run into an
-analysis-ready timeline. Perform this work on the analysis device, not on the
-Jetson acquisition system. Treat the copied run directory as read-only and
-write derived tables to a separate analysis directory.
+This guide describes how to construct an analysis timeline from a finalized
+SqueakView protocol-v2 run. Perform this work on the analysis device, treat the
+copied run as read-only, and write derived tables to a separate directory.
 
-No video decode is required for this alignment. `raw.mp4` sample ordinal zero
-corresponds to `frames.csv` `raw_frame_index=0`; the Jetson has already checked
-the MP4 sample count against the authoritative frame ledgers.
+No video decode is required. The Jetson already verifies that the MP4 sample
+count agrees with the camera and recording ledgers.
 
-## 1. Check the run before analysis
+## 1. Qualification gates
 
-Open `run_status.json` and require all of the following:
+Require the following before analyzing a run:
 
 ```text
-state == "finalized"
-overall_validation_passed == true
-recording_validation_passed == true
-alignment_validated == true          # for controller-enabled runs
+run_status.json.state == "finalized"
+run_status.json.overall_validation_passed == true
+run_status.json.recording_validation_passed == true
+run_manifest.json.serial.controller_protocol == "v2"
+run_manifest.json.serial.alignment_required == false
+diagnostics/controller_v2_summary.json.integrity_latched == false
+diagnostics/controller_v2_summary.json.counts.crc_or_framing_errors == 0
+diagnostics/controller_v2_summary.json.counts.conflicting_duplicates == 0
 ```
 
-Also inspect `alignment_summary.json`. A valid triggered run has:
+`alignment_validated=false` is expected for v2. It means the obsolete legacy
+`CAMERA_HIGH` aligner was not run; it is not a failed validation. The v2
+acquisition gates are the controller transport, `CAMERA_STOP` reconciliation,
+camera integrity, recording admission, and MP4 sample-count checks recorded in
+`run_status.json`.
 
-```text
-frame_alignment.validated == true
-counts.recorded_frames == counts.camera_high_events
-counts.frames_missing_ttl == 0
-counts.camera_frames_missing == 0
-validation.video_frame_count_matches_frames_csv == true
-```
-
-Do not silently analyze a failed or incomplete run. Preserve its files, but
-record the failed qualification in the downstream analysis.
-
-## 2. Canonical inputs and their cardinality
+## 2. Canonical inputs
 
 | File | Meaning | Natural key |
 | --- | --- | --- |
 | `frames.csv` | One authoritative row per recorded camera frame | `(stream_id, source_sequence_index)` |
-| `inference/frames.csv` | Frames admitted to the inference branch | `(stream_id, source_sequence_index)` |
-| `objects.csv` | Zero or more detector/tracker observations per inference frame | `observation_id` |
-| `keypoints.csv` | Zero or more pose keypoints per object observation | `(observation_id, keypoint_index)` |
-| `serial.csv` | Ordered controller messages, camera TTLs, and lifecycle markers | physical row order |
-| `record_admission.csv` | Durable recording-branch admission ledger | `(stream_id, record_frame_index)` |
+| `record_admission.csv` | Non-leaky recording-branch ledger | `(stream_id, record_frame_index)` |
+| `inference/frames.csv` | Frames admitted to inference | `(stream_id, source_sequence_index)` |
+| `objects.csv` | Detector/tracker observations | `observation_id` |
+| `keypoints.csv` | Pose points belonging to observations | `(observation_id, keypoint_index)` |
+| `diagnostics/controller_v2.jsonl` | Durable CRC-checked controller records | `(boot_id, sequence)` |
+| `diagnostics/controller_v2_summary.json` | Controller transport integrity summary | one per run |
+| `serial.csv` | Compatibility export plus host lifecycle markers | physical row order |
 
-`frames.csv` is the spine of a frame-level analysis. Never use
-`inference/frames.csv` as the spine because inference or preview may omit
-frames without affecting the non-leaky recording branch.
+The JSONL journal—not `serial.csv`—is the source of truth for v2 controller
+records. `serial.csv` remains useful for human inspection and host-originated
+markers.
 
-## 3. Preserve the three levels of data
+`frames.csv` is the spine of frame-level analysis. Never use inference rows as
+the spine: inference may be absent while the recording branch remains complete.
 
-The files are normalized because the relationships are one-to-many:
+## 3. The v2 timing model
 
-```text
-one camera frame
-  -> zero or one inference-frame row
-  -> zero or more controller behavior events
-  -> zero or more object observations
-       -> zero or more keypoints
-```
-
-A direct wide join of all five CSVs creates a Cartesian multiplication. For
-example, a frame with two behavior events, three objects, and nineteen
-keypoints per object would incorrectly become 114 rows. Event and object
-counts calculated from that table would be wrong.
-
-Use one of these analysis representations:
-
-1. Keep normalized aligned tables and join only the relationship needed by an
-   analysis. This is the recommended representation.
-2. Build one long-format table with a `record_type` column (`FRAME`,
-   `BEHAVIOR`, or `OBJECT`) and common frame/time columns. Aggregate the
-   keypoints for each object into a list or JSON value before adding an
-   `OBJECT` row.
-
-Do not put each keypoint into the same flat join as behavior events.
-
-## 4. Align inference by frame identity
-
-Join inference frames to `frames.csv` with:
+Legacy firmware emitted `CAMERA_HIGH` and `CAMERA_LOW` for every trigger.
+Protocol v2 intentionally avoids that serial load. It emits:
 
 ```text
-(stream_id, source_sequence_index)
+CAMERA_EPOCH       exact timestamp and count for the first trigger
+CAMERA_CHECKPOINT  exact timestamp and count at a periodic checkpoint
+CAMERA_STOP        exact timestamp and final trigger count
 ```
 
-For every joined row, cross-check that these values also agree when present:
+For the current single-camera system:
 
 ```text
-camera_frame_id
-camera_timestamp_ns
-gst_pts_ns
-raw_frame_index
+controller_count = CAMERA_EPOCH.count + source_sequence_index
 ```
 
-The identity join is exact; do not use nearest timestamps for inference.
-A frame absent from `inference/frames.csv` should remain in the frame table
-with `inference_present=false`, rather than being removed by an inner join.
+The final value must equal `CAMERA_STOP.count`. The acquisition finalizer also
+requires that this count equal the source, recording-admission, frame-ledger,
+and MP4 sample counts.
 
-Join `objects.csv` to the frame table using the same
-`(stream_id, source_sequence_index)` key and cross-check `camera_frame_id`.
-Join `keypoints.csv` to `objects.csv` using `observation_id`, then cross-check
-its duplicated stream, source-sequence, camera-frame, track, class, and object
-fields. Those duplicated fields are integrity evidence, not alternative fuzzy
-join keys.
+Anchor timestamps are exact controller measurements. Per-frame controller
+timestamps between anchors are piecewise-linear reconstructions. Keep the
+`controller_time_method` column in derived data so an exact anchor is never
+confused with an interpolated timestamp. The camera's own
+`camera_timestamp_ns` remains the exact frame-to-frame camera clock.
 
-## 5. Establish the controller-to-camera mapping
+This distinction matters for sub-frame timing claims: v2 gives exact trigger
+count identity for every frame, but only sparse exact controller timestamps.
 
-`serial.csv` order is scientifically meaningful. Add a zero-based
-`serial_index` while ingesting it and do not reorder the file first.
+## 4. Recommended pandas workflow
 
-Locate these marker rows in order:
-
-```text
-START_SENT
-CAPTURE_STOP_REQUESTED
-STOP_SENT
-CAPTURE_STOP_DONE
-```
-
-Marker names are stored on rows whose `eventType` is `MARKER`; depending on
-the controller message, the name is present in `context`, `reason`, or
-`rawLine`. Reject missing, duplicate, or out-of-order epoch markers.
-
-Within the epoch, select the first `CAMERA_HIGH` after `START_SENT`. For the
-current single-camera system, calculate:
-
-```text
-camera_frame_id_offset =
-    first frames.csv camera_frame_id - first CAMERA_HIGH count
-
-frame_ttl_count = camera_frame_id - camera_frame_id_offset
-```
-
-Join every frame to exactly one `CAMERA_HIGH` using `frame_ttl_count=count`.
-This mapping must include TTLs received during the shutdown tail after
-`CAPTURE_STOP_REQUESTED`.
-
-For every matched frame, retain at least:
-
-```text
-raw_frame_index
-camera_frame_id
-frame_ttl_count
-camera_timestamp_ns
-gst_pts_ns
-frame host timestamps
-CAMERA_HIGH rp2040Time
-CAMERA_HIGH host timestamps
-```
-
-Define elapsed experiment time on the controller clock:
-
-```text
-elapsed_s =
-    (CAMERA_HIGH rp2040Time - first CAMERA_HIGH rp2040Time) / 1_000_000
-```
-
-Do not align controller and camera data through wall-clock time. Host Unix
-timestamps are useful diagnostics but are not the primary controller mapping.
-
-## 6. Attach behavior events
-
-Behavior rows have their own `rp2040Time`. Associate each behavior event with
-the immediately preceding `CAMERA_HIGH` in controller time (an as-of join):
-
-```text
-matched frame = CAMERA_HIGH with the greatest rp2040Time <= event rp2040Time
-offset_from_frame_ms =
-    (event rp2040Time - matched CAMERA_HIGH rp2040Time) / 1000
-```
-
-Retain the original behavior timestamp and the calculated offset. This makes
-the association auditable and prevents an event from being presented as if it
-occurred exactly on the frame boundary.
-
-It can also be useful to calculate the nearest frame as a diagnostic, but the
-preceding frame is the canonical causal association. Keep lifecycle messages,
-acknowledgements, and raw controller lines available; filter to behavioral
-event types only in an analysis-specific view.
-
-## 7. Pandas workflow
-
-Use pandas for the alignment. On a large analysis machine, the frame and
-controller tables can normally remain in memory. Read `objects.csv` and
-especially `keypoints.csv` in chunks when they do not fit comfortably.
-Install a Parquet engine alongside pandas:
-
-```bash
-python -m pip install pandas pyarrow
-```
-
-A practical directory layout is:
-
-```text
-/data/squeakview/
-  source_runs/<run_id>/                 # read-only Jetson copy
-  analysis_results/<run_id>/alignment/  # derived outputs
-```
-
-The following is the core frame/controller/inference alignment. It intentionally
-selects only the columns needed for the join; add scientific columns to the
-`usecols` lists rather than initially loading every CSV column as Python
-objects.
+The repository includes a reusable, fail-closed loader:
 
 ```python
 from pathlib import Path
-import json
-import numpy as np
-import pandas as pd
+from data_viz.v2_alignment import associate_events_to_frames, load_v2_run
 
 RUN = Path("/data/squeakview/source_runs/<run_id>")
 OUT = Path("/data/squeakview/analysis_results/<run_id>/alignment")
 OUT.mkdir(parents=True, exist_ok=True)
 
-status = json.loads((RUN / "run_status.json").read_text())
-assert status["state"] == "finalized"
-assert status["overall_validation_passed"] is True
-assert status["recording_validation_passed"] is True
-assert status["alignment_validated"] is True
+run = load_v2_run(RUN)
+frames = run.frames
+events = run.events
+anchors = run.anchors
+aligned_events = associate_events_to_frames(events, frames)
 
-frame_columns = [
-    "stream_id", "source_sequence_index", "raw_frame_index",
-    "camera_frame_id", "camera_timestamp_ns", "gst_pts_ns",
-    "host_monotonic_ns", "host_unix_ns", "status",
-]
-frames = pd.read_csv(RUN / "frames.csv", usecols=frame_columns)
-frames = frames.sort_values(["stream_id", "source_sequence_index"])
-assert not frames.duplicated(["stream_id", "source_sequence_index"]).any()
-assert frames["raw_frame_index"].is_monotonic_increasing
+frames.to_parquet(OUT / "aligned_frames.parquet", index=False)
+aligned_events.to_parquet(OUT / "aligned_events.parquet", index=False)
+anchors.to_parquet(OUT / "controller_camera_anchors.parquet", index=False)
+```
 
-# Physical serial row order defines the controller epoch.
-serial = pd.read_csv(RUN / "serial.csv", low_memory=False)
-serial.insert(0, "serial_index", np.arange(len(serial), dtype=np.int64))
+`load_v2_run` verifies the finalized status, recording validation, v2 manifest,
+transport integrity summary, contiguous durable sequences, one controller boot,
+camera epoch structure, frame ordinals, and final controller/frame count. It
+then adds these columns to `frames.csv`:
 
-required_markers = [
-    "START_SENT", "CAPTURE_STOP_REQUESTED", "STOP_SENT",
-    "CAPTURE_STOP_DONE",
-]
-marker_rows = serial.loc[serial["eventType"].eq("MARKER")]
-marker_index = {}
-for name in required_markers:
-    matches = marker_rows.loc[marker_rows["reason"].eq(name), "serial_index"]
-    assert len(matches) == 1, f"expected exactly one {name} marker"
-    marker_index[name] = int(matches.iloc[0])
-assert list(marker_index.values()) == sorted(marker_index.values())
+```text
+controller_count
+frame_controller_us
+controller_time_method        exact_anchor | piecewise_interpolated
+controller_anchor_left_count
+controller_anchor_right_count
+controller_anchor_span_frames
+frame_time_s
+video_frame_index
+```
 
-highs = serial.loc[
-    serial["eventType"].eq("CAMERA_HIGH")
-    & serial["serial_index"].gt(marker_index["START_SENT"]),
-    ["serial_index", "count", "rp2040Time", "hostUnixNs", "hostMonotonicNs"],
-].copy()
-highs[["count", "rp2040Time"]] = highs[["count", "rp2040Time"]].apply(
-    pd.to_numeric, errors="raise"
-)
-highs = highs.rename(columns={
-    "count": "frame_ttl_count",
-    "rp2040Time": "frame_rp2040_us",
-    "hostUnixNs": "ttl_host_unix_ns",
-    "hostMonotonicNs": "ttl_host_monotonic_ns",
-})
-assert highs["frame_ttl_count"].is_unique
+`associate_events_to_frames` maps each non-camera controller message to the
+immediately preceding reconstructed frame and retains
+`offset_from_frame_ms`. The original journal sequence, controller timestamp,
+payload, host-receipt timestamps, boot ID, and session ID remain available.
 
-offset = int(frames.iloc[0]["camera_frame_id"] - highs.iloc[0]["frame_ttl_count"])
-frames["frame_ttl_count"] = frames["camera_frame_id"] - offset
-aligned_frames = frames.merge(
-    highs,
-    on="frame_ttl_count",
-    how="left",
-    validate="one_to_one",
-    indicator="ttl_join",
-)
-assert aligned_frames["ttl_join"].eq("both").all()
-assert len(aligned_frames) == len(frames) == len(highs)
+## 5. Exact inference and object joins
 
-first_rp2040_us = int(aligned_frames.iloc[0]["frame_rp2040_us"])
-aligned_frames["elapsed_s"] = (
-    aligned_frames["frame_rp2040_us"] - first_rp2040_us
-) / 1_000_000
+Join inference to frames by exact identity:
 
-inference = pd.read_csv(
-    RUN / "inference" / "frames.csv",
-    usecols=[
-        "stream_id", "source_sequence_index", "camera_frame_id",
-        "camera_timestamp_ns", "gst_pts_ns", "raw_frame_index",
-    ],
-)
-assert not inference.duplicated(["stream_id", "source_sequence_index"]).any()
+```python
+import pandas as pd
+
+inference = pd.read_csv(RUN / "inference" / "frames.csv", low_memory=False)
 inference["inference_present"] = True
 
-aligned_frames = aligned_frames.merge(
+aligned_frames = frames.merge(
     inference,
     on=["stream_id", "source_sequence_index"],
     how="left",
@@ -306,71 +150,53 @@ for column in (
     assert aligned_frames.loc[present, column].eq(
         aligned_frames.loc[present, f"{column}_inference"]
     ).all(), f"inference identity mismatch: {column}"
-
-aligned_frames.to_parquet(OUT / "aligned_frames.parquet", index=False)
 ```
 
-Associate behavior events with the preceding camera trigger using
-`pandas.merge_asof`:
+Join objects with `(stream_id, source_sequence_index)` and validate
+`camera_frame_id`. Join keypoints to objects using `observation_id`, then
+cross-check their duplicated stream, frame, camera, track, class, and object
+fields. Never fuzzy-match inference with timestamps.
 
-```python
-events = serial.loc[
-    serial["serial_index"].gt(marker_index["START_SENT"])
-    & serial["serial_index"].le(marker_index["CAPTURE_STOP_DONE"])
-    & ~serial["eventType"].isin(["CAMERA_HIGH", "CAMERA_LOW"])
-].copy()
-events["event_rp2040_us"] = pd.to_numeric(
-    events["rp2040Time"], errors="coerce"
-)
-# Startup/status lines without a numeric controller timestamp remain in the
-# canonical serial.csv, but cannot participate in controller-time alignment.
-events = events.loc[events["event_rp2040_us"].notna()].copy()
-events["event_rp2040_us"] = events["event_rp2040_us"].astype(np.int64)
-events["pre_capture"] = events["event_rp2040_us"].lt(first_rp2040_us)
+## 6. Keep normalized tables
 
-frame_clock = aligned_frames[[
-    "stream_id", "source_sequence_index", "raw_frame_index",
-    "camera_frame_id", "frame_ttl_count", "frame_rp2040_us", "elapsed_s",
-]].sort_values("frame_rp2040_us")
-events = events.sort_values("event_rp2040_us")
+The relationships are one-to-many:
 
-aligned_events = pd.merge_asof(
-    events,
-    frame_clock,
-    left_on="event_rp2040_us",
-    right_on="frame_rp2040_us",
-    direction="backward",
-    allow_exact_matches=True,
-)
-aligned_events["offset_from_frame_ms"] = (
-    aligned_events["event_rp2040_us"]
-    - aligned_events["frame_rp2040_us"]
-) / 1000
-aligned_events.to_parquet(OUT / "aligned_events.parquet", index=False)
+```text
+one camera frame
+  -> zero or one inference-frame row
+  -> zero or more controller events
+  -> zero or more objects
+       -> zero or more keypoints
 ```
 
-Run-start acknowledgements can occur after `START_SENT` but before the first
-camera trigger. They remain in `aligned_events` with `pre_capture=true` and no
-matched frame. Do not force them onto frame zero. Actual behavior events during
-capture should have a frame mapping.
+A direct wide join creates a Cartesian multiplication and corrupts event and
+object counts. Keep normalized Parquet tables and join only what an analysis
+needs. If a long-format export is required, use explicit `FRAME`, `BEHAVIOR`,
+and `OBJECT` record types and aggregate keypoints per object first.
 
-The example assumes the current single-camera/controller configuration. For a
-future multi-camera controller protocol, perform the as-of join separately per
-stream only after the controller events carry an explicit stream identity.
+## 7. Large runs
 
-Join objects to the compact frame lookup in pandas. Use `chunksize` if the
-object table is large:
+Install a Parquet engine with pandas on the analysis device:
+
+```bash
+python -m pip install pandas pyarrow
+```
+
+Frames, anchors, and controller events are normally small enough for memory.
+Read `objects.csv` and especially `keypoints.csv` in chunks:
 
 ```python
-frame_lookup = aligned_frames[[
+frame_lookup = frames[[
     "stream_id", "source_sequence_index", "raw_frame_index",
-    "camera_frame_id", "frame_ttl_count", "frame_rp2040_us", "elapsed_s",
+    "camera_frame_id", "controller_count", "frame_controller_us",
+    "controller_time_method", "frame_time_s",
 ]]
 
-objects_dir = OUT / "aligned_objects.parquet"
-objects_dir.mkdir(exist_ok=True)
-object_parts = []
-for part, objects in enumerate(pd.read_csv(RUN / "objects.csv", chunksize=1_000_000)):
+objects_out = OUT / "aligned_objects.parquet"
+objects_out.mkdir(exist_ok=True)
+for part, objects in enumerate(
+    pd.read_csv(RUN / "objects.csv", chunksize=1_000_000)
+):
     aligned = objects.merge(
         frame_lookup,
         on=["stream_id", "source_sequence_index"],
@@ -380,101 +206,40 @@ for part, objects in enumerate(pd.read_csv(RUN / "objects.csv", chunksize=1_000_
         indicator=True,
     )
     assert aligned["_merge"].eq("both").all()
-    assert aligned["camera_frame_id"].eq(aligned["camera_frame_id_frame"]).all()
+    assert aligned["camera_frame_id"].eq(
+        aligned["camera_frame_id_frame"]
+    ).all()
     aligned.drop(columns="_merge").to_parquet(
-        objects_dir / f"part-{part:05d}.parquet", index=False
-    )
-    object_parts.append(aligned[[
-        "observation_id", "stream_id", "source_sequence_index",
-        "camera_frame_id", "raw_frame_index", "frame_ttl_count",
-        "frame_rp2040_us", "elapsed_s",
-    ]])
-```
-
-`aligned_objects.parquet/` is a partitioned Parquet dataset. Pandas can read it
-as one logical table with `pd.read_parquet(objects_dir)`. On an analysis device
-with enough memory, concatenate the chunks and call `to_parquet` once if a
-single physical file is preferable.
-
-Keypoints are normally the largest table. Build an object lookup from the
-minimal columns retained in `object_parts`, then process keypoints in chunks:
-
-```python
-object_lookup = pd.concat(object_parts, ignore_index=True)
-assert object_lookup["observation_id"].is_unique
-
-keypoints_dir = OUT / "aligned_keypoints.parquet"
-keypoints_dir.mkdir(exist_ok=True)
-for part, keypoints in enumerate(
-    pd.read_csv(RUN / "keypoints.csv", chunksize=2_000_000)
-):
-    aligned = keypoints.merge(
-        object_lookup,
-        on="observation_id",
-        how="left",
-        suffixes=("", "_object"),
-        validate="many_to_one",
-        indicator=True,
-    )
-    assert aligned["_merge"].eq("both").all()
-    for column in ("stream_id", "source_sequence_index", "camera_frame_id"):
-        assert aligned[column].eq(aligned[f"{column}_object"]).all()
-    aligned.drop(columns="_merge").to_parquet(
-        keypoints_dir / f"part-{part:05d}.parquet", index=False
+        objects_out / f"part-{part:05d}.parquet", index=False
     )
 ```
 
-Recommended processing order:
+A directory of numbered Parquet parts is one logical dataset and keeps peak
+memory bounded. The copied CSV and JSONL files remain the canonical evidence.
 
-1. Stream `serial.csv` into a table while assigning `serial_index`.
-2. Validate the epoch markers and create a `camera_high` table.
-3. Stream `frames.csv`, calculate `frame_ttl_count`, and create
-   `aligned_frames`.
-4. Left-join inference admission onto `aligned_frames` by exact identity.
-5. As-of join behavior events to `camera_high` by `rp2040Time`.
-6. Join objects to frames by exact identity.
-7. Join keypoints to objects by `observation_id`, retaining their
-   `keypoint_index` ordering.
-8. Write derived tables as Parquet with `DataFrame.to_parquet`. Export a CSV
-   only when a downstream tool specifically requires it.
+## 8. Required downstream checks
 
-Parquet is recommended because it preserves pandas dtypes, supports column
-selection, and avoids repeatedly parsing tens of gigabytes of CSV. A directory
-of numbered Parquet parts is one logical dataset and keeps peak pandas memory
-bounded. The copied Jetson CSVs remain the canonical source evidence.
+Record these checks with every derived dataset:
 
-## 8. Required validation after combining
-
-Record these checks alongside the derived outputs:
-
-- frame rows equal the authoritative `frames.csv` count;
-- frame rows equal the validated MP4 sample count in `run_status.json`;
-- every frame has exactly one TTL mapping for controller-enabled runs;
-- the derived frame order is strictly increasing by `raw_frame_index`;
-- camera frame IDs and controller TTL counts are strictly increasing;
+- the source run was finalized and production eligible;
+- MP4, source, recording-admission, frame-ledger, and controller-stop counts
+  agree;
+- the durable controller journal has one boot and contiguous stored sequences;
+- camera anchors have increasing unique counts and timestamps;
+- every frame has one controller count and a declared timing method;
+- frame order is strictly increasing by `raw_frame_index`;
 - inference joins have no duplicate frame keys;
-- every object references an existing inference/camera frame;
+- every object references an existing frame;
 - every keypoint references an existing `observation_id`;
-- each object/keypoint cross-check field agrees with its parent;
-- all input file sizes or hashes used by the analysis are recorded;
+- duplicated identity fields agree with their parent tables;
 - source-run files remain unchanged.
 
-Missing inference for a frame is not automatically a recording failure. It
-must be represented explicitly and evaluated according to the scientific
-question. Missing canonical frames, missing controller TTLs, or mismatched MP4
-samples are acquisition-integrity failures.
+Missing inference is not automatically a recording failure. Missing canonical
+frames, a controller/frame count mismatch, a controller boot boundary, or a
+durable v2 transport integrity failure is an acquisition-integrity failure.
 
-## 9. Existing SqueakView audit utility
+## 9. Legacy runs
 
-The repository command below recreates the compact alignment audit on a copied
-run:
-
-```bash
-python3 scripts/align_run_outputs.py \
-  /data/squeakview/source_runs/<run_id> \
-  --out-dir /data/squeakview/analysis_results/<run_id>/alignment
-```
-
-At present this command writes `alignment_summary.json`; it does not create a
-combined analysis table. Use it to verify the copy and controller/frame
-mapping before building analysis-specific Parquet or CSV outputs.
+The old `scripts/align_run_outputs.py` utility and `alignment_summary.json`
+workflow are retained only for historical runs containing per-frame
+`CAMERA_HIGH` records. Do not run that legacy aligner on protocol-v2 data.

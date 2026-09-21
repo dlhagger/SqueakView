@@ -161,7 +161,7 @@ def build_launch_config(
         if failure_plan_value
         else None
     )
-    controller_protocol = env.get("SQUEAKVIEW_CONTROLLER_PROTOCOL", "legacy").strip()
+    controller_protocol = env.get("SQUEAKVIEW_CONTROLLER_PROTOCOL", "v2").strip()
     try:
         watchdog_lease_ms = int(
             env.get("SQUEAKVIEW_CONTROLLER_WATCHDOG_LEASE_MS", "1500")

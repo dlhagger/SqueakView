@@ -37,6 +37,9 @@ DeepStream-Yolo/configs/*
 
 #tool omit
 tools/
+!squeakview/tools/
+!squeakview/tools/*.py
+*.egg-info/
 
 # local credentials / secrets
 client_secret_*.json

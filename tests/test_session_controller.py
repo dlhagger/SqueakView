@@ -113,6 +113,21 @@ class SessionConfigHelpersTest(unittest.TestCase):
             self.project.paths.qualification / "fault.json",
         )
         self.assertEqual(request.bottles["left"]["initial_weight_g"], 25.0)
+        self.assertEqual(request.controller_protocol, "v2")
+
+    def test_legacy_controller_transport_requires_explicit_override(self) -> None:
+        data = default_config_data(self.project)
+        data["inference_enabled"] = False
+
+        request = build_launch_config(
+            data,
+            bottles={},
+            preview_window_id=None,
+            project=self.project,
+            environment={"SQUEAKVIEW_CONTROLLER_PROTOCOL": "legacy"},
+        )
+
+        self.assertEqual(request.controller_protocol, "legacy")
 
     def test_launch_mapping_rejects_missing_configuration(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "Configuration not set"):

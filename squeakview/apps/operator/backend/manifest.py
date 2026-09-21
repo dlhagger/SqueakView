@@ -340,6 +340,16 @@ class RunManifestService:
         )
         if cfg.controller_protocol == "watchdog_v1_experimental":
             disqualifiers = (*disqualifiers, "controller_watchdog_unqualified")
+        if cfg.serial_enabled and cfg.controller_protocol != "v2":
+            disqualifiers = (*disqualifiers, "controller_protocol_not_v2")
+        v2_summary_path = run_dir / "diagnostics" / "controller_v2_summary.json"
+        v2_transport = (
+            run_context.read_json_required(v2_summary_path)
+            if cfg.serial_enabled
+            and cfg.controller_protocol == "v2"
+            and v2_summary_path.exists()
+            else None
+        )
         storage = dict(context.storage)
         storage_policy = resolve_storage_reserve_policy()
         storage["reserve_supervision"] = {
@@ -510,7 +520,22 @@ class RunManifestService:
                 "enabled": cfg.serial_enabled,
                 "port": cfg.serial_port if cfg.serial_enabled else None,
                 "baud": cfg.serial_baud if cfg.serial_enabled else None,
-                "alignment_required": bool(cfg.serial_enabled and cfg.trigger_on),
+                "alignment_required": bool(
+                    cfg.serial_enabled
+                    and cfg.trigger_on
+                    and cfg.controller_protocol != "v2"
+                ),
+                "v2_journal": (
+                    "diagnostics/controller_v2.jsonl"
+                    if cfg.serial_enabled and cfg.controller_protocol == "v2"
+                    else None
+                ),
+                "v2_summary": (
+                    "diagnostics/controller_v2_summary.json"
+                    if cfg.serial_enabled and cfg.controller_protocol == "v2"
+                    else None
+                ),
+                "v2_transport": v2_transport,
                 "controller_protocol": cfg.controller_protocol,
                 "watchdog": (
                     dict(context.controller_watchdog)

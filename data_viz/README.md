@@ -16,12 +16,14 @@ The Jetson:
 The DGX Spark:
 
 - Stores a verified copy of each finalized run.
-- Rechecks alignment when required.
+- Builds the protocol-v2 frame/controller timeline from durable camera anchors.
 - Runs notebooks, statistics, visualization, and project-specific analysis.
 - Stores every derived result outside the copied source run.
 
-The Jetson post-run aligner is part of acquisition validation, not downstream
-scientific analysis. Wait for it to finish before copying a run.
+The Jetson performs bounded acquisition-integrity and frame-count validation.
+Protocol v2 does not build a legacy per-frame TTL alignment on the Jetson;
+derived analysis timelines are built on the analysis device. Wait for capture
+validation to finish before copying a run.
 
 For the exact frame identities, controller-clock mapping, inference joins, and
 large-run processing rules, see [ALIGNMENT_GUIDE.md](ALIGNMENT_GUIDE.md).
@@ -62,13 +64,14 @@ A normal finalized single-camera run contains:
 ```text
 raw.mp4                         Authoritative H.264 camera recording
 frames.csv                      One row per recorded frame
-serial.csv                      Controller events and camera TTLs, when enabled
+serial.csv                      Decoded compatibility export and host markers
 objects.csv                     Live detector/tracker observations
 keypoints.csv                   Live normalized pose observations
 run_manifest.json               Immutable acquisition and model provenance
 run_status.json                 Lifecycle and validation result
-alignment_summary.json          Jetson-generated timing audit
 diagnostics/                    Camera, recording, error, and finalizer records
+  controller_v2.jsonl          Durable CRC-checked controller journal
+  controller_v2_summary.json   Controller transport integrity summary
 config/                         Run-local configuration snapshots
 bottle_setup.json               Bottle setup, when used
 bottle_measurements.csv         Entered bottle weights, when used
@@ -77,7 +80,9 @@ bottle_summary.json             Derived bottle intake, when used
 
 Some optional CSVs may contain only their header when no observations or errors
 occurred. That is not by itself a failure. `run_status.json` and
-`alignment_summary.json` determine whether the acquisition passed validation.
+`diagnostics/controller_v2_summary.json` determine whether a v2 acquisition
+passed validation. `alignment_validated=false` is expected for v2 because the
+legacy `CAMERA_HIGH` aligner is intentionally skipped.
 
 ## DGX Directory Layout
 
@@ -102,23 +107,24 @@ matching `analysis_results/<run_id>/` directory.
 ## Verify the Copied Run
 
 First inspect `run_status.json` and confirm that the copied video and canonical
-CSVs have the same byte sizes as the Jetson originals. For serial-enabled runs,
-the bounded aligner can independently validate the DGX copy without changing
-the source directory:
+tables have the same byte sizes as the Jetson originals. For protocol-v2 runs,
+load and validate the copied evidence without changing the source directory:
 
-```bash
-python3 scripts/align_run_outputs.py \
-  /data/squeakview/source_runs/<run_id> \
-  --out-dir /data/squeakview/analysis_results/<run_id>/alignment
+```python
+from pathlib import Path
+from data_viz.v2_alignment import load_v2_run
+
+run = load_v2_run(Path("/data/squeakview/source_runs/<run_id>"))
+print(len(run.frames), len(run.events), len(run.anchors))
 ```
 
-The command requires `ffprobe`, writes a new `alignment_summary.json` under the
-selected analysis-results directory, and exits nonzero if frame, video,
-controller, or object mapping validation fails. Compare this result with the
-Jetson-generated summary retained in the source run.
+The loader rejects incomplete acquisition validation, corrupt or discontinuous
+v2 journals, controller boot boundaries, malformed camera anchors, and final
+controller/frame count mismatches. Write resulting Parquet tables under the
+matching analysis-results directory, never into the copied source run.
 
 Runs recorded without serial input do not contain the RP2040 time base required
-by this aligner. For those runs, use the recording and capture reconciliation
+by this workflow. For those runs, use the recording and capture reconciliation
 results in `run_status.json`.
 
 ## Demonstration Notebook
@@ -134,7 +140,8 @@ NumPy, pandas, Matplotlib, Seaborn, and IPython:
 jupyter lab data_viz/analysis_demo_viz.ipynb
 ```
 
-Set `RUN_DIR` in the first code cell to the copied source-run path and leave
+Leave `RUN_DIR = None` to select the newest run referenced by the project
+`.latest_run` markers, or set it to a copied source-run path explicitly. Leave
 `INFERENCE_RESULT = "live"` to inspect the acquisition-time inference outputs.
 The notebook currently reads canonical CSVs into memory, so do not point it at a
 full long-duration run unless a suitably sampled copy has been prepared.

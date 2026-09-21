@@ -45,6 +45,10 @@ class _Serial:
         self.events.append(f"serial:ack:{timeout_s}")
         return True
 
+    def wait_for_camera_stop(self, timeout_s: float = 3.0) -> bool:
+        self.events.append(f"serial:camera-stop:{timeout_s}")
+        return True
+
     def disarm_watchdog_v1(self, *, timeout_s: float = 2.0) -> None:
         self.events.append(f"serial:disarm:{timeout_s}")
 
@@ -134,6 +138,7 @@ class FinalizationServiceTests(unittest.TestCase):
         ordered = [
             "marker:CAPTURE_STOP_REQUESTED",
             "serial:STOP",
+            "serial:camera-stop:3.0",
             "serial:ack:2.0",
             "capture:drain:17",
             "capture:terminate",
@@ -145,6 +150,19 @@ class FinalizationServiceTests(unittest.TestCase):
         ]
         positions = [self.events.index(event) for event in ordered]
         self.assertEqual(positions, sorted(positions), self.events)
+
+    def test_missing_v2_camera_stop_fails_shutdown_closed(self) -> None:
+        serial = _Serial(self.events)
+        serial.wait_for_camera_stop = lambda timeout_s=3.0: False  # type: ignore[method-assign]
+
+        result = lifecycle.finalize_run(
+            self._request(_Capture(self.events), serial),
+            self._hooks(),
+        )
+
+        self.assertTrue(result.failed)
+        self.assertIn("CAMERA_STOP was not received", result.error or "")
+        self.assertIn("serial:close", self.events)
 
     def test_unconfirmed_capture_exit_skips_validation_and_fails_closed(self) -> None:
         result = lifecycle.finalize_run(

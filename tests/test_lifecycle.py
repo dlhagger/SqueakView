@@ -124,6 +124,13 @@ class FakeSerialHandle:
         del timeout_s
         return True
 
+    def wait_for_camera_stop(self, timeout_s: float = 3.0) -> bool:
+        del timeout_s
+        return True
+
+    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None:
+        self.sent.append(f"PROTO_V2_TEST,{timeout_s}")
+
     def negotiate_watchdog_v1(
         self, *, requested_lease_ms: int, timeout_s: float = 2.0
     ) -> object:
@@ -1113,8 +1120,12 @@ power_modes: [25W]
         self.assertEqual(worker.wait_timeouts, [30.0])
         self.assertEqual(self.status()["state"], "finalization_failed")
 
-    def test_triggered_run_generates_alignment_during_finalization(self) -> None:
-        self.backend.launch_cfg = self.config(serial_enabled=True, trigger_on=True)
+    def test_triggered_legacy_run_generates_alignment_during_finalization(self) -> None:
+        self.backend.launch_cfg = self.config(
+            serial_enabled=True,
+            trigger_on=True,
+            controller_protocol="legacy_v1",
+        )
         with mock.patch.object(
             manager.finalizer, "run_capture_finalizer", return_value=0
         ) as run_finalizer:
@@ -1123,6 +1134,21 @@ power_modes: [25W]
             )
 
         self.assertTrue(run_finalizer.call_args.kwargs["enable_align"])
+
+    def test_triggered_v2_run_skips_legacy_alignment_during_finalization(self) -> None:
+        self.backend.launch_cfg = self.config(
+            serial_enabled=True,
+            trigger_on=True,
+            controller_protocol="v2",
+        )
+        with mock.patch.object(
+            manager.finalizer, "run_capture_finalizer", return_value=0
+        ) as run_finalizer:
+            manager.OperatorBackend._run_capture_finalizer(
+                self.backend, self.run_dir
+            )
+
+        self.assertFalse(run_finalizer.call_args.kwargs["enable_align"])
 
     def test_free_running_serial_logging_does_not_request_trigger_alignment(self) -> None:
         self.backend.launch_cfg = self.config(serial_enabled=True, trigger_on=False)

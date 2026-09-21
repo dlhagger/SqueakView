@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import atexit
 import csv
+import json
 import os
+import queue
 import smtplib
 import ssl
 import tempfile
@@ -15,6 +17,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Callable, Iterable
 
+from squeakview.common import controller_protocol_v2 as protocol_v2
 from squeakview.common.failure_injection import FailurePlan
 from squeakview.common.controller_watchdog import (
     ControllerCapabilities,
@@ -44,6 +47,7 @@ SERIAL_HEADER = [
 ]
 MAX_SERIAL_LINE_BYTES = 64 * 1024
 MAX_BUFFERED_SERIAL_ROWS = 1024
+MAX_BUFFERED_V2_RECORDS = 1024
 CLEAR_JAM_ACK = "ACK_CLEAR_JAM"
 CLEAR_JAM_NACK_FEED_ACTIVE = "NACK,CLEAR_JAM,FEED_ACTIVE"
 CLEAR_JAM_NACK_NOT_JAMMED = "NACK,CLEAR_JAM,NOT_JAMMED"
@@ -54,6 +58,29 @@ _CLEAR_JAM_RESPONSES = frozenset(
         CLEAR_JAM_NACK_NOT_JAMMED,
     }
 )
+
+_WRITE_PRIORITY_SAFETY = 0
+_WRITE_PRIORITY_COMMAND = 10
+_WRITE_PRIORITY_REPLAY = 40
+_WRITE_PRIORITY_ACK = 50
+
+
+class _WriteRequest:
+    __slots__ = ("payload", "done", "error", "marker_before", "starts_trigger")
+
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        wait: bool,
+        marker_before: str | None = None,
+        starts_trigger: bool = False,
+    ) -> None:
+        self.payload = payload
+        self.done = threading.Event() if wait else None
+        self.error: BaseException | None = None
+        self.marker_before = marker_before
+        self.starts_trigger = starts_trigger
 
 
 def _is_feeder_jam_protocol_line(line: str) -> bool:
@@ -104,6 +131,13 @@ class SerialHandle:
         self._controller_capabilities: ControllerCapabilities | None = None
         self._watchdog_session: ControllerWatchdogSession | None = None
         self._write_lock = threading.Lock()
+        self._write_queue: queue.PriorityQueue[tuple[int, int, _WriteRequest | None]] = (
+            queue.PriorityQueue()
+        )
+        self._write_order = 0
+        self._write_order_lock = threading.Lock()
+        self._writer_thread: threading.Thread | None = None
+        self._writer_stop = threading.Event()
         self._ttl_lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
@@ -120,6 +154,38 @@ class SerialHandle:
         self._clock_response_seen = threading.Event()
         self._clock_response: tuple[str, int] | None = None
         self._clock_error: str | None = None
+        self._protocol_mode = "v1"
+        self._protocol_v2_pending = False
+        self._protocol_v2_seen = threading.Event()
+        self._protocol_v2_error: str | None = None
+        self._v1_input = bytearray()
+        self._v2_decoder = protocol_v2.StreamDecoder()
+        self._v2_queue: queue.Queue[
+            tuple[protocol_v2.Frame, int, int] | None
+        ] = queue.Queue(maxsize=MAX_BUFFERED_V2_RECORDS)
+        self._v2_worker: threading.Thread | None = None
+        self._v2_worker_stop = threading.Event()
+        self._v2_journal: protocol_v2.DurableJournal | None = None
+        self._v2_boot_id: int | None = None
+        self._v2_session_id: int | None = None
+        self._v2_last_ack_queued: dict[int, int] = {}
+        self._v2_last_resend_requested: dict[int, int] = {}
+        self._v2_integrity_latched = False
+        self._v2_summary_path: Path | None = None
+        self._v2_counts: dict[str, int] = {
+            "frames_received": 0,
+            "frames_stored": 0,
+            "duplicates": 0,
+            "retransmissions_received": 0,
+            "crc_or_framing_errors": 0,
+            "conflicting_duplicates": 0,
+            "boot_boundaries": 0,
+        }
+        self._v2_last_status: dict[str, str] | None = None
+        self._v2_ack_withheld = False
+        self._v2_observed = threading.Condition()
+        self._v2_message_counts: dict[int, int] = {}
+        self._v2_payloads: list[tuple[int, str, int, int]] = []
         self._csv_lock = threading.Lock()
         self._csv_writer: csv.writer | None = None
         self._csv_file = None
@@ -261,6 +327,16 @@ class SerialHandle:
 
             self._open_csv(dst_path)
 
+            diagnostics_dir = run_dir / "diagnostics"
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            if self._v2_journal is not None:
+                self._v2_journal.close()
+            self._v2_journal = protocol_v2.DurableJournal(
+                diagnostics_dir / "controller_v2.jsonl",
+                allow_midstream_start=True,
+            )
+            self._v2_summary_path = diagnostics_dir / "controller_v2_summary.json"
+
             self._tmp_opened = False
             self._tmp_csv_path = None
             return True
@@ -293,6 +369,16 @@ class SerialHandle:
             )
             self._closed = False
             self._stop.clear()
+            self._writer_stop.clear()
+            self._v2_worker_stop.clear()
+            self._protocol_mode = "v1"
+            self._protocol_v2_pending = False
+            self._protocol_v2_error = None
+            self._protocol_v2_seen.clear()
+            self._v1_input.clear()
+            self._v2_decoder.reset()
+            self._write_queue = queue.PriorityQueue()
+            self._v2_queue = queue.Queue(maxsize=MAX_BUFFERED_V2_RECORDS)
             with self._ttl_lock:
                 self._ttl_seen.clear()
             self._stop_ack_seen.clear()
@@ -312,6 +398,18 @@ class SerialHandle:
                     raise OSError(self.fatal_error or "serial CSV setup failed")
             else:
                 self._open_temp_csv()
+            self._writer_thread = threading.Thread(
+                target=self._writer_pump,
+                daemon=True,
+                name="squeakview-serial-writer",
+            )
+            self._writer_thread.start()
+            self._v2_worker = threading.Thread(
+                target=self._v2_persistence_pump,
+                daemon=True,
+                name="squeakview-controller-v2-journal",
+            )
+            self._v2_worker.start()
             self._thread = threading.Thread(target=self._pump, daemon=True)
             self._thread.start()
             return True
@@ -331,7 +429,6 @@ class SerialHandle:
     def _pump(self) -> None:
         failure: str | None = None
         try:
-            buf = b""
             while not self._stop.is_set():
                 ser = self.ser
                 if ser is None or not getattr(ser, "is_open", False):
@@ -341,76 +438,12 @@ class SerialHandle:
                     chunk = ser.read(256)
                     if not chunk:
                         continue
-                    buf += chunk
-                    while b"\n" in buf:
-                        line, buf = buf.split(b"\n", 1)
-                        # Capture host receipt before presentation logging or
-                        # ledger I/O can inflate a clock exchange's RTT.
-                        received_ns = time.time_ns()
-                        if len(line) > self._max_line_bytes:
-                            raise ValueError(
-                                "serial line exceeded bounded size of "
-                                f"{self._max_line_bytes} bytes"
-                            )
-                        try:
-                            s = line.decode(errors="replace").strip()
-                        except Exception:
-                            s = str(line)
-                        if not s:
-                            continue
-                        if (
-                            self.failure_plan is not None
-                            and self.failure_plan.kind == "read_error"
-                            and self._read_count >= self.failure_plan.after_frames
-                        ):
-                            raise OSError(
-                                "qualification-injected serial reader failure"
-                            )
-                        self._read_count += 1
-                        if self._emit_serial_logs or _is_feeder_jam_protocol_line(s):
-                            self.emit(f"[{timestamp()}] 【SER】 {s}")
-                        # Recording readiness requires evidence of an actual
-                        # rising trigger edge, not arbitrary CAMERA_* status or
-                        # configuration telemetry.
-                        if s == "CAMERA_HIGH" or s.startswith("CAMERA_HIGH,"):
-                            with self._ttl_lock:
-                                self._ttl_seen.set()
-                        self._write_csv_line(s)
-                        if self._stop.is_set():
-                            break
-                        try:
-                            session = self._watchdog_session
-                            consumed = session.ingest(s) if session is not None else False
-                            capabilities = (
-                                None if consumed else parse_controller_capabilities(s)
-                            )
-                        except ValueError as exc:
-                            self.emit(
-                                f"[{timestamp()}] [SER] WARN: ignored malformed "
-                                f"controller capability advertisement: {exc}"
-                            )
-                        else:
-                            if capabilities is not None:
-                                with self._capabilities_lock:
-                                    self._controller_capabilities = capabilities
-                        if s == "ACK_STOP" or s.startswith("ACK_STOP,"):
-                            fields = s.split(",")
-                            try:
-                                self._stop_ack_count = int(float(fields[4]))
-                            except (IndexError, TypeError, ValueError):
-                                self._stop_ack_count = None
-                            self._stop_ack_seen.set()
-                        self._ingest_clear_jam_response(s)
-                        self._ingest_clock_response(s, received_ns)
-                        self._maybe_send_alert(s)
-                    if len(buf) > self._max_line_bytes:
-                        raise ValueError(
-                            "serial input without a newline exceeded bounded size of "
-                            f"{self._max_line_bytes} bytes"
-                        )
+                    self._ingest_serial_bytes(chunk)
                 except Exception as exc:
                     if self._stop.is_set():
                         break
+                    if self._protocol_mode == "v2" and self._reconnect_v2(exc):
+                        continue
                     failure = f"serial reader failed on {self.port}: {exc}"
                     break
         finally:
@@ -419,6 +452,519 @@ class SerialHandle:
             elif not self._stop.is_set():
                 self._report_fatal("serial reader exited unexpectedly")
             self.emit(f"[{timestamp()}] [SER] reader thread exit")
+
+    def _ingest_serial_bytes(self, chunk: bytes) -> None:
+        """Route one read without losing the v1-ACK/v2-binary boundary."""
+
+        if self._protocol_mode == "v2":
+            self._ingest_v2_bytes(chunk)
+            return
+        if self._protocol_mode == "v2_resync":
+            self._ingest_v2_resync_bytes(chunk)
+            return
+        self._v1_input.extend(chunk)
+        while self._protocol_mode != "v2" and b"\n" in self._v1_input:
+            raw_line, remainder = self._v1_input.split(b"\n", 1)
+            self._v1_input = bytearray(remainder)
+            received_ns = time.time_ns()
+            if len(raw_line) > self._max_line_bytes:
+                raise ValueError(
+                    f"serial line exceeded bounded size of {self._max_line_bytes} bytes"
+                )
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            negotiation_pending = self._protocol_v2_pending
+            self._handle_semantic_line(line, received_ns=received_ns)
+            if negotiation_pending and line == "ACK_PROTO,2":
+                trailing = bytes(self._v1_input)
+                self._v1_input.clear()
+                self.emit(f"[{timestamp()}] [SER] controller protocol v2 active")
+                if trailing:
+                    self._ingest_v2_bytes(trailing)
+                return
+        if len(self._v1_input) > self._max_line_bytes:
+            raise ValueError(
+                "serial input without a newline exceeded bounded size of "
+                f"{self._max_line_bytes} bytes"
+            )
+
+    def _ingest_v2_resync_bytes(self, chunk: bytes) -> None:
+        """Resolve reconnect as continued binary mode or a rebooted v1 device."""
+
+        self._v1_input.extend(chunk)
+        delimiter = self._v1_input.find(0)
+        ack = self._v1_input.find(b"ACK_PROTO,2\n")
+        nack = self._v1_input.find(b"NACK,PROTO,")
+        if ack >= 0 and (delimiter < 0 or ack < delimiter):
+            prefix = bytes(self._v1_input[:ack])
+            trailing = bytes(self._v1_input[ack + len(b"ACK_PROTO,2\n") :])
+            self._v1_input.clear()
+            for raw_line in prefix.splitlines():
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if line:
+                    self._handle_semantic_line(line, received_ns=time.time_ns())
+            self._protocol_mode = "v2"
+            self._v2_decoder.reset()
+            self._handle_semantic_line("ACK_PROTO,2", received_ns=time.time_ns())
+            self.emit(f"[{timestamp()}] [SER] controller protocol v2 active")
+            if trailing:
+                self._ingest_v2_bytes(trailing)
+            return
+        if nack >= 0 and (delimiter < 0 or nack < delimiter):
+            newline = self._v1_input.find(b"\n", nack)
+            if newline >= 0:
+                prefix = bytes(self._v1_input[:newline])
+                trailing = bytes(self._v1_input[newline + 1 :])
+                self._v1_input.clear()
+                for raw_line in prefix.splitlines():
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if line:
+                        self._handle_semantic_line(line, received_ns=time.time_ns())
+                if trailing:
+                    self._v1_input.extend(trailing)
+                return
+        if delimiter >= 0:
+            buffered = bytes(self._v1_input)
+            try:
+                protocol_v2.decode_frame(buffered[:delimiter])
+            except protocol_v2.ProtocolV2Error:
+                complete_first_frame = False
+            else:
+                complete_first_frame = True
+            if complete_first_frame:
+                self._v1_input.clear()
+                self._v2_decoder.reset()
+                self._protocol_mode = "v2"
+                self.emit(f"[{timestamp()}] [SER] rejoined active controller protocol v2")
+                self._ingest_v2_bytes(buffered)
+                return
+            if self._protocol_v2_pending and self._v2_boot_id is None:
+                self._v1_input.clear()
+                self._protocol_v2_error = (
+                    "controller was already in v2 and the host attached in the "
+                    "middle of a frame; a safe run-local sequence baseline "
+                    "cannot be established"
+                )
+                self._protocol_v2_pending = False
+                self._protocol_v2_seen.set()
+                return
+            trailing = bytes(self._v1_input[delimiter + 1 :])
+            self._v1_input.clear()
+            self._v2_decoder.reset()
+            self._protocol_mode = "v2"
+            if self._v2_boot_id is not None and self._v2_journal is not None:
+                contiguous = self._v2_journal.contiguous(self._v2_boot_id)
+                if contiguous:
+                    self._queue_line(
+                        f"ACK_EVENTS,{self._v2_boot_id},{contiguous}",
+                        priority=_WRITE_PRIORITY_ACK,
+                        wait=False,
+                    )
+                self._v2_last_resend_requested.pop(self._v2_boot_id, None)
+                self._request_v2_replay(
+                    self._v2_boot_id,
+                    contiguous + 1,
+                )
+            if trailing:
+                self._ingest_v2_bytes(trailing)
+            return
+        if len(self._v1_input) > self._max_line_bytes:
+            raise ValueError("protocol-v2 reconnect resynchronization exceeded its bound")
+
+    def _reconnect_v2(self, cause: BaseException) -> bool:
+        """Reconnect without a second reader and recover from the durable watermark."""
+
+        if serial is None:
+            return False
+        self.emit(f"[{timestamp()}] [SER] USB disconnected in v2: {cause}; reconnecting")
+        try:
+            if self.ser is not None and getattr(self.ser, "is_open", False):
+                self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+        while not self._stop.wait(0.25):
+            try:
+                replacement = serial.Serial(
+                    self.port,
+                    self.baud,
+                    timeout=0.05,
+                    write_timeout=1.0,
+                )
+            except Exception:
+                continue
+            self.ser = replacement
+            self._protocol_mode = "v2_resync"
+            self._v1_input.clear()
+            self._v2_decoder.discard_through_delimiter()
+            self._queue_line("PROTO,2", priority=_WRITE_PRIORITY_COMMAND, wait=False)
+            self.emit(f"[{timestamp()}] [SER] USB reopened; resynchronizing protocol v2")
+            return True
+        return False
+
+    def _ingest_v2_bytes(self, chunk: bytes) -> None:
+        frames, errors = self._v2_decoder.feed(chunk)
+        for error in errors:
+            self._v2_counts["crc_or_framing_errors"] += 1
+            self.emit(f"[{timestamp()}] [SER] WARN: protocol-v2 frame rejected: {error}")
+            if self._v2_boot_id is not None:
+                journal = self._v2_journal
+                start = journal.contiguous(self._v2_boot_id) + 1 if journal else 1
+                self._request_v2_replay(self._v2_boot_id, start)
+        for frame in frames:
+            if (
+                self.failure_plan is not None
+                and self.failure_plan.kind == "read_error"
+                and self._read_count >= self.failure_plan.after_frames
+            ):
+                raise OSError("qualification-injected serial reader failure")
+            self._read_count += 1
+            self._v2_counts["frames_received"] += 1
+            if frame.flags & protocol_v2.FLAG_RETRANSMISSION:
+                self._v2_counts["retransmissions_received"] += 1
+            item = (frame, time.time_ns(), time.monotonic_ns())
+            try:
+                self._v2_queue.put_nowait(item)
+            except queue.Full as exc:
+                raise RuntimeError(
+                    f"protocol-v2 persistence queue reached {MAX_BUFFERED_V2_RECORDS} records"
+                ) from exc
+
+    def _handle_semantic_line(
+        self, line: str, *, received_ns: int, count_read: bool = True
+    ) -> None:
+        if count_read and (
+            self.failure_plan is not None
+            and self.failure_plan.kind == "read_error"
+            and self._read_count >= self.failure_plan.after_frames
+        ):
+            raise OSError("qualification-injected serial reader failure")
+        if count_read:
+            self._read_count += 1
+        if self._protocol_v2_pending and line == "ACK_PROTO,2":
+            self._protocol_mode = "v2"
+            self._protocol_v2_pending = False
+            self._protocol_v2_seen.set()
+        elif self._protocol_v2_pending and line.startswith("NACK,PROTO,"):
+            self._protocol_v2_error = line
+            self._protocol_v2_pending = False
+            self._protocol_v2_seen.set()
+        if self._emit_serial_logs or _is_feeder_jam_protocol_line(line):
+            self.emit(f"[{timestamp()}] 【SER】 {line}")
+        if line == "CAMERA_HIGH" or line.startswith("CAMERA_HIGH,"):
+            with self._ttl_lock:
+                self._ttl_seen.set()
+        self._write_csv_line(line)
+        if self._stop.is_set():
+            return
+        try:
+            session = self._watchdog_session
+            consumed = session.ingest(line) if session is not None else False
+            capabilities = None if consumed else parse_controller_capabilities(line)
+        except ValueError as exc:
+            self.emit(
+                f"[{timestamp()}] [SER] WARN: ignored malformed controller "
+                f"capability advertisement: {exc}"
+            )
+        else:
+            if capabilities is not None:
+                with self._capabilities_lock:
+                    self._controller_capabilities = capabilities
+        if line == "ACK_STOP" or line.startswith("ACK_STOP,"):
+            fields = line.split(",")
+            try:
+                self._stop_ack_count = int(float(fields[4]))
+            except (IndexError, TypeError, ValueError):
+                self._stop_ack_count = None
+            self._stop_ack_seen.set()
+        self._ingest_clear_jam_response(line)
+        self._ingest_clock_response(line, received_ns)
+        self._maybe_send_alert(line)
+
+    def _v2_persistence_pump(self) -> None:
+        while not self._v2_worker_stop.is_set() or not self._v2_queue.empty():
+            try:
+                item = self._v2_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                self._v2_queue.task_done()
+                break
+            frame, host_unix_ns, host_monotonic_ns = item
+            try:
+                self._persist_v2_frame(frame, host_unix_ns, host_monotonic_ns)
+            except Exception as exc:
+                self._report_fatal(f"protocol-v2 durable persistence failed: {exc}")
+            finally:
+                self._v2_queue.task_done()
+
+    def _persist_v2_frame(
+        self,
+        frame: protocol_v2.Frame,
+        host_unix_ns: int,
+        host_monotonic_ns: int,
+    ) -> None:
+        journal = self._v2_journal
+        if journal is None:
+            raise RuntimeError("protocol-v2 journal is unavailable")
+        result, contiguous = journal.store(
+            frame,
+            host_unix_ns=host_unix_ns,
+            host_monotonic_ns=host_monotonic_ns,
+        )
+        if result == protocol_v2.StoreResult.CONFLICT:
+            self._v2_counts["conflicting_duplicates"] += 1
+            raise RuntimeError(
+                "conflicting duplicate controller record for "
+                f"boot={frame.boot_id} sequence={frame.sequence}"
+            )
+        if result == protocol_v2.StoreResult.DUPLICATE:
+            self._v2_counts["duplicates"] += 1
+        else:
+            self._v2_counts["frames_stored"] += 1
+
+        previous_boot = self._v2_boot_id
+        if previous_boot is None:
+            self._v2_boot_id = frame.boot_id
+        elif previous_boot != frame.boot_id:
+            self._v2_counts["boot_boundaries"] += 1
+            self._v2_boot_id = frame.boot_id
+            self._write_v2_summary()
+            self._report_watchdog_fatal(
+                "controller reboot boundary detected during protocol v2; "
+                f"boot ID changed from {previous_boot} to {frame.boot_id}, so "
+                "unacknowledged controller RAM records may have been lost"
+            )
+
+        if frame.session_id:
+            self._v2_session_id = frame.session_id
+        if result == protocol_v2.StoreResult.NEW:
+            self._publish_v2_frame(frame, host_unix_ns)
+
+        if frame.integrity_latched or frame.message_type == protocol_v2.MessageType.INTEGRITY_FAULT:
+            self._v2_integrity_latched = True
+            self._write_v2_summary()
+            self._report_watchdog_fatal(
+                "controller protocol-v2 scientific integrity fault: " + frame.text
+            )
+
+        if frame.reliable and contiguous and not self._v2_ack_withheld:
+            last_ack = self._v2_last_ack_queued.get(frame.boot_id, 0)
+            if contiguous > last_ack:
+                self._v2_last_ack_queued[frame.boot_id] = contiguous
+                self._queue_line(
+                    f"ACK_EVENTS,{frame.boot_id},{contiguous}",
+                    priority=_WRITE_PRIORITY_ACK,
+                    wait=False,
+                )
+        if frame.reliable and frame.sequence > contiguous + 1:
+            self._request_v2_replay(frame.boot_id, contiguous + 1)
+        self._write_v2_summary()
+
+    def _publish_v2_frame(self, frame: protocol_v2.Frame, received_ns: int) -> None:
+        text = frame.text
+        message_type = frame.message_type
+        with self._v2_observed:
+            self._v2_message_counts[message_type] = (
+                self._v2_message_counts.get(message_type, 0) + 1
+            )
+            self._v2_payloads.append(
+                (message_type, text, frame.sequence, frame.flags)
+            )
+            if len(self._v2_payloads) > 4096:
+                del self._v2_payloads[: len(self._v2_payloads) - 4096]
+            self._v2_observed.notify_all()
+        if message_type in {
+            protocol_v2.MessageType.EVENT,
+            protocol_v2.MessageType.COMMAND_RESULT,
+            protocol_v2.MessageType.DIAGNOSTIC,
+            protocol_v2.MessageType.INTEGRITY_FAULT,
+        }:
+            self._handle_semantic_line(
+                text, received_ns=received_ns, count_read=False
+            )
+            if message_type == protocol_v2.MessageType.COMMAND_RESULT:
+                if text.startswith("ACK_RESEND_EVENTS,"):
+                    self.emit(f"[{timestamp()}] [SER] protocol-v2 replay accepted")
+                elif text.startswith("NACK,RESEND_EVENTS,TOO_OLD,"):
+                    self._report_watchdog_fatal(
+                        "controller cannot replay the requested durable gap: " + text
+                    )
+                elif text == "NACK,RESEND_EVENTS,NOT_EMITTED":
+                    self.emit(
+                        f"[{timestamp()}] [SER] protocol-v2 replay not needed; "
+                        "host durable watermark is current"
+                    )
+                elif text == "NACK,RESEND_EVENTS,WRONG_BOOT":
+                    self._report_watchdog_fatal(
+                        "controller rejected protocol-v2 recovery: " + text
+                    )
+            return
+        if message_type in {
+            protocol_v2.MessageType.CAMERA_EPOCH,
+            protocol_v2.MessageType.CAMERA_CHECKPOINT,
+            protocol_v2.MessageType.CAMERA_STOP,
+        }:
+            camera = protocol_v2.parse_camera_payload(text)
+            self._write_csv_line(text)
+            if self._emit_serial_logs:
+                self.emit(f"[{timestamp()}] 【SER】 {text}")
+            if message_type == protocol_v2.MessageType.CAMERA_EPOCH:
+                with self._ttl_lock:
+                    self._ttl_seen.set()
+            if message_type == protocol_v2.MessageType.CAMERA_STOP:
+                self._stop_ack_count = int(camera["count"])
+            return
+        if message_type == protocol_v2.MessageType.TRANSPORT_STATUS:
+            self._v2_last_status = protocol_v2.parse_transport_status(text)
+            self._write_csv_line(text)
+            if self._emit_serial_logs:
+                self.emit(f"[{timestamp()}] 【SER】 {text}")
+            return
+        self.emit(
+            f"[{timestamp()}] [SER] protocol-v2 unknown message type "
+            f"{message_type} stored without interpretation"
+        )
+
+    def _request_v2_replay(self, boot_id: int, sequence: int) -> None:
+        if sequence <= 0:
+            sequence = 1
+        if self._v2_last_resend_requested.get(boot_id) == sequence:
+            return
+        self._v2_last_resend_requested[boot_id] = sequence
+        self._queue_line(
+            f"RESEND_EVENTS,{boot_id},{sequence}",
+            priority=_WRITE_PRIORITY_REPLAY,
+            wait=False,
+        )
+
+    def _write_v2_summary(self) -> None:
+        path = self._v2_summary_path
+        if path is None:
+            return
+        payload = {
+            "schema_version": 1,
+            "protocol": "mousehouse_v2",
+            "boot_id": self._v2_boot_id,
+            "session_id": self._v2_session_id,
+            "journal_start_sequence": (
+                self._v2_journal.start_sequence(self._v2_boot_id)
+                if self._v2_journal is not None and self._v2_boot_id is not None
+                else None
+            ),
+            "integrity_latched": self._v2_integrity_latched,
+            "counts": dict(self._v2_counts),
+            "last_transport_status": self._v2_last_status,
+            "updated_unix_ns": time.time_ns(),
+        }
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        temp_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(temp_path, path)
+
+    def _next_write_order(self) -> int:
+        with self._write_order_lock:
+            self._write_order += 1
+            return self._write_order
+
+    def _queue_line(
+        self,
+        text: str,
+        *,
+        priority: int,
+        wait: bool,
+        marker_before: str | None = None,
+    ) -> None:
+        command = text.strip()
+        request = _WriteRequest(
+            (command + "\n").encode("utf-8"),
+            wait=wait,
+            marker_before=marker_before,
+            starts_trigger=command.upper().startswith(("START", "ARM,")),
+        )
+        if self._writer_thread is None or not self._writer_thread.is_alive():
+            ser = self.ser
+            if ser is None or not getattr(ser, "is_open", False):
+                raise RuntimeError("serial port is not open")
+            if (
+                self.failure_plan is not None
+                and self.failure_plan.kind == "write_error"
+                and self._write_count >= self.failure_plan.after_frames
+            ):
+                raise OSError("qualification-injected serial command write failure")
+            if request.starts_trigger:
+                self._ttl_seen.clear()
+            if marker_before is not None:
+                self.log_marker(marker_before)
+            self.emit(f"[{timestamp()}] 【SER→】 {command}")
+            written = ser.write(request.payload)
+            if isinstance(written, int) and written != len(request.payload):
+                raise OSError(f"short serial command write {written}/{len(request.payload)}")
+            flush = getattr(ser, "flush", None)
+            if callable(flush):
+                flush()
+            self._write_count += 1
+            return
+        self._write_queue.put((priority, self._next_write_order(), request))
+        if not wait:
+            return
+        if request.done is None or not request.done.wait(timeout=3.0):
+            raise TimeoutError(f"serial writer did not send {command!r} within 3 seconds")
+        if request.error is not None:
+            raise RuntimeError(f"serial write failed for {command!r}: {request.error}")
+
+    def _writer_pump(self) -> None:
+        while not self._writer_stop.is_set() or not self._write_queue.empty():
+            try:
+                _priority, _order, request = self._write_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if request is None:
+                self._write_queue.task_done()
+                break
+            try:
+                ser = self.ser
+                if ser is None or not getattr(ser, "is_open", False):
+                    raise ConnectionError("serial port is not open")
+                command = request.payload.rstrip(b"\n").decode("utf-8", errors="replace")
+                if (
+                    self.failure_plan is not None
+                    and self.failure_plan.kind == "write_error"
+                    and self._write_count >= self.failure_plan.after_frames
+                ):
+                    raise OSError("qualification-injected serial command write failure")
+                with self._write_lock:
+                    with self._ttl_lock:
+                        if request.starts_trigger:
+                            self._ttl_seen.clear()
+                        if request.marker_before is not None:
+                            self.log_marker(request.marker_before)
+                        self.emit(f"[{timestamp()}] 【SER→】 {command}")
+                        written = ser.write(request.payload)
+                        if isinstance(written, int) and written != len(request.payload):
+                            raise OSError(
+                                f"short serial command write {written}/{len(request.payload)}"
+                            )
+                        flush = getattr(ser, "flush", None)
+                        if callable(flush):
+                            flush()
+                        self._write_count += 1
+            except BaseException as exc:
+                request.error = exc
+                if request.done is None and not self._stop.is_set():
+                    if self._protocol_mode in {"v2", "v2_resync"}:
+                        self.emit(
+                            f"[{timestamp()}] [SER] WARN: deferred v2 control "
+                            f"write failed during connection recovery: {exc}"
+                        )
+                    else:
+                        self._report_fatal(f"asynchronous serial write failed: {exc}")
+            finally:
+                if request.done is not None:
+                    request.done.set()
+                self._write_queue.task_done()
 
     def _write_csv_line(self, line: str) -> None:
         self._write_csv_fields(line.split(","), line)
@@ -486,36 +1032,20 @@ class SerialHandle:
             raise RuntimeError(message)
         try:
             command = text.strip().upper()
-            if (
-                self.failure_plan is not None
-                and self.failure_plan.kind == "write_error"
-                and self._write_count >= self.failure_plan.after_frames
-            ):
-                raise OSError("qualification-injected serial command write failure")
             if command == "STOP":
-                # Clear immediately before writing so a fast controller reply
-                # cannot race ahead of wait_for_stop_ack().
                 self._stop_ack_seen.clear()
                 self._stop_ack_count = None
-            with self._write_lock:
-                starts_trigger = command.startswith("START") or command.startswith(
-                    "ARM,"
-                )
-                # Serialize the clear/write boundary with CAMERA_HIGH ingest.
-                # A delayed pre-command edge therefore cannot race between the
-                # clear and the command write and falsely satisfy readiness.
-                with self._ttl_lock:
-                    if starts_trigger:
-                        self._ttl_seen.clear()
-                    if marker_before is not None:
-                        # The marker and controller write share the same edge-ingest
-                        # lock. A fast controller response therefore cannot be
-                        # persisted ahead of the marker that defines its epoch.
-                        self.log_marker(marker_before)
-                    self.emit(f"[{timestamp()}] 【SER→】 {text}")
-                    self.ser.write((text + "\n").encode())
-                    self.ser.flush()
-                    self._write_count += 1
+            priority = (
+                _WRITE_PRIORITY_SAFETY
+                if command == "STOP" or command == "CLEAR_JAM"
+                else _WRITE_PRIORITY_COMMAND
+            )
+            self._queue_line(
+                text,
+                priority=priority,
+                wait=True,
+                marker_before=marker_before,
+            )
         except Exception as exc:
             self.emit(f"[{timestamp()}] [SER] write error: {exc}")
             raise RuntimeError(f"serial write failed for {text!r}: {exc}") from exc
@@ -529,6 +1059,99 @@ class SerialHandle:
         if type(fps) is not int or fps <= 0:
             raise ValueError("controller FPS must be a positive integer")
         self._send_line(f"START,{fps}", marker_before="START_SENT")
+
+    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None:
+        """Enter or rejoin v2, including when the controller is already active."""
+
+        if self._protocol_mode == "v2":
+            return
+        if self._protocol_v2_pending:
+            raise RuntimeError("protocol-v2 negotiation is already pending")
+        if self._v2_journal is None:
+            raise RuntimeError("protocol-v2 requires an established run directory")
+        self._protocol_v2_error = None
+        self._protocol_v2_seen.clear()
+        self._protocol_v2_pending = True
+        self._protocol_mode = "v2_resync"
+        self._v1_input.clear()
+        self._v2_decoder.discard_through_delimiter()
+        try:
+            self._send_line("PROTO,2")
+            if not self._protocol_v2_seen.wait(timeout=float(timeout_s)):
+                raise TimeoutError(
+                    f"controller did not acknowledge PROTO,2 within {timeout_s:g}s"
+                )
+            if self._protocol_v2_error:
+                raise RuntimeError(self._protocol_v2_error)
+            if self._protocol_mode != "v2":
+                raise RuntimeError("controller negotiation completed without entering v2")
+        finally:
+            if self._protocol_mode != "v2":
+                self._protocol_v2_pending = False
+                self._protocol_mode = "v1"
+                self._v1_input.clear()
+                self._v2_decoder.reset()
+
+    @property
+    def protocol_v2_snapshot(self) -> dict[str, object]:
+        return {
+            "active": self._protocol_mode == "v2",
+            "boot_id": self._v2_boot_id,
+            "session_id": self._v2_session_id,
+            "integrity_latched": self._v2_integrity_latched,
+            "counts": dict(self._v2_counts),
+            "last_transport_status": (
+                dict(self._v2_last_status) if self._v2_last_status else None
+            ),
+        }
+
+    def set_protocol_v2_ack_withheld(self, withheld: bool) -> None:
+        self._v2_ack_withheld = bool(withheld)
+        if not withheld and self._v2_boot_id is not None and self._v2_journal is not None:
+            contiguous = self._v2_journal.contiguous(self._v2_boot_id)
+            if contiguous > self._v2_last_ack_queued.get(self._v2_boot_id, 0):
+                self._v2_last_ack_queued[self._v2_boot_id] = contiguous
+                self._queue_line(
+                    f"ACK_EVENTS,{self._v2_boot_id},{contiguous}",
+                    priority=_WRITE_PRIORITY_ACK,
+                    wait=False,
+                )
+
+    def request_protocol_v2_status(self) -> None:
+        if self._protocol_mode != "v2":
+            raise RuntimeError("controller protocol v2 is not active")
+        self._queue_line(
+            "TRANSPORT_STATUS", priority=_WRITE_PRIORITY_REPLAY, wait=True
+        )
+
+    def request_protocol_v2_replay(self, from_sequence: int) -> None:
+        if self._protocol_mode != "v2" or self._v2_boot_id is None:
+            raise RuntimeError("controller protocol-v2 boot identity is unavailable")
+        self._v2_last_resend_requested.pop(self._v2_boot_id, None)
+        self._request_v2_replay(self._v2_boot_id, int(from_sequence))
+
+    def wait_for_protocol_v2_message(
+        self, message_type: int, *, after_count: int = 0, timeout_s: float = 3.0
+    ) -> bool:
+        deadline = time.monotonic() + float(timeout_s)
+        with self._v2_observed:
+            while self._v2_message_counts.get(int(message_type), 0) <= after_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._v2_observed.wait(timeout=remaining)
+            return True
+
+    def protocol_v2_observations(
+        self,
+    ) -> tuple[dict[int, int], list[tuple[int, str, int, int]]]:
+        with self._v2_observed:
+            return dict(self._v2_message_counts), list(self._v2_payloads)
+
+    def protocol_v2_contiguous_sequence(self) -> int:
+        if self._v2_boot_id is None or self._v2_journal is None:
+            return 0
+        return self._v2_journal.contiguous(self._v2_boot_id)
 
     def _ingest_clear_jam_response(self, line: str) -> bool:
         """Publish one exact CLEAR_JAM reply from the existing reader."""
@@ -691,6 +1314,25 @@ class SerialHandle:
         )
         return hit
 
+    def wait_for_camera_stop(self, timeout_s: float = 3.0) -> bool:
+        """Wait until a durable protocol-v2 CAMERA_STOP record is published."""
+
+        if self._protocol_mode != "v2":
+            return False
+        self.emit(
+            f"[{timestamp()}] [SER] Waiting for CAMERA_STOP "
+            f"(timeout {timeout_s:.1f}s) …"
+        )
+        hit = self.wait_for_protocol_v2_message(
+            protocol_v2.MessageType.CAMERA_STOP,
+            timeout_s=timeout_s,
+        )
+        self.emit(
+            f"[{timestamp()}] [SER] "
+            f"{'CAMERA_STOP received.' if hit else 'CAMERA_STOP not received within timeout.'}"
+        )
+        return hit
+
     def negotiate_watchdog_v1(
         self, *, requested_lease_ms: int, timeout_s: float = 2.0
     ) -> ControllerCapabilities:
@@ -829,9 +1471,9 @@ class SerialHandle:
             self._watchdog_session.stop_worker()
         self._stop.set()
         failure: str | None = None
-        # Close the port before joining so a driver read that ignores the
-        # configured timeout is actively unblocked.  The ledger remains open
-        # until the reader has had a chance to finish its final callback.
+        # Closing first actively unblocks a driver read. Any v2 record already
+        # admitted to the host queue is still journaled below; shutdown ACKs
+        # are unnecessary because reconnect replay is sequence-based.
         try:
             if self.ser and getattr(self.ser, "is_open", False):
                 self.ser.close()
@@ -845,6 +1487,30 @@ class SerialHandle:
             except Exception as exc:
                 if failure is None:
                     failure = f"serial reader join failed: {exc}"
+        try:
+            self._v2_queue.join()
+        except Exception as exc:
+            failure = failure or f"protocol-v2 persistence drain failed: {exc}"
+        self._v2_worker_stop.set()
+        if self._v2_worker and self._v2_worker.is_alive():
+            self._v2_worker.join(timeout=2.0)
+            if self._v2_worker.is_alive() and failure is None:
+                failure = "protocol-v2 persistence worker did not stop"
+        try:
+            self._write_queue.join()
+        except Exception as exc:
+            failure = failure or f"serial writer drain failed: {exc}"
+        self._writer_stop.set()
+        if self._writer_thread and self._writer_thread.is_alive():
+            self._writer_thread.join(timeout=2.0)
+            if self._writer_thread.is_alive() and failure is None:
+                failure = "serial writer did not stop"
+        try:
+            self._write_v2_summary()
+            if self._v2_journal is not None:
+                self._v2_journal.close()
+        except Exception as exc:
+            failure = failure or f"protocol-v2 journal close failed: {exc}"
         with self._csv_lock:
             if self._csv_file:
                 try:
@@ -867,6 +1533,7 @@ class SerialHandle:
                 f"[{timestamp()}] [SER] Run dir unknown at stop. Temp CSV kept here:\n{tmp_path}"
             )
         self.ser = None
+        self._v2_journal = None
         self._closed = True
         self._unregister_atexit()
 

@@ -565,6 +565,7 @@ class OperatorBackend:
         alignment_required = bool(
             getattr(self.launch_cfg, "serial_enabled", False)
             and getattr(self.launch_cfg, "trigger_on", False)
+            and getattr(self.launch_cfg, "controller_protocol", "v2") != "v2"
         )
         return finalizer.run_capture_finalizer(
             run_dir,
@@ -608,11 +609,13 @@ class OperatorBackend:
                         trigger_on=bool(getattr(self.launch_cfg, "trigger_on", False)),
                         phase=self._state_machine.phase,
                         controller_protocol=getattr(
-                            self.launch_cfg, "controller_protocol", "legacy"
+                            self.launch_cfg, "controller_protocol", "v2"
                         ),
                         alignment_required=bool(
                             getattr(self.launch_cfg, "serial_enabled", False)
                             and getattr(self.launch_cfg, "trigger_on", False)
+                            and getattr(self.launch_cfg, "controller_protocol", "v2")
+                            != "v2"
                         ),
                         failure_plan=self._failure_plan,
                     ),
@@ -803,6 +806,8 @@ class OperatorBackend:
             )
             if cfg.controller_protocol == "watchdog_v1_experimental":
                 disqualifiers = (*disqualifiers, "controller_watchdog_unqualified")
+            if cfg.serial_enabled and cfg.controller_protocol != "v2":
+                disqualifiers = (*disqualifiers, "controller_protocol_not_v2")
             run_context.write_status(
                 prepared.run_dir,
                 "created",

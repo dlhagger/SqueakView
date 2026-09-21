@@ -46,6 +46,9 @@ class _Serial:
         self.events.append(f"serial-negotiate:{requested_lease_ms}:{timeout_s}")
         return object()
 
+    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None:
+        self.events.append(f"serial-negotiate-v2:{timeout_s}")
+
     def exchange_time_sync(
         self, sequence: int, jetson_send_ns: int, *, timeout_s: float
     ) -> tuple[str, int]:
@@ -195,6 +198,55 @@ class StartupServiceTests(unittest.TestCase):
             self.events.index("capture-spawn"),
         )
         self.assertIn("serial-marker:WATCHDOG_V1_NEGOTIATED", self.events)
+
+    def test_v2_negotiates_before_clock_and_capture_spawn(self) -> None:
+        result = startup.start_run(
+            startup.StartupRequest(
+                RunRequest(
+                    task_cfg=self.task,
+                    inference_enabled=False,
+                    serial_enabled=True,
+                    trigger_on=True,
+                    controller_protocol="v2",
+                ),
+                False,
+            ),
+            self.hooks(),
+        )
+
+        self.assertTrue(result.started)
+        self.assertLess(
+            self.events.index("serial-negotiate-v2:3.0"),
+            self.events.index("clock-validate"),
+        )
+        self.assertLess(
+            self.events.index("serial-negotiate-v2:3.0"),
+            self.events.index("capture-spawn"),
+        )
+        self.assertIn("serial-marker:PROTOCOL_V2_NEGOTIATED", self.events)
+
+    def test_v2_negotiation_failure_blocks_clock_and_capture(self) -> None:
+        self.serial.negotiate_protocol_v2 = lambda **_kwargs: (  # type: ignore[method-assign]
+            (_ for _ in ()).throw(RuntimeError("unsupported controller"))
+        )
+
+        result = startup.start_run(
+            startup.StartupRequest(
+                RunRequest(
+                    task_cfg=self.task,
+                    inference_enabled=False,
+                    serial_enabled=True,
+                    trigger_on=True,
+                ),
+                False,
+            ),
+            self.hooks(),
+        )
+
+        self.assertFalse(result.started)
+        self.assertIn("protocol-v2 negotiation failed", result.error or "")
+        self.assertNotIn("clock-validate", self.events)
+        self.assertNotIn("capture-spawn", self.events)
 
     def test_clock_preflight_failure_blocks_capture_and_controller_start(self) -> None:
         hooks = replace(
