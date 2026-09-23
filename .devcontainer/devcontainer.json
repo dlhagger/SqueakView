@@ -1,0 +1,42 @@
+{
+  "name": "SqueakView DeepStream 9.1",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "workspaceFolder": "/workspace/SqueakView",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/SqueakView,type=bind",
+  "remoteUser": "triton-server",
+  "updateRemoteUserUID": false,
+  "runArgs": [
+    "--gpus=all",
+    "--network=host",
+    "--privileged"
+  ],
+  "containerEnv": {
+    "NVIDIA_DRIVER_CAPABILITIES": "all",
+    "CUDA_CACHE_DISABLE": "0",
+    "UV_LINK_MODE": "copy",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "DISPLAY": "${localEnv:DISPLAY}",
+    "QT_QPA_PLATFORM": "xcb",
+    "PULSE_SERVER": "${localEnv:PULSE_SERVER}",
+    "SQUEAKVIEW_DEEPSTREAM_SDK": "/opt/nvidia/deepstream/deepstream"
+  },
+  "mounts": [
+    "source=/usr/lib/wsl/lib/libnvcuvid.so.1,target=/usr/lib/x86_64-linux-gnu/libnvcuvid.so.1,type=bind,readonly",
+    "source=/usr/lib/wsl/lib/libnvidia-encode.so.1,target=/usr/lib/x86_64-linux-gnu/libnvidia-encode.so.1,type=bind,readonly",
+    "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind",
+    "source=/mnt/wslg,target=/mnt/wslg,type=bind"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "openai.chatgpt"
+      ]
+    }
+  }
+}

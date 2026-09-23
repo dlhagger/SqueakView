@@ -1,48 +1,21 @@
 [project]
-name = "squeakview"
-version = "1.0.0"
+name = "SqueakView_WSL"
+version = "0.1.0"
 description = "Direct FLIR Spinnaker/GStreamer source into NVIDIA DeepStream for SqueakView."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "pyserial>=3.5",
-    "PySide6>=6.8.0.2",
-    "numpy>=2.2.6",
-    "pyqtgraph>=0.14.0",
-    "pandas>=2.3.3",
-    "ipykernel>=7.2.0",
-    "jupyter>=1.1.1",
-    "seaborn>=0.13.2",
-    "scipy>=1.15.3",
-    "ultralytics>=8.4.142",
-    "torch>=2.12.0",
-    "torchvision>=0.27.0",
-    "onnxslim>=0.1.94",
-    "PyYAML>=6.0.2",
-    "coloredlogs>=15.0.1",
-    "flatbuffers>=25.12.19",
-    "packaging>=26.2",
-    "protobuf>=7.35.1",
-    "sympy>=1.14.0",
-    "onnxruntime-gpu>=1.27.0.dev20260511001",
+    "ipykernel>=7.3.0",
     "onnx>=1.22.0",
+    "onnxruntime-gpu>=1.30.0",
+    "pyqtgraph>=0.14.0",
+    "pyside6>=6.11.2",
+    "pyyaml>=6.0.3",
+    "tensorrt-cu13==10.16.0.72",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "ultralytics>=8.4.152",
 ]
 
 [tool.uv]
-required-environments = [
-    "sys_platform == 'linux' and platform_machine == 'aarch64'",
-]
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu132" }
-torchvision = { index = "pytorch-cu132" }
-onnxruntime-gpu = { index = "ort" }
-
-[[tool.uv.index]]
-name = "ort"
-url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/"
-
-[[tool.uv.index]]
-name = "pytorch-cu132"
-url = "https://download.pytorch.org/whl/cu132"
-explicit = true
+torch-backend = "auto"

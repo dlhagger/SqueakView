@@ -41,3 +41,9 @@ client_secret_*.json
 
 # OS cruft
 .DS_Store
+
+# CMake build output
+/build/
+
+# Proprietary vendor SDK installers
+/vendor/

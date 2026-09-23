@@ -1,0 +1,4 @@
+{
+  "cmake.sourceDirectory": "${workspaceFolder}/native/flir_gst_source",
+  "cmake.buildDirectory": "${workspaceFolder}/build"
+}
