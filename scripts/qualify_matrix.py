@@ -29,6 +29,7 @@ from squeakview.common.diagnostics.qualification import (  # noqa: E402
     TERMINAL_SUCCESS_STATES,
 )
 from squeakview.common.run_context import atomic_write_text  # noqa: E402
+from squeakview.project import AppPaths, open_project  # noqa: E402
 
 
 MAX_RUN_METADATA_BYTES = 4 << 20
@@ -39,6 +40,7 @@ def _next_case_worksheet(
     assignments: dict[str, str | None],
     *,
     matrix_path: Path,
+    project_root: Path | None = None,
 ) -> dict:
     """Return the next unassigned case without modifying the checklist."""
 
@@ -88,6 +90,7 @@ def _next_case_worksheet(
                 *(f"{name}={value}" for name, value in environment.items()),
                 "bash",
                 "squeakview.sh",
+                *([str(project_root)] if project_root is not None else []),
             ]
         )
     return worksheet
@@ -203,9 +206,15 @@ def main() -> int:
         type=Path,
         help="YAML mapping/checklist of case IDs to run directories",
     )
-    parser.add_argument("--matrix", type=Path, default=ROOT / "qualification/matrix.v1.yaml")
-    parser.add_argument("--limits", type=Path, default=ROOT / "qualification/limits.v1.yaml")
-    parser.add_argument("--output", type=Path, default=ROOT / "qualification/matrix_report.json")
+    parser.add_argument(
+        "--project",
+        type=Path,
+        default=(Path(os.environ["SQUEAKVIEW_PROJECT"]) if os.environ.get("SQUEAKVIEW_PROJECT") else None),
+        help="required SqueakView project owning qualification state and runs",
+    )
+    parser.add_argument("--matrix", type=Path)
+    parser.add_argument("--limits", type=Path)
+    parser.add_argument("--output", type=Path)
     action = parser.add_mutually_exclusive_group()
     action.add_argument(
         "--list-cases", action="store_true", help="print canonical matrix cases and exit"
@@ -232,6 +241,25 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
+        if args.project is None:
+            raise ValueError("--project or SQUEAKVIEW_PROJECT is required")
+        project = open_project(args.project)
+        AppPaths.discover().validate_for_project(project.paths)
+        qualification_root = project.paths.qualification
+        args.matrix = project.paths.resolve_path(
+            args.matrix or (qualification_root / "matrix.v1.yaml"),
+            within=qualification_root,
+            must_exist=True,
+        )
+        args.limits = project.paths.resolve_path(
+            args.limits or (qualification_root / "limits.v1.yaml"),
+            within=qualification_root,
+            must_exist=True,
+        )
+        args.output = project.paths.resolve_path(
+            args.output or (qualification_root / "matrix_report.json"),
+            within=qualification_root,
+        )
         if args.list_cases:
             matrix = load_matrix(args.matrix)
             cases = expand_cases(matrix)
@@ -239,35 +267,60 @@ def main() -> int:
             return 0
         if args.init_assignments is not None:
             matrix = load_matrix(args.matrix)
-            _write_new_assignment_checklist(args.init_assignments, matrix)
-            print(json.dumps({"result": "created", "assignments": str(args.init_assignments), "case_count": len(expand_cases(matrix))}, indent=2))
+            assignments_path = project.paths.resolve_path(
+                args.init_assignments,
+                within=qualification_root,
+            )
+            _write_new_assignment_checklist(assignments_path, matrix)
+            print(json.dumps({"result": "created", "assignments": str(assignments_path), "case_count": len(expand_cases(matrix))}, indent=2))
             return 0
         if args.next_case:
             if args.assignments is None:
                 raise ValueError("the assignments path is required with --next-case")
+            assignments_path = project.paths.resolve_path(
+                args.assignments,
+                within=qualification_root,
+                must_exist=True,
+            )
             matrix = load_matrix(args.matrix)
-            assignments = load_assignments(args.assignments)
+            assignments = load_assignments(assignments_path)
             worksheet = _next_case_worksheet(
                 matrix,
                 assignments,
                 matrix_path=args.matrix,
+                project_root=project.paths.root,
             )
             print(json.dumps(worksheet, indent=2, sort_keys=True))
             return 0
         if args.assign is not None:
             if args.assignments is None:
                 raise ValueError("the assignments path is required with --assign")
+            assignments_path = project.paths.resolve_path(
+                args.assignments,
+                within=qualification_root,
+                must_exist=True,
+            )
+            assigned_run = project.paths.resolve_path(
+                Path(args.assign[1]),
+                within=project.paths.runs,
+                must_exist=True,
+            )
             matrix = load_matrix(args.matrix)
             _record_assignment(
-                args.assignments, matrix, args.assign[0], Path(args.assign[1])
+                assignments_path, matrix, args.assign[0], assigned_run
             )
-            print(json.dumps({"result": "assigned", "case_id": args.assign[0], "run_directory": str(Path(args.assign[1]).resolve())}, indent=2))
+            print(json.dumps({"result": "assigned", "case_id": args.assign[0], "run_directory": str(assigned_run)}, indent=2))
             return 0
         if args.assignments is None:
             raise ValueError(
                 "assignments path is required (or use --list-cases/--init-assignments)"
             )
-        assignments = load_assignments(args.assignments)
+        assignments_path = project.paths.resolve_path(
+            args.assignments,
+            within=qualification_root,
+            must_exist=True,
+        )
+        assignments = load_assignments(assignments_path)
         report = qualify_matrix(
             args.matrix,
             assignments,

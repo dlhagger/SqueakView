@@ -28,12 +28,41 @@ from squeakview.apps.operator.backend.supervisor.server import (
     _json_value,
 )
 from squeakview.common.dashboard import DashboardEvent
+from squeakview.project import (
+    AppPaths,
+    Project,
+    ProjectMetadata,
+    ProjectPaths,
+    RuntimeContext,
+    UserPaths,
+)
+
+
+def _runtime_context(root: Path) -> RuntimeContext:
+    app_root = root / "app"
+    project_root = root / "project"
+    app_root.mkdir(exist_ok=True)
+    project_root.mkdir(exist_ok=True)
+    return RuntimeContext(
+        app=AppPaths.from_root(app_root),
+        project=Project(
+            paths=ProjectPaths.from_existing_root(project_root),
+            metadata=ProjectMetadata.create("Test"),
+        ),
+        user=UserPaths(
+            config=root / "user/config",
+            state=root / "user/state",
+            runtime=root / "user/runtime",
+            projects_parent=root / "projects",
+        ),
+    )
 
 
 class FakeBackend:
-    def __init__(self, emit, ingest, *, acquisition_owner) -> None:
+    def __init__(self, emit, ingest, *, runtime_context, acquisition_owner) -> None:
         self.emit = emit
         self.ingest = ingest
+        self.runtime_context = runtime_context
         self.acquisition_owner = acquisition_owner
         self.subscriber = None
         self.phase = RunPhase.IDLE
@@ -50,6 +79,7 @@ class FakeBackend:
         self.abort_calls: list[str] = []
         self.saved = 0
         self.saved_bottles = None
+        self.clear_jam_calls = 0
 
     def subscribe(self, callback) -> None:
         self.subscriber = callback
@@ -92,6 +122,11 @@ class FakeBackend:
 
     def abort_run(self, error: str) -> bool:
         self.abort_calls.append(error)
+        if self.phase == RunPhase.STOPPING and self.finalization_in_progress:
+            # The real backend serializes abort/finalize through its
+            # finalization lock. Model that ownership in this lightweight fake.
+            self.stop_release.wait()
+            return False
         if self.phase in {RunPhase.CREATED, RunPhase.STARTING, RunPhase.RECORDING}:
             self.phase = RunPhase.FAILED
             return True
@@ -102,12 +137,21 @@ class FakeBackend:
         self.saved_bottles = bottles
         return {"complete": bool(bottles), "run_dir": str(run_dir) if run_dir else None}
 
+    def clear_feeder_jam(self) -> str:
+        self.clear_jam_calls += 1
+        return "ACK_CLEAR_JAM"
+
 
 class SupervisorServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.socket_path = Path(self.temp_dir.name) / "operator.sock"
-        self.server = SupervisorServer(self.socket_path, backend_factory=FakeBackend)
+        self.runtime_context = _runtime_context(Path(self.temp_dir.name))
+        self.server = SupervisorServer(
+            self.socket_path,
+            runtime_context=self.runtime_context,
+            backend_factory=FakeBackend,
+        )
         self.backend: FakeBackend = self.server.backend
 
     def tearDown(self) -> None:
@@ -116,6 +160,8 @@ class SupervisorServerTests(unittest.TestCase):
         self.backend.stop_release.set()
         if self.server._loss_thread is not None:
             self.server._loss_thread.join(timeout=2)
+        if self.server._async_stop_thread is not None:
+            self.server._async_stop_thread.join(timeout=2)
         self.temp_dir.cleanup()
 
     def _worker(self) -> threading.Thread:
@@ -143,6 +189,15 @@ class SupervisorServerTests(unittest.TestCase):
         self.assertTrue(result["started"])
         self.assertEqual(result["config"]["fps"], 30)
         self.assertEqual(result["config"]["preview_socket_paths"], [])
+
+    def test_clear_jam_command_dispatches_to_owned_backend(self) -> None:
+        result, stop = self.server._dispatch(
+            CommandEnvelope("clear_feeder_jam", "jam-1", {})
+        )
+
+        self.assertFalse(stop)
+        self.assertEqual(result, {"response": "ACK_CLEAR_JAM"})
+        self.assertEqual(self.backend.clear_jam_calls, 1)
 
     def test_run_request_decoder_rejects_missing_and_wrong_scalar_types(self) -> None:
         missing = self._config()
@@ -172,7 +227,8 @@ class SupervisorServerTests(unittest.TestCase):
         self.assertEqual(self.backend.abort_calls, ["operator GUI lost"])
         self.assertNotEqual(self.backend.phase, RunPhase.RECORDING)
 
-    def test_gui_loss_waits_for_in_progress_finalization(self) -> None:
+    def test_gui_loss_after_stop_acceptance_preserves_finalization(self) -> None:
+        self.backend.phase = RunPhase.RECORDING
         self.backend.block_stop = True
         worker = self._worker()
         self.server._commands.put(CommandEnvelope("stop_run", "stop-1"))
@@ -180,14 +236,113 @@ class SupervisorServerTests(unittest.TestCase):
 
         self.server._signal_client_loss()
         time.sleep(0.02)
-        self.assertTrue(self.server._loss_thread.is_alive())
+        self.assertIsNone(self.server._loss_thread)
+        self.assertFalse(self.backend.cancelled.is_set())
         self.backend.stop_release.set()
-        self.server._loss_thread.join(2)
+        self.server._async_stop_thread.join(2)
         worker.join(2)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(self.backend.phase, RunPhase.FINALIZED)
+        self.assertEqual(self.backend.abort_calls, [])
+
+    def test_ipc_failure_after_stop_acceptance_is_a_warning_not_run_failure(self) -> None:
+        self.backend.phase = RunPhase.RECORDING
+        self.backend.block_stop = True
+        result, _ = self.server._dispatch(
+            CommandEnvelope("stop_run", "stop-before-ipc-loss")
+        )
+        self.assertTrue(result["accepted"])
+        self.assertTrue(self.backend.stop_entered.wait(1))
+
+        self.server._signal_client_loss(
+            "supervisor IPC send failed: TimeoutError: timed out"
+        )
+
+        self.assertIsNone(self.server.last_error)
+        self.assertIn("after Stop was accepted", self.server.last_warning or "")
+        self.assertFalse(self.backend.cancelled.is_set())
+        self.assertEqual(self.backend.abort_calls, [])
+        self.backend.stop_release.set()
+        self.server._async_stop_thread.join(2)
+        self.assertEqual(self.backend.phase, RunPhase.FINALIZED)
+
+    def test_ipc_failure_during_recording_remains_fail_closed_with_detail(self) -> None:
+        self.backend.phase = RunPhase.RECORDING
+
+        self.server._signal_client_loss(
+            "supervisor IPC send failed: BrokenPipeError: peer closed"
+        )
+        self.server._loss_thread.join(2)
+
+        self.assertIn("BrokenPipeError", self.server.last_error or "")
+        self.assertIsNone(self.server.last_warning)
+        self.assertTrue(self.backend.cancelled.is_set())
         self.assertEqual(self.backend.abort_calls, ["operator GUI lost"])
+        self.assertEqual(self.backend.phase, RunPhase.FAILED)
+
+    def test_stop_command_acknowledges_while_long_finalizer_is_still_running(self) -> None:
+        self.backend.phase = RunPhase.RECORDING
+        self.backend.block_stop = True
+
+        started = time.monotonic()
+        result, stop = self.server._dispatch(
+            CommandEnvelope("stop_run", "stop-async")
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertFalse(stop)
+        self.assertTrue(result["accepted"])
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(self.backend.stop_entered.wait(1))
+        self.assertTrue(self.server._async_stop_thread.is_alive())
+
+        duplicate, _ = self.server._dispatch(
+            CommandEnvelope("stop_run", "stop-async-duplicate")
+        )
+        self.assertFalse(duplicate["accepted"])
+
+        self.backend.stop_release.set()
+        self.server._async_stop_thread.join(2)
+        self.assertEqual(self.backend.phase, RunPhase.FINALIZED)
+
+    def test_blocked_finalizer_does_not_block_stop_ack_or_progress_snapshot(self) -> None:
+        self.backend.phase = RunPhase.RECORDING
+        self.backend.block_stop = True
+        responses: dict[str, dict] = {}
+        response_ready = threading.Event()
+
+        def enqueue(name, payload, **kwargs):
+            if name == "command_result":
+                responses[str(kwargs.get("request_id"))] = dict(payload)
+                response_ready.set()
+            return True
+
+        with mock.patch.object(self.server, "_enqueue", side_effect=enqueue):
+            worker = self._worker()
+            self.server._commands.put(CommandEnvelope("stop_run", "slow-stop"))
+            self.assertTrue(self.backend.stop_entered.wait(1))
+            self.assertTrue(response_ready.wait(1))
+            self.assertTrue(responses["slow-stop"]["ok"])
+            self.assertTrue(responses["slow-stop"]["result"]["accepted"])
+
+            response_ready.clear()
+            self.server._commands.put(CommandEnvelope("snapshot", "during-stop"))
+            self.assertTrue(response_ready.wait(1))
+            self.assertEqual(
+                responses["during-stop"]["result"]["phase"], "stopping"
+            )
+            self.assertTrue(
+                responses["during-stop"]["result"]["finalization_in_progress"]
+            )
+
+            self.backend.stop_release.set()
+            self.server._async_stop_thread.join(2)
+            self.server._stopping.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.backend.phase, RunPhase.FINALIZED)
 
     def test_duplicate_mutation_request_replays_without_reexecution(self) -> None:
         worker = self._worker()
@@ -311,6 +466,7 @@ class SupervisorServerTests(unittest.TestCase):
         clock = [0.0]
         server = SupervisorServer(
             self.socket_path,
+            runtime_context=self.runtime_context,
             backend_factory=FakeBackend,
             gui_lease_timeout_s=5.0,
             monotonic=lambda: clock[0],
@@ -469,6 +625,7 @@ class SupervisorServerTests(unittest.TestCase):
         clock = [0.0]
         server = SupervisorServer(
             self.socket_path,
+            runtime_context=self.runtime_context,
             backend_factory=FakeBackend,
             gui_lease_timeout_s=1.0,
             monotonic=lambda: clock[0],
@@ -509,7 +666,10 @@ class SupervisorServerTests(unittest.TestCase):
         self.assertEqual(self.server.last_error, "supervisor IPC send failed")
 
     def test_backend_abort_seam_wakes_startup_and_fails_active_run(self) -> None:
-        backend = OperatorBackend(lambda _line: None)
+        backend = OperatorBackend(
+            lambda _line: None,
+            runtime_context=self.runtime_context,
+        )
         backend._state_machine.transition(RunPhase.CREATED)
         backend._run_finalized = False
         with mock.patch.object(backend, "_finalize_run", return_value=True) as finalize:
@@ -523,7 +683,10 @@ class SupervisorServerTests(unittest.TestCase):
         )
 
     def test_backend_abort_waits_through_nonterminal_finalization_phase(self) -> None:
-        backend = OperatorBackend(lambda _line: None)
+        backend = OperatorBackend(
+            lambda _line: None,
+            runtime_context=self.runtime_context,
+        )
         backend._state_machine.transition(RunPhase.CREATED)
         backend._state_machine.transition(RunPhase.STARTING)
         backend._state_machine.transition(RunPhase.STOPPING)
@@ -536,7 +699,10 @@ class SupervisorServerTests(unittest.TestCase):
         )
 
     def test_lease_loss_during_successful_finalizer_forces_failed_terminal_state(self) -> None:
-        backend = OperatorBackend(lambda _line: None)
+        backend = OperatorBackend(
+            lambda _line: None,
+            runtime_context=self.runtime_context,
+        )
         backend._state_machine.transition(RunPhase.CREATED)
         backend._run_finalized = False
         backend.state.run_dir = self.socket_path.parent / "run"

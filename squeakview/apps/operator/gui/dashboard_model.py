@@ -7,6 +7,7 @@ tested independently from widget construction and rendering.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Mapping
 
 from squeakview.common import dashboard as dash_util
@@ -49,6 +50,40 @@ class DashboardDefinition:
     plots: tuple[dict[str, Any], ...]
     series_order: tuple[str, ...]
     settings_panel: bool
+
+
+class FeederJamEvent(str, Enum):
+    """Authoritative feeder-latch messages emitted by MouseHouse firmware."""
+
+    JAMMED = "jammed"
+    CLEAR_ACK = "clear_ack"
+    CLEAR_FEED_ACTIVE = "clear_feed_active"
+    CLEAR_NOT_JAMMED = "clear_not_jammed"
+
+
+def feeder_jam_event(event: dash_util.DashboardEvent) -> FeederJamEvent | None:
+    """Classify only exact feeder-jam protocol messages.
+
+    Short ACK/NACK messages do not use the ten-column telemetry schema, so the
+    immutable raw line is the protocol authority for those responses.
+    """
+
+    raw = event.raw_line.strip().upper()
+    if event.event_uc == "FEED_JAM":
+        return FeederJamEvent.JAMMED
+    if raw == "NACK,FEED,JAMMED":
+        return FeederJamEvent.JAMMED
+    if raw == "ACK_CLEAR_JAM":
+        return FeederJamEvent.CLEAR_ACK
+    if raw == "NACK,CLEAR_JAM,FEED_ACTIVE":
+        return FeederJamEvent.CLEAR_FEED_ACTIVE
+    if raw == "NACK,CLEAR_JAM,NOT_JAMMED":
+        return FeederJamEvent.CLEAR_NOT_JAMMED
+    # Preserve the pre-latch firmware warning convention as an additional
+    # authoritative jam indication. FEED_STOP alone never clears the latch.
+    if event.event_uc == "FEED_STOP" and "FEEDER JAM" in event.reason.upper():
+        return FeederJamEvent.JAMMED
+    return None
 
 
 def default_task_config() -> dict[str, Any]:

@@ -7,6 +7,7 @@ import hashlib
 import math
 import os
 import stat
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -818,6 +819,24 @@ def _task_config_snapshot_valid(run_dir: Path, manifest: dict[str, Any]) -> bool
         return False
 
 
+def _project_identity_valid(run_dir: Path, manifest: dict[str, Any]) -> bool:
+    project = manifest.get("project")
+    if not isinstance(project, dict) or set(project) != {"id", "name", "root"}:
+        return False
+    project_id = project.get("id")
+    name = project.get("name")
+    root_value = project.get("root")
+    if not all(isinstance(value, str) and value.strip() for value in (project_id, name, root_value)):
+        return False
+    try:
+        parsed_id = uuid.UUID(project_id)
+        project_root = Path(root_value).expanduser().resolve(strict=True)
+        resolved_run = run_dir.resolve(strict=True)
+    except (ValueError, OSError):
+        return False
+    return str(parsed_id) == project_id and resolved_run.is_relative_to(project_root)
+
+
 def _integrity_gates(
     status: dict[str, Any],
     manifest: dict[str, Any],
@@ -937,9 +956,14 @@ def _integrity_gates(
     def recording_validation_valid() -> bool:
         if (
             not isinstance(recording, dict)
-            or recording.get("schema_version") != "2.0"
+            or recording.get("schema_version") not in {"2.0", "3.0"}
             or recording.get("passed") is not True
-            or recording.get("evidence_unchanged_during_validation") is not True
+        ):
+            return False
+        schema_version = recording.get("schema_version")
+        if (
+            schema_version == "2.0"
+            and recording.get("evidence_unchanged_during_validation") is not True
         ):
             return False
         cameras = recording.get("cameras")
@@ -957,8 +981,17 @@ def _integrity_gates(
                 and camera.get("nonzero_frame_count") is True
                 and camera.get("source_count_matches") is True
                 and camera.get("frame_count_matches") is True
-                and isinstance(camera.get("frame_count_method"), str)
-                and camera["frame_count_method"].startswith("full_decode_")
+                and camera.get("frame_count_method")
+                in {
+                    "mp4_sample_table",
+                    "full_decode_gstreamer_nvv4l2decoder",
+                    "full_decode_ffmpeg_h264_nvv4l2dec",
+                }
+                and camera.get("video_unchanged_during_validation", True) is True
+                and (
+                    schema_version != "3.0"
+                    or camera.get("frame_manifest_count_matches") is True
+                )
                 and type(camera.get("source_frames")) is int
                 and camera["source_frames"] > 0
                 and camera.get("record_admitted_frames") == camera["source_frames"]
@@ -1067,9 +1100,12 @@ def _integrity_gates(
         return True
     return {
         "manifest_schema_supported": (
-            str(manifest.get("schema_version")) == "2.0"
+            str(manifest.get("schema_version")) == "3.0"
             if manifest
             else None
+        ),
+        "project_identity_valid": (
+            _project_identity_valid(run_dir, manifest) if manifest else None
         ),
         "production_eligible": (
             manifest.get("production_eligible") is True

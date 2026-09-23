@@ -23,6 +23,7 @@ class ConfigFields:
     capture_backend: str
     trigger_enabled: bool
     serial_enabled: bool
+    allow_rtc_correction: bool
     serial_port: str
     inference_enabled: bool
     ds_cfg: str
@@ -53,7 +54,9 @@ def collect_config(
     fields: ConfigFields,
     *,
     include_mode: bool,
-    resolve_path: Callable[[str], Path | None],
+    resolve_path: Callable[[str], Path | None] | None = None,
+    resolve_model_path: Callable[[str], Path | None] | None = None,
+    resolve_task_path: Callable[[str], Path | None] | None = None,
     validate_model: Callable[[Path], object],
 ) -> ConfigCollection:
     """Normalize a form snapshot and fail closed on invalid acquisition inputs."""
@@ -72,8 +75,19 @@ def collect_config(
             "Please enter valid numeric values for size, FPS, bitrate, and baud.",
         )
 
-    ds_cfg = resolve_path(fields.ds_cfg.strip()) if fields.inference_enabled else None
-    task_cfg = resolve_path(fields.task_cfg.strip())
+    model_resolver = resolve_model_path or resolve_path
+    task_resolver = resolve_task_path or resolve_path
+    if model_resolver is None or task_resolver is None:
+        raise TypeError("model and task path resolvers are required")
+    try:
+        ds_cfg = (
+            model_resolver(fields.ds_cfg.strip())
+            if fields.inference_enabled
+            else None
+        )
+        task_cfg = task_resolver(fields.task_cfg.strip())
+    except ValueError as exc:
+        return _failure("Invalid project path", str(exc))
     result: dict[str, Any] = {
         "width": width,
         "height": height,
@@ -84,6 +98,7 @@ def collect_config(
         "exposure_us": exposure_us,
         "arduino_fps": arduino_fps,
         "serial_enabled": fields.serial_enabled,
+        "allow_rtc_correction": fields.allow_rtc_correction,
         "serial_port": fields.serial_port.strip() or "/dev/ttyACM0",
         "serial_baud": serial_baud,
         "ds_cfg": ds_cfg,

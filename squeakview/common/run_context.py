@@ -19,11 +19,7 @@ from typing import Any
 
 from squeakview.common.bounded_csv import bounded_csv_lines
 
-from squeakview import config as squeakview_config
 from squeakview.common.storage_policy import resolve_storage_reserve_policy
-
-RUNS_DIR = squeakview_config.ensure_runs_dir()
-RUN_MARKER = RUNS_DIR / ".latest_run"
 
 RUN_STATUS_FILENAME = "run_status.json"
 RUN_MANIFEST_FILENAME = "run_manifest.json"
@@ -92,17 +88,21 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> Path:
     )
 
 
-def _atomic_write_latest(run_dir: Path) -> None:
-    atomic_write_text(RUN_MARKER, str(run_dir.resolve()) + "\n")
+def _run_marker(runs_dir: Path) -> Path:
+    return Path(runs_dir) / ".latest_run"
 
 
-def latest_run_dir() -> Path | None:
+def _atomic_write_latest(runs_dir: Path, run_dir: Path) -> None:
+    atomic_write_text(_run_marker(runs_dir), str(run_dir.resolve()) + "\n")
+
+
+def latest_run_dir(runs_dir: Path) -> Path | None:
     """Return the most recent run directory recorded by timestamped_run_dir."""
     from squeakview.common.bounded_input import read_stable_regular_file
 
     try:
         text = read_stable_regular_file(
-            RUN_MARKER, max_bytes=4096, label="latest-run marker"
+            _run_marker(runs_dir), max_bytes=4096, label="latest-run marker"
         ).decode("utf-8", errors="strict").strip()
     except (OSError, UnicodeDecodeError, ValueError):
         return None
@@ -116,22 +116,23 @@ def timestamped_run_dir(
     prefix: str | None = None,
     *,
     random_suffix: bool = True,
-    parent: Path | None = None,
+    parent: Path,
 ) -> Path:
     ts = time.strftime("%Y-%m-%d_%H-%M-%S")
     name = f"{prefix}_{ts}" if prefix else ts
     if random_suffix:
         name = f"{name}_{os.urandom(4).hex()}"
-    base = Path(parent) if parent is not None else RUNS_DIR
+    base = Path(parent)
     base.mkdir(parents=True, exist_ok=True)
     root = base / name
     root.mkdir(parents=True, exist_ok=True)
-    _atomic_write_latest(root)
+    _atomic_write_latest(base, root)
     return root
 
 
 def create_run_dir(
     *,
+    runs_dir: Path,
     experiment_name: str | None = None,
     mouse_id: str | None = None,
     prefix: str | None = None,
@@ -148,7 +149,8 @@ def create_run_dir(
     experiment_slug = slugify(experiment_name, fallback="default_experiment")
     subject_slug = slugify(mouse_id, fallback="unassigned")
     prefix_slug = slugify(prefix or mouse_id or "run", fallback="run")
-    base = RUNS_DIR / experiment_slug / subject_slug
+    runs_root = Path(runs_dir)
+    base = runs_root / experiment_slug / subject_slug
     base.mkdir(parents=True, exist_ok=True)
     for _ in range(100):
         ts = time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -159,28 +161,34 @@ def create_run_dir(
             root.mkdir(parents=False, exist_ok=False)
         except FileExistsError:
             continue
-        _atomic_write_latest(root)
+        _atomic_write_latest(runs_root, root)
         return root, run_id
     raise FileExistsError(f"could not create unique run directory under {base}")
 
 
-def assert_runs_dir_ready(min_free_bytes: int | None = None) -> dict[str, Any]:
+def assert_runs_dir_ready(
+    runs_dir: Path,
+    min_free_bytes: int | None = None,
+) -> dict[str, Any]:
     """Verify local run storage is writable and has basic free-space headroom."""
     if min_free_bytes is None:
         min_free_bytes = resolve_storage_reserve_policy().min_free_bytes
     min_free_bytes = max(1, int(min_free_bytes))
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    probe = RUNS_DIR / f".write_test_{os.getpid()}"
+    runs_root = Path(runs_dir)
+    runs_root.mkdir(parents=True, exist_ok=True)
+    probe = runs_root / f".write_test_{os.getpid()}"
     try:
         probe.write_text("ok")
         probe.unlink(missing_ok=True)
     except Exception as exc:
-        raise OSError(f"runs directory is not writable: {RUNS_DIR}: {exc}") from exc
-    usage = shutil.disk_usage(RUNS_DIR)
+        raise OSError(f"runs directory is not writable: {runs_root}: {exc}") from exc
+    usage = shutil.disk_usage(runs_root)
     if usage.free < min_free_bytes:
-        raise OSError(f"runs directory low on free space: {usage.free} bytes available at {RUNS_DIR}")
+        raise OSError(
+            f"runs directory low on free space: {usage.free} bytes available at {runs_root}"
+        )
     return {
-        "runs_dir": str(RUNS_DIR),
+        "runs_dir": str(runs_root),
         "free_bytes": int(usage.free),
         "total_bytes": int(usage.total),
     }

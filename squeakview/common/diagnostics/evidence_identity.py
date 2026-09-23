@@ -209,7 +209,7 @@ def acquisition_identity_errors(identity: Mapping[str, Any] | None) -> list[str]
         or type(serial.get("baud")) is not int
         or serial["baud"] <= 0
         or serial.get("controller_protocol")
-        not in {"legacy", "watchdog_v1_experimental"}
+        not in {"legacy", "watchdog_v1_experimental", "v2"}
     ):
         errors.append(
             "acquisition_identity.serial: port/baud/controller protocol identity "

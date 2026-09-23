@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -17,12 +18,23 @@ from squeakview.common.diagnostics.debug_overhead import (
     compare_debug_overhead,
     load_debug_thresholds,
 )
+from squeakview.project import AppPaths, open_project
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline_run", type=Path)
     parser.add_argument("debug_run", type=Path)
+    parser.add_argument(
+        "--project",
+        type=Path,
+        default=(
+            Path(os.environ["SQUEAKVIEW_PROJECT"])
+            if os.environ.get("SQUEAKVIEW_PROJECT")
+            else None
+        ),
+        help="required SqueakView project owning both runs and qualification state",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--case-id",
@@ -45,21 +57,43 @@ def main() -> int:
         default=1.0,
         help="allowed duration difference as a percentage of the longer run (default: 1%%)",
     )
-    args = parser.parse_args()
-    thresholds = None
-    if args.thresholds is not None:
-        try:
-            thresholds = load_debug_thresholds(args.thresholds)
-        except ValueError as exc:
-            print(json.dumps({"result": "incomplete", "error": str(exc)}, indent=2))
-            return 2
-    if args.case_id is not None and not args.case_id.strip():
-        print(json.dumps({"result": "incomplete", "error": "--case-id must be non-empty"}, indent=2))
-        return 2
+    args = parser.parse_args(argv)
     try:
-        report = compare_debug_overhead(
+        if args.project is None:
+            raise ValueError("--project or SQUEAKVIEW_PROJECT is required")
+        project = open_project(args.project)
+        AppPaths.discover().validate_for_project(project.paths)
+        baseline_run = project.paths.resolve_path(
             args.baseline_run,
+            within=project.paths.runs,
+            must_exist=True,
+        )
+        debug_run = project.paths.resolve_path(
             args.debug_run,
+            within=project.paths.runs,
+            must_exist=True,
+        )
+        thresholds = None
+        if args.thresholds is not None:
+            thresholds_path = project.paths.resolve_path(
+                args.thresholds,
+                within=project.paths.qualification,
+                must_exist=True,
+            )
+            thresholds = load_debug_thresholds(thresholds_path)
+        if args.case_id is not None and not args.case_id.strip():
+            raise ValueError("--case-id must be non-empty")
+        output_path = (
+            project.paths.resolve_path(
+                args.output,
+                within=project.paths.qualification,
+            )
+            if args.output is not None
+            else None
+        )
+        report = compare_debug_overhead(
+            baseline_run,
+            debug_run,
             thresholds=thresholds,
             duration_tolerance_seconds=args.duration_tolerance_seconds,
             duration_tolerance_percent=args.duration_tolerance_percent,
@@ -68,8 +102,8 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         print(json.dumps({"result": "incomplete", "error": str(exc)}, indent=2))
         return 2
-    if args.output is not None:
-        run_context.atomic_write_json(args.output, report)
+    if output_path is not None:
+        run_context.atomic_write_json(output_path, report)
     print(json.dumps(report, indent=2, sort_keys=True))
     return {"passed": 0, "failed": 1, "incomplete": 2}[report["result"]]
 

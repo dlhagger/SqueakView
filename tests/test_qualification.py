@@ -60,7 +60,8 @@ RECORDING_HEADERS = [
 class QualificationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.run_dir = Path(self.temp_dir.name) / "run"
+        self.root = Path(self.temp_dir.name)
+        self.run_dir = self.root / "run"
         (self.run_dir / "diagnostics").mkdir(parents=True)
         preflight_output = b"verified preflight"
         self.preflight_evidence = {
@@ -94,8 +95,13 @@ class QualificationTests(unittest.TestCase):
             "preflight": self.preflight_evidence,
         }
         self.manifest = {
-            "schema_version": "2.0",
+            "schema_version": "3.0",
             "run_id": "run-1",
+            "project": {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "Test Project",
+                "root": str(self.root),
+            },
             "production_eligible": True,
             "process_topology": {"acquisition_owner": "durable_supervisor"},
             "preflight": self.preflight_evidence,
@@ -545,7 +551,7 @@ class QualificationTests(unittest.TestCase):
         self.assertIn("recording is missing keys", error or "")
 
     def test_measurement_only_limits_allow_blank_thresholds(self) -> None:
-        path = Path("qualification/limits.v1.yaml")
+        path = Path("resources/project_template/qualification/limits.v1.yaml")
         payload, error = _read_yaml(path)
         self.assertIsNone(error)
         self.assertIsNotNone(payload)
@@ -1008,7 +1014,7 @@ class QualificationTests(unittest.TestCase):
             summary["failed_reasons"],
         )
 
-    def test_routine_structural_validation_is_not_full_qualification(self) -> None:
+    def test_mp4_sample_table_validation_satisfies_recording_integrity(self) -> None:
         self.status["recording_validation"]["cameras"][0][
             "frame_count_method"
         ] = "mp4_sample_table"
@@ -1018,10 +1024,9 @@ class QualificationTests(unittest.TestCase):
             self.run_dir, limits_path=self._limits(validated=False)
         )
 
-        self.assertEqual(summary["result"], "failed")
-        self.assertIn(
-            "frame-integrity gate failed: recording_validation_passed",
-            summary["failed_reasons"],
+        self.assertEqual(summary["result"], "incomplete")
+        self.assertTrue(
+            summary["frame_integrity_gates"]["recording_validation_passed"]
         )
 
     def test_power_interrupted_nonterminal_run_cannot_qualify(self) -> None:
@@ -1210,6 +1215,18 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(summary["result"], "failed")
         self.assertIn(
             "frame-integrity gate failed: manifest_schema_supported",
+            summary["failed_reasons"],
+        )
+
+    def test_missing_project_identity_is_rejected(self) -> None:
+        self.manifest.pop("project")
+        (self.run_dir / "run_manifest.json").write_text(json.dumps(self.manifest))
+
+        summary = qualify_run(self.run_dir, limits_path=self._limits(validated=True))
+
+        self.assertEqual(summary["result"], "failed")
+        self.assertIn(
+            "frame-integrity gate failed: project_identity_valid",
             summary["failed_reasons"],
         )
 

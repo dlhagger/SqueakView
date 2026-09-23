@@ -25,7 +25,17 @@ from squeakview.apps.operator.gui.system_meters import JetsonMeters, MetersBar
 
 
 class BehaviorDashboard(QtWidgets.QWidget):
-    def __init__(self, window_sec: float = 300.0, pellet_mode: str = "auto", parent=None) -> None:
+    clear_jam_requested = QtCore.Signal()
+    jam_state_changed = QtCore.Signal(bool)
+
+    def __init__(
+        self,
+        window_sec: float = 300.0,
+        pellet_mode: str = "auto",
+        parent=None,
+        *,
+        disk_root: Path | None = None,
+    ) -> None:
         super().__init__(parent)
         self.window_sec = float(max(30.0, window_sec))
         self.pellet_mode = pellet_mode
@@ -42,6 +52,7 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self._jam_active = False
         self._jam_reason = ""
         self._jam_detected_at = ""
+        self._clear_jam_pending = False
         self.setObjectName("behaviorDashboard")
         self.setAutoFillBackground(True)
         self.setStyleSheet("#behaviorDashboard { background-color: #1a1d2a; }")
@@ -90,7 +101,11 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self._timer.timeout.connect(self._refresh)
         self._timer.start(100)
 
-        self._meters = JetsonMeters(self, interval_ms=500)
+        self._meters = JetsonMeters(
+            self,
+            interval_ms=500,
+            disk_root=disk_root,
+        )
         self._meters.updated.connect(self._on_meters)
 
     def apply_task_config(self, path: Path) -> None:
@@ -98,19 +113,79 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self._task_cfg_path = path
         self._build_from_task_config(cfg)
 
+    def reset_run_data(self) -> None:
+        """Clear display-only history before a new acquisition starts.
+
+        Feeder-jam state deliberately survives this reset because a new run does
+        not authoritatively clear the controller's hardware latch.
+        """
+
+        self._observed_pellet_mode = None
+        self.counters = {key: 0 for key in self.series_order}
+        self.series_x = {key: [] for key in self.series_order}
+        self.series_y = {key: [] for key in self.series_order}
+        self.series_events = {key: [] for key in self.series_order}
+        self._first_event_at = None
+        self._refresh()
+
     def clear_jam_alert(self) -> None:
+        """Clear the latch presentation after an authoritative firmware ACK."""
+
+        changed = self._jam_active
         self._jam_active = False
         self._jam_reason = ""
         self._jam_detected_at = ""
+        self._clear_jam_pending = False
+        self._clear_jam_btn.setEnabled(False)
+        self._clear_jam_btn.setText("Clear Jam")
         self._jam_banner.hide()
+        if changed:
+            self.jam_state_changed.emit(False)
+
+    @property
+    def feeder_jammed(self) -> bool:
+        return self._jam_active
+
+    @property
+    def clear_jam_pending(self) -> bool:
+        return self._clear_jam_pending
 
     def _set_jam_alert(self, reason: str) -> None:
+        changed = not self._jam_active
         self._jam_active = True
-        self._jam_reason = reason or "Feeder Jammed"
+        self._jam_reason = reason or "The controller reports that its feeder latch is active."
         self._jam_detected_at = time.strftime("%H:%M:%S")
-        self._jam_title.setText("FEEDER JAM DETECTED")
-        self._jam_detail.setText(f"{self._jam_detected_at} · {self._jam_reason}")
+        self._jam_title.setText("FEEDER JAMMED — PHYSICAL INSPECTION REQUIRED")
+        self._jam_detail.setText(
+            f"{self._jam_detected_at} · Inspect and physically clear the feeder, "
+            f"then click Clear Jam. {self._jam_reason}"
+        )
+        self._clear_jam_btn.setEnabled(not self._clear_jam_pending)
         self._jam_banner.show()
+        if changed:
+            self.jam_state_changed.emit(True)
+
+    def _request_clear_jam(self) -> None:
+        if not self._jam_active or self._clear_jam_pending:
+            return
+        self._clear_jam_pending = True
+        self._clear_jam_btn.setEnabled(False)
+        self._clear_jam_btn.setText("Clearing…")
+        self._jam_detail.setText(
+            "Waiting for the controller. The jam remains latched until "
+            "ACK_CLEAR_JAM is received."
+        )
+        self.clear_jam_requested.emit()
+
+    def clear_jam_failed(self, message: str) -> None:
+        """Keep the latch active after a NACK, timeout, or transport failure."""
+
+        self._clear_jam_pending = False
+        self._clear_jam_btn.setText("Clear Jam")
+        self._clear_jam_btn.setEnabled(self._jam_active)
+        self._jam_detail.setText(message)
+        if self._jam_active:
+            self._jam_banner.show()
 
     def _load_task_config(self, path: Path) -> dict:
         from squeakview.common.bounded_input import (
@@ -339,10 +414,23 @@ class BehaviorDashboard(QtWidgets.QWidget):
         data = dashboard_model.event_data(event)
         if not data:
             return
+        jam_event = dashboard_model.feeder_jam_event(event)
+        if jam_event == dashboard_model.FeederJamEvent.JAMMED:
+            reason = str(data.get("reason", "")).strip()
+            self._set_jam_alert(reason)
+        elif jam_event == dashboard_model.FeederJamEvent.CLEAR_ACK:
+            self.clear_jam_alert()
+        elif jam_event == dashboard_model.FeederJamEvent.CLEAR_FEED_ACTIVE:
+            self.clear_jam_failed(
+                "Clear Jam was rejected: wait until the current feed stops, "
+                "then inspect the mechanism and try again."
+            )
+        elif jam_event == dashboard_model.FeederJamEvent.CLEAR_NOT_JAMMED:
+            self.clear_jam_failed(
+                "The firmware reports that no jam is currently latched. "
+                "The warning remains active because no ACK_CLEAR_JAM was received."
+            )
         event = str(data.get("event_uc", ""))
-        reason_text = str(data.get("reason", "")).strip()
-        if event == "FEED_STOP" and "FEEDER JAM" in reason_text.upper():
-            self._set_jam_alert(reason_text)
         if event == "TASK_INFO":
             self._update_settings_from_task_info(data)
         elif event == "NOGO_STAGE_INFO":
@@ -557,7 +645,7 @@ class BehaviorDashboard(QtWidgets.QWidget):
         text_wrap = QtWidgets.QVBoxLayout()
         text_wrap.setContentsMargins(0, 0, 0, 0)
         text_wrap.setSpacing(2)
-        self._jam_title = QtWidgets.QLabel("FEEDER JAM DETECTED")
+        self._jam_title = QtWidgets.QLabel("FEEDER JAMMED — PHYSICAL INSPECTION REQUIRED")
         self._jam_title.setStyleSheet("color: #ffd8dc; font-size: 12px; font-weight: 700;")
         self._jam_detail = QtWidgets.QLabel("--")
         self._jam_detail.setStyleSheet("color: #ffb6be; font-size: 12px;")
@@ -565,11 +653,12 @@ class BehaviorDashboard(QtWidgets.QWidget):
         text_wrap.addWidget(self._jam_title)
         text_wrap.addWidget(self._jam_detail)
 
-        clear_btn = QtWidgets.QPushButton("Clear")
-        clear_btn.clicked.connect(self.clear_jam_alert)
+        self._clear_jam_btn = QtWidgets.QPushButton("Clear Jam")
+        self._clear_jam_btn.setEnabled(False)
+        self._clear_jam_btn.clicked.connect(self._request_clear_jam)
 
         layout.addLayout(text_wrap, 1)
-        layout.addWidget(clear_btn, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self._clear_jam_btn, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
         panel.hide()
         return panel
 

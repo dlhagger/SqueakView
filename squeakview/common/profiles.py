@@ -8,9 +8,9 @@ from itertools import islice
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from squeakview import config as squeakview_config
 from squeakview.common.bounded_input import read_json_object
 from squeakview.common.run_context import atomic_write_json
+from squeakview.project import ProjectPaths
 
 
 MAX_PROFILE_BYTES = 1024 * 1024
@@ -39,8 +39,14 @@ class SubjectProfile:
 
 
 class ProfileStore:
-    def __init__(self, root: Path | None = None) -> None:
-        self.root = Path(root) if root is not None else squeakview_config.ensure_profiles_dir()
+    def __init__(
+        self,
+        root: Path,
+        *,
+        project_paths: ProjectPaths | None = None,
+    ) -> None:
+        self.root = Path(root)
+        self.project_paths = project_paths
         self.experiments_dir = self.root / "experiments"
         self.subjects_dir = self.root / "subjects"
         self.experiments_dir.mkdir(parents=True, exist_ok=True)
@@ -131,17 +137,21 @@ class ProfileStore:
         except FileNotFoundError:
             pass
 
-    @staticmethod
-    def _normalize_config(config: dict[str, object]) -> dict[str, object]:
+    def _portable_project_value(self, value: str | Path) -> str:
+        if self.project_paths is None:
+            return str(value)
+        return self.project_paths.portable_path(value)
+
+    def _normalize_config(self, config: dict[str, object]) -> dict[str, object]:
         normalized: dict[str, object] = {}
         for key, value in config.items():
             if isinstance(value, Path):
                 if key in {"ds_cfg", "task_cfg"}:
-                    normalized[key] = squeakview_config.portable_workspace_path(value)
+                    normalized[key] = self._portable_project_value(value)
                 else:
                     normalized[key] = str(value)
             elif key in {"ds_cfg", "task_cfg"} and isinstance(value, str):
-                normalized[key] = squeakview_config.portable_workspace_path(value)
+                normalized[key] = self._portable_project_value(value)
             else:
                 normalized[key] = value
         return normalized

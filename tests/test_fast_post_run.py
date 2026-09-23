@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from squeakview.apps.inference import post_run
+from squeakview.apps.inference.frame_audit import FrameCsvOperator
 from squeakview.common import run_context
 
 
@@ -17,11 +19,26 @@ class FastPostRunTests(unittest.TestCase):
         self.root = Path(self._temp.name)
         (self.root / "diagnostics").mkdir()
         (self.root / "capture_cam0.jsonl").write_text(
-            json.dumps({"source_sequence_index": 41}) + "\n"
+            json.dumps(
+                {
+                    "source_sequence_index": 41,
+                    "total_incomplete": 0,
+                    "total_frame_gap_events": 0,
+                    "total_crc_failures": 0,
+                }
+            )
+            + "\n"
         )
         (self.root / "record_admission.csv").write_text(
             "stream_id,record_frame_index,pts_ns\n0,41,100\n"
         )
+        manifest_row = [""] * len(FrameCsvOperator.HEADERS)
+        manifest_row[0] = "0"
+        manifest_row[3] = "41"
+        with (self.root / "frames.csv").open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(FrameCsvOperator.HEADERS)
+            writer.writerow(manifest_row)
         (self.root / "raw.mp4").write_bytes(b"closed-mp4")
         run_context.write_status(
             self.root,
@@ -32,10 +49,6 @@ class FastPostRunTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._temp.cleanup()
-
-    @staticmethod
-    def _integrity(_run_dir: Path, _camera_count: int) -> tuple[dict, bool]:
-        return {"passed": True}, True
 
     def test_fast_finalizer_compares_counts_without_scanning_or_hashing(self) -> None:
         with (
@@ -50,11 +63,6 @@ class FastPostRunTests(unittest.TestCase):
             ) as probe,
             mock.patch.object(
                 post_run,
-                "_validate_acquisition_integrity",
-                side_effect=self._integrity,
-            ),
-            mock.patch.object(
-                post_run,
                 "capture_recording_evidence",
                 side_effect=AssertionError("fast shutdown must not hash evidence"),
             ),
@@ -66,6 +74,7 @@ class FastPostRunTests(unittest.TestCase):
         probe.assert_called_once_with(self.root / "raw.mp4", expected_frames=42)
         status = run_context.read_json(self.root / "run_status.json")
         self.assertTrue(status["recording_validation_passed"])
+        self.assertTrue(status["acquisition_integrity"]["passed"])
         self.assertEqual(
             status["recording_validation"]["validation_tier"],
             "shutdown_fast_count",
@@ -83,11 +92,6 @@ class FastPostRunTests(unittest.TestCase):
                     "method": "mp4_sample_table",
                     "error": "MP4 sample-count mismatch: recording=41, expected=42",
                 },
-            ),
-            mock.patch.object(
-                post_run,
-                "_validate_acquisition_integrity",
-                side_effect=self._integrity,
             ),
         ):
             result = post_run.fast_finalize_run(self.root, camera_count=1)
@@ -122,6 +126,11 @@ class FastPostRunTests(unittest.TestCase):
                 post_run, "fast_finalize_run", return_value=result
             ) as fast,
             mock.patch.object(post_run, "finalize_run") as full,
+            mock.patch.object(
+                post_run,
+                "align_run",
+                return_value={"counts": {"recorded_frames": 42}},
+            ) as align,
             mock.patch.object(post_run, "cleanup_successful_run"),
         ):
             returncode = post_run.main()
@@ -129,6 +138,10 @@ class FastPostRunTests(unittest.TestCase):
         self.assertEqual(returncode, 0)
         fast.assert_called_once_with(self.root, camera_count=1)
         full.assert_not_called()
+        align.assert_called_once_with(
+            self.root,
+            video_validation=result.video_validation,
+        )
 
 
 if __name__ == "__main__":

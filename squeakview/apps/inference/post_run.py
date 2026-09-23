@@ -1,4 +1,4 @@
-"""Fast recording validation and opt-in bounded-memory run analysis."""
+"""Bounded recording validation and automatic controller alignment."""
 from __future__ import annotations
 
 import argparse
@@ -240,6 +240,80 @@ def _durable_ledger_counts(run_dir: Path, camera_count: int) -> dict[int, tuple[
     return counts
 
 
+def _durable_frame_manifest_counts(run_dir: Path, camera_count: int) -> dict[int, int]:
+    """Read source-owned canonical manifest totals from final row indices."""
+
+    counts: dict[int, int] = {}
+    for stream_id in range(camera_count):
+        path = run_dir / (
+            "frames.csv" if stream_id == 0 else f"frames_cam{stream_id}.csv"
+        )
+        line = _last_complete_line(path)
+        try:
+            fields = next(csv.reader([line or ""], strict=True))
+            if len(fields) != len(FrameCsvOperator.HEADERS):
+                raise ValueError(
+                    f"expected {len(FrameCsvOperator.HEADERS)} fields, got {len(fields)}"
+                )
+            if fields[0] != str(stream_id):
+                raise ValueError(f"unexpected stream_id {fields[0]!r}")
+            sequence_text = fields[3]
+            if not sequence_text.isascii() or not sequence_text.isdecimal():
+                raise ValueError("invalid source_sequence_index")
+            counts[stream_id] = int(sequence_text) + 1
+        except (csv.Error, IndexError, StopIteration, ValueError) as exc:
+            raise RuntimeError(
+                "cannot read final canonical frame manifest count for camera "
+                f"{stream_id}: {exc}"
+            ) from exc
+    return counts
+
+
+def _bounded_acquisition_integrity(run_dir: Path, camera_count: int) -> tuple[dict, bool]:
+    """Validate source-owned cumulative fault counters from final ledger rows."""
+
+    cameras: list[dict[str, object]] = []
+    for stream_id in range(camera_count):
+        line = _last_complete_line(run_dir / f"capture_cam{stream_id}.jsonl")
+        try:
+            payload = json.loads(line or "")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"cannot read final acquisition counters for camera {stream_id}: {exc}"
+            ) from exc
+        counters: dict[str, int] = {}
+        for name in (
+            "total_incomplete",
+            "total_frame_gap_events",
+            "total_crc_failures",
+        ):
+            value = payload.get(name)
+            if type(value) is not int or value < 0:
+                raise RuntimeError(
+                    f"final acquisition counter {name} is unavailable or invalid "
+                    f"for camera {stream_id}; rebuild the FLIR source plugin"
+                )
+            counters[name] = value
+        cameras.append(
+            {
+                "stream_id": stream_id,
+                **counters,
+                "passed": not any(counters.values()),
+            }
+        )
+    passed = bool(cameras) and all(camera["passed"] is True for camera in cameras)
+    return (
+        {
+            "schema_version": "2.0",
+            "validation_tier": "source_cumulative_counters",
+            "policy": "no_incomplete_frames_frame_gaps_or_payload_crc_failures",
+            "cameras": cameras,
+            "passed": passed,
+        },
+        passed,
+    )
+
+
 def _video_metadata_identity(path: Path) -> tuple[int, int, int, int, int]:
     metadata = Path(path).stat()
     return (
@@ -252,11 +326,11 @@ def _video_metadata_identity(path: Path) -> tuple[int, int, int, int, int]:
 
 
 def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult:
-    """Validate final MP4 sample totals against durable metadata counters.
+    """Validate the live frame manifest against admission and MP4 samples.
 
-    This is the normal shutdown gate.  It performs bounded tail reads and MP4
-    sample-table reads only; frame reconstruction, hashing, inference
-    reconciliation, and controller alignment are explicit offline analysis.
+    The source writes ``frames.csv`` during acquisition, matching the original
+    SqueakView lifecycle. Shutdown performs bounded tail reads and a direct MP4
+    sample-table read; it never reconstructs metadata or decodes video.
     """
 
     run_dir = Path(run_dir).resolve()
@@ -276,6 +350,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
     )
     try:
         counts = _durable_ledger_counts(run_dir, camera_count)
+        manifest_counts = _durable_frame_manifest_counts(run_dir, camera_count)
         prior_status = run_context.read_json_required(
             run_dir / run_context.RUN_STATUS_FILENAME
         )
@@ -290,6 +365,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
         recorded_counts: dict[int, int] = {}
         for stream_id in range(camera_count):
             source_count, admitted_count = counts[stream_id]
+            manifest_count = manifest_counts[stream_id]
             source_counts[stream_id] = source_count
             recorded_counts[stream_id] = admitted_count
             video_path = run_dir / (
@@ -306,6 +382,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
             )
             unchanged = before == after
             source_matches = source_count == admitted_count
+            manifest_matches = manifest_count == admitted_count
             controller_matches = expected_ttl is None or source_count == expected_ttl
             count_matches = video_count == admitted_count if video_count is not None else None
             error = probe.get("error")
@@ -323,7 +400,9 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
                     "exists": before[2] > 0,
                     "source_frames": source_count,
                     "record_admitted_frames": admitted_count,
+                    "frame_manifest_frames": manifest_count,
                     "source_count_matches": source_matches,
+                    "frame_manifest_count_matches": manifest_matches,
                     "controller_count_matches": controller_matches,
                     "nonzero_frame_count": bool(
                         source_count > 0 and admitted_count > 0 and (video_count or 0) > 0
@@ -341,6 +420,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
         recording_passed = bool(cameras) and all(
             camera["exists"] is True
             and camera["source_count_matches"] is True
+            and camera["frame_manifest_count_matches"] is True
             and camera["controller_count_matches"] is True
             and camera["nonzero_frame_count"] is True
             and camera["frame_count_matches"] is True
@@ -351,11 +431,14 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
         recording_report = {
             "schema_version": "3.0",
             "validation_tier": "shutdown_fast_count",
-            "policy": "mp4_sample_count_equals_durable_capture_and_recording_counts",
+            "policy": (
+                "mp4_sample_count_equals_live_frame_manifest_and_durable_"
+                "capture_admission_counts"
+            ),
             "cameras": cameras,
             "passed": recording_passed,
         }
-        integrity_report, integrity_passed = _validate_acquisition_integrity(
+        integrity_report, integrity_passed = _bounded_acquisition_integrity(
             run_dir, camera_count
         )
         passed = recording_passed and integrity_passed
@@ -364,11 +447,15 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
             "validation_tier": "durable_final_indices",
             "source_frames": source_counts,
             "record_admitted_frames": recorded_counts,
+            "frame_manifest_frames": manifest_counts,
             "source_not_recorded_frames": {
                 stream_id: source_counts[stream_id] - recorded_counts[stream_id]
                 for stream_id in source_counts
             },
-            "policy": "final monotonic capture/admission indices must agree",
+            "policy": (
+                "final source, non-leaky recording admission, and live canonical "
+                "frame-manifest indices must agree"
+            ),
         }
         total = sum(recorded_counts.values())
         run_context.write_status(
@@ -745,6 +832,7 @@ def align_run(
             run_dir,
             temp_dir,
             video_validation=video_validation,
+            include_objects=False,
         )
         run_context.atomic_write_json(run_dir / "alignment_summary.json", summary)
         counts = summary.get("counts", {})
@@ -827,8 +915,8 @@ def parse_args() -> argparse.Namespace:
         "--full-analysis",
         action="store_true",
         help=(
-            "rebuild canonical frame metadata and run optional inference/alignment "
-            "analysis; normal shutdown performs fast count validation only"
+            "recover canonical frame metadata from verbose ledgers before "
+            "validation; normal capture writes frames.csv live"
         ),
     )
     parser.add_argument("--enable-infer", action="store_true")
@@ -853,7 +941,7 @@ def main() -> int:
     except Exception as exc:
         print(f"[{_timestamp()}] [POST-RUN] ERROR: {exc}", flush=True)
         return 1
-    if args.full_analysis and args.align and result.validation_passed:
+    if args.align and result.validation_passed:
         try:
             summary = align_run(
                 args.run_dir,

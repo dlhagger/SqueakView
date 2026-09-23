@@ -30,8 +30,8 @@ from squeakview.apps.operator.backend.events import (
     RunSnapshot,
     RunStateMachine,
 )
-from squeakview import config as squeakview_config
 from squeakview import model_package
+from squeakview.common import clock_validation
 from squeakview.common import dashboard as dashboard_util, run_context
 from squeakview.common import qualification_barrier
 from squeakview.common.device_context import device_context_snapshot
@@ -40,6 +40,7 @@ from squeakview.common.diagnostics.qualification_matrix import (
 )
 from squeakview.common.failure_injection import FailurePlan, load_failure_plan
 from squeakview.common import serial as serial_util
+from squeakview.project import PROJECT_ENV, RuntimeContext
 
 
 def _now() -> str:
@@ -75,6 +76,7 @@ class OperatorBackend:
         on_run_started: Callable[[], None] | None = None,
         on_run_failed: Callable[[str], None] | None = None,
         *,
+        runtime_context: RuntimeContext,
         acquisition_owner: str = manifest.IN_PROCESS_DEV_OWNER,
     ):
         if acquisition_owner not in {
@@ -83,6 +85,7 @@ class OperatorBackend:
         }:
             raise ValueError(f"unsupported acquisition owner: {acquisition_owner!r}")
         self._acquisition_owner = acquisition_owner
+        self.runtime_context = runtime_context
         self.emit = emit_log
         self.ingest = ingest_dashboard
         self.on_run_started = on_run_started
@@ -113,12 +116,13 @@ class OperatorBackend:
         self._device_context: dict[str, object] | None = None
         self._task_config_snapshot: dict[str, object] | None = None
         self._preflight_evidence: dict[str, object] | None = None
+        self._clock_validation_evidence: dict[str, object] | None = None
         self._qualification_case: dict[str, Any] | None = None
         self._manifest_service = manifest.RunManifestService(self._log)
         self._capture_drain_coordinator = capture_drain.CaptureDrainCoordinator()
         self._failure_plan: FailurePlan | None = None
         self._acquisition_lock = AcquisitionLock(
-            run_context.RUNS_DIR / ".acquisition.lock"
+            runtime_context.user.acquisition_lock
         )
 
     def _log(self, message: str) -> None:
@@ -169,6 +173,22 @@ class OperatorBackend:
             run_dir=self.state.run_dir,
             message=message,
             payload={"previous_phase": previous.value, **payload},
+        )
+        for callback in tuple(self._subscribers):
+            try:
+                callback(event)
+            except Exception as exc:
+                self._log(f"[BACKEND] event subscriber failed: {exc}")
+
+    def _publish_event(
+        self, event_type: str, *, message: str | None = None, **payload: object
+    ) -> None:
+        event = BackendEvent(
+            type=event_type,
+            phase=self._state_machine.phase,
+            run_dir=self.state.run_dir,
+            message=message,
+            payload=payload,
         )
         for callback in tuple(self._subscribers):
             try:
@@ -402,7 +422,11 @@ class OperatorBackend:
     def _manifest_context(self) -> manifest.RunManifestContext:
         return manifest.RunManifestContext(
             config=self.launch_cfg,
-            workspace=process.WORKSPACE,
+            application_root=self.runtime_context.app.root,
+            project_root=self.runtime_context.project.paths.root,
+            project_id=self.runtime_context.project.metadata.project_id,
+            project_name=self.runtime_context.project.metadata.name,
+            runs_root=self.runtime_context.project.paths.runs,
             created_at=self._run_started_at,
             storage=self._run_storage_info,
             model_snapshot=self._model_snapshot,
@@ -420,6 +444,7 @@ class OperatorBackend:
             acquisition_owner=self._acquisition_owner,
             task_config_snapshot=self._task_config_snapshot,
             preflight_evidence=self._preflight_evidence,
+            clock_validation=self._clock_validation_evidence,
             qualification_case=self._qualification_case,
             controller_watchdog=(
                 self.state.serial.watchdog_snapshot
@@ -436,7 +461,7 @@ class OperatorBackend:
 
     @staticmethod
     def _git_snapshot() -> dict[str, Any]:
-        return manifest.RunManifestService.git_snapshot(process.WORKSPACE)
+        return manifest.RunManifestService.git_snapshot(process.APPLICATION_ROOT)
 
     def _run_output_snapshot(self, run_dir: Path) -> dict[str, Any]:
         return self._manifest_service.output_snapshot(run_dir)
@@ -478,6 +503,11 @@ class OperatorBackend:
         target = Path(run_dir) if run_dir is not None else self.state.run_dir
         if target is None:
             raise RuntimeError("no active run directory for bottle metadata")
+        target = self.runtime_context.project.paths.resolve_path(
+            target,
+            within=self.runtime_context.project.paths.runs,
+            must_exist=True,
+        )
         summary = self._write_bottle_measurements(target, bottles)
         self._write_run_manifest(target)
         try:
@@ -532,14 +562,16 @@ class OperatorBackend:
         )
 
     def _run_capture_finalizer(self, run_dir: Path) -> int:
+        alignment_required = bool(
+            getattr(self.launch_cfg, "serial_enabled", False)
+            and getattr(self.launch_cfg, "trigger_on", False)
+            and getattr(self.launch_cfg, "controller_protocol", "v2") != "v2"
+        )
         return finalizer.run_capture_finalizer(
             run_dir,
             camera_count=int(getattr(self.launch_cfg, "num_cameras", 1)),
             enable_infer=bool(getattr(self.launch_cfg, "inference_enabled", True)),
-            # Shutdown validates recording completeness from durable counts.
-            # Controller/object alignment is explicit offline analysis and
-            # must never block closing an otherwise complete MP4.
-            enable_align=False,
+            enable_align=alignment_required,
             emit=self._log,
             force_timeout=bool(
                 self._failure_plan is not None
@@ -577,9 +609,14 @@ class OperatorBackend:
                         trigger_on=bool(getattr(self.launch_cfg, "trigger_on", False)),
                         phase=self._state_machine.phase,
                         controller_protocol=getattr(
-                            self.launch_cfg, "controller_protocol", "legacy"
+                            self.launch_cfg, "controller_protocol", "v2"
                         ),
-                        alignment_required=False,
+                        alignment_required=bool(
+                            getattr(self.launch_cfg, "serial_enabled", False)
+                            and getattr(self.launch_cfg, "trigger_on", False)
+                            and getattr(self.launch_cfg, "controller_protocol", "v2")
+                            != "v2"
+                        ),
                         failure_plan=self._failure_plan,
                     ),
                     lifecycle.FinalizationHooks(
@@ -710,6 +747,7 @@ class OperatorBackend:
                     else None
                 )
                 self._task_config_snapshot = None
+                self._clock_validation_evidence = None
                 self._inference_ready.clear()
                 self._stop_requested.clear()
             self._recording_started = False
@@ -768,6 +806,8 @@ class OperatorBackend:
             )
             if cfg.controller_protocol == "watchdog_v1_experimental":
                 disqualifiers = (*disqualifiers, "controller_watchdog_unqualified")
+            if cfg.serial_enabled and cfg.controller_protocol != "v2":
+                disqualifiers = (*disqualifiers, "controller_protocol_not_v2")
             run_context.write_status(
                 prepared.run_dir,
                 "created",
@@ -821,6 +861,75 @@ class OperatorBackend:
             holder["handle"] = handle
             return handle
 
+        def validate_clock(
+            handle: serial_util.SerialHandle, prepared: startup.PreparedRun
+        ) -> dict[str, Any]:
+            evidence_path = prepared.run_dir / "diagnostics" / "clock_validation.json"
+
+            def publish(state: str, snapshot: dict[str, Any]) -> None:
+                summary = snapshot.get("after") or snapshot.get("before") or {}
+                self._publish_event(
+                    "clock_preflight",
+                    message=state,
+                    validation_state=state,
+                    ntp_synchronized=bool(
+                        dict(snapshot.get("host") or {}).get("ntp_synchronized", False)
+                    ),
+                    rtc_valid=(
+                        summary.get("all_rtc_valid")
+                        if isinstance(summary, dict)
+                        else None
+                    ),
+                    median_offset_seconds=(
+                        summary.get("median_offset_seconds")
+                        if isinstance(summary, dict)
+                        else None
+                    ),
+                    median_round_trip_ms=(
+                        summary.get("median_round_trip_ms")
+                        if isinstance(summary, dict)
+                        else None
+                    ),
+                    correction_requested=bool(snapshot.get("correction_requested")),
+                    correction_applied=bool(snapshot.get("correction_applied")),
+                    validation_timestamp=snapshot.get("completed_utc")
+                    or snapshot.get("started_utc"),
+                    evidence_path=str(evidence_path),
+                    reason=snapshot.get("reason"),
+                    detail=snapshot.get("detail"),
+                )
+
+            try:
+                host_status = clock_validation.host_time_status()
+            except Exception as exc:
+                host_status = {
+                    "ntp_synchronized": False,
+                    "timezone": None,
+                    "checked_utc": clock_validation.utc_now(),
+                    "query_error": f"{type(exc).__name__}: {exc}",
+                }
+            record = clock_validation.validate_clock(
+                handle,
+                host_status=host_status,
+                correct=prepared.config.allow_rtc_correction,
+                controller_identifier=prepared.config.serial_port,
+                progress=publish,
+            )
+            record["evidence_path"] = str(evidence_path)
+            run_context.atomic_write_json(evidence_path, record)
+            self._clock_validation_evidence = dict(record)
+            run_context.update_status(
+                prepared.run_dir,
+                clock_validation=self._clock_validation_evidence,
+            )
+            self._write_run_manifest(prepared.run_dir, required=True)
+            publish(str(record.get("validation_state") or "VALIDATION_ERROR"), record)
+            self._log(
+                "[CLOCK] preflight "
+                f"{record.get('result')}: {record.get('reason')} → {evidence_path}"
+            )
+            return record
+
         def ready_timeout() -> float:
             return _bounded_ready_timeout()
 
@@ -855,16 +964,32 @@ class OperatorBackend:
 
         return startup.StartupHooks(
             log=self._log,
-            resolve_workspace_path=squeakview_config.resolve_workspace_path,
+            resolve_task_path=lambda path: self.runtime_context.project.paths.resolve_path(
+                path,
+                within=self.runtime_context.project.paths.tasks,
+            ),
+            resolve_model_path=lambda path: self.runtime_context.project.paths.resolve_path(
+                path,
+                within=self.runtime_context.project.paths.models,
+            ),
+            resolve_failure_plan_path=lambda path: self.runtime_context.project.paths.resolve_path(
+                path,
+                within=self.runtime_context.project.paths.qualification,
+            ),
             load_failure_plan=load_failure_plan,
             validate_model=validate_model,
-            assert_storage_ready=run_context.assert_runs_dir_ready,
+            assert_storage_ready=lambda: run_context.assert_runs_dir_ready(
+                self.runtime_context.project.paths.runs
+            ),
             acquire_lock=acquire_lock,
             release_lock=self._acquisition_lock.release,
             now_iso=lambda: time.strftime("%Y-%m-%dT%H:%M:%S"),
             device_context=device_context_snapshot,
             set_fan_max=self._set_fan_max,
-            create_run_dir=run_context.create_run_dir,
+            create_run_dir=lambda **kwargs: run_context.create_run_dir(
+                runs_dir=self.runtime_context.project.paths.runs,
+                **kwargs,
+            ),
             preview_socket_paths=process.preview_socket_paths,
             initialize_runtime=initialize_runtime,
             establish_run=establish_run,
@@ -873,6 +998,7 @@ class OperatorBackend:
             create_serial=create_serial,
             set_serial=lambda handle: setattr(self.state, "serial", handle),
             arm_serial_runtime=lambda: setattr(self, "_serial_runtime_armed", True),
+            validate_clock=validate_clock,
             spawn_capture=spawn_capture,
             set_capture=lambda handle: setattr(self.state, "inference", handle),
             after_capture_spawn=lambda run_dir: qualification_barrier.wait_at_barrier(
@@ -897,7 +1023,8 @@ class OperatorBackend:
                     cfg,
                     device,
                     default_matrix_path=(
-                        process.WORKSPACE / "qualification/matrix.v1.yaml"
+                        self.runtime_context.project.paths.qualification
+                        / "matrix.v1.yaml"
                     ),
                     environ=os.environ,
                 )
@@ -920,9 +1047,13 @@ class OperatorBackend:
                     serial_enabled=cfg.serial_enabled,
                     serial_port=cfg.serial_port,
                 ),
-                workspace=process.WORKSPACE,
+                workspace=self.runtime_context.app.root,
                 python_bin=os.fsdecode(os.environ.get("PYTHON_BIN") or sys.executable),
                 emit=self._log,
+                environ={
+                    **os.environ,
+                    PROJECT_ENV: str(self.runtime_context.project.paths.root),
+                },
             )
             self._preflight_evidence = preflight.evidence_snapshot(result)
             if not result.passed:
@@ -944,6 +1075,16 @@ class OperatorBackend:
 
     def stop_run(self) -> None:
         self._finalize_run(final_state="finalized")
+
+    def clear_feeder_jam(self) -> str:
+        """Clear the firmware latch through the currently owned serial link."""
+
+        handle = self.state.serial
+        if handle is None:
+            raise ConnectionError(
+                "the controller is not connected; the feeder jam remains latched"
+            )
+        return handle.clear_feeder_jam(timeout_s=2.0)
 
     def cancel_operator_lease(self) -> None:
         """Persistently cancel startup and wake any readiness wait."""

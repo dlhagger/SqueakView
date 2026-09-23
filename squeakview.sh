@@ -5,9 +5,11 @@ set -euo pipefail
 # mandatory GUI. GUI loss is observable and forces fail-closed run finalization;
 # the supervisor never continues acquisition headlessly.
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python}"
-LOG_DIR="${SQUEAKVIEW_LAUNCH_LOG_DIR:-$ROOT/runs/logs}"
+STATE_BASE="${XDG_STATE_HOME:-${HOME:?HOME is required}/.local/state}"
+LOG_DIR="${SQUEAKVIEW_LAUNCH_LOG_DIR:-$STATE_BASE/SqueakView/logs}"
 TIMESTAMP="$(date +%Y-%m-%d_%H-%M-%S)"
 GUI_LOG_PATH="${SQUEAKVIEW_LOGFILE:-$LOG_DIR/squeakview_gui_$TIMESTAMP.log}"
 SUPERVISOR_LOG_PATH="${SQUEAKVIEW_SUPERVISOR_LOGFILE:-$LOG_DIR/squeakview_supervisor_$TIMESTAMP.log}"
@@ -22,8 +24,49 @@ if ! command -v setsid >/dev/null 2>&1; then
   printf '[FAIL] setsid is required for a terminal-independent launch.\n' >&2
   exit 1
 fi
-
 cd "$ROOT"
+if [ "$#" -gt 1 ]; then
+  printf 'Usage: bash squeakview.sh [PROJECT_DIRECTORY]\n' >&2
+  exit 2
+fi
+
+requested_project="${1:-}"
+if [ -n "$requested_project" ]; then
+  if ! PROJECT_PATH="$("$PYTHON_BIN" -m squeakview.apps.project_launcher --project "$requested_project")"; then
+    printf '[FAIL] SqueakView project could not be opened: %s\n' "$requested_project" >&2
+    exit 1
+  fi
+else
+  if ! PROJECT_PATH="$("$PYTHON_BIN" -m squeakview.apps.project_launcher)"; then
+    printf '[FAIL] No SqueakView project was selected.\n' >&2
+    exit 1
+  fi
+fi
+if [ -z "$PROJECT_PATH" ]; then
+  printf '[FAIL] Project selection returned an empty path.\n' >&2
+  exit 1
+fi
+
+assert_external_log_path() {
+  local label="$1"
+  local raw_path="$2"
+  local canonical_path
+  canonical_path="$(readlink -m -- "$raw_path")"
+  case "$canonical_path" in
+    "$ROOT"|"$ROOT"/*)
+      printf '[FAIL] %s must not be inside the application release: %s\n' "$label" "$canonical_path" >&2
+      exit 2
+      ;;
+    "$PROJECT_PATH"|"$PROJECT_PATH"/*)
+      printf '[FAIL] %s must not be inside the scientific project: %s\n' "$label" "$canonical_path" >&2
+      exit 2
+      ;;
+  esac
+}
+assert_external_log_path "Launch log directory" "$LOG_DIR"
+assert_external_log_path "GUI launch log" "$GUI_LOG_PATH"
+assert_external_log_path "Supervisor launch log" "$SUPERVISOR_LOG_PATH"
+
 mkdir -p "$LOG_DIR" "$(dirname "$GUI_LOG_PATH")" "$(dirname "$SUPERVISOR_LOG_PATH")"
 case "$LAUNCH_TIMEOUT_S" in
   ''|*[!0-9]*)
@@ -64,6 +107,7 @@ SQUEAKVIEW_LOGFILE="$GUI_LOG_PATH" \
 SQUEAKVIEW_SUPERVISOR_LOGFILE="$SUPERVISOR_LOG_PATH" \
 SQUEAKVIEW_LAUNCH_STATUS_FILE="$LAUNCH_STATUS_PATH" nohup setsid \
   "$PYTHON_BIN" -m squeakview.apps.operator.backend.supervisor \
+  --project "$PROJECT_PATH" \
   --gui-command "$PYTHON_BIN" "$ROOT/squeakview_gui.py" \
   </dev/null >/dev/null 2>&1 &
 supervisor_pid=$!
@@ -88,5 +132,6 @@ fi
 
 launch_complete=1
 printf '[PASS] SqueakView durable supervisor launched (PID %s).\n' "$supervisor_pid"
+printf '       Project: %s\n' "$PROJECT_PATH"
 printf '       GUI log: %s\n' "$GUI_LOG_PATH"
 printf '       Supervisor log: %s\n' "$SUPERVISOR_LOG_PATH"

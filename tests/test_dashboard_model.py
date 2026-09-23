@@ -68,6 +68,31 @@ class DashboardConfigTests(unittest.TestCase):
 
 
 class DashboardEventSemanticsTests(unittest.TestCase):
+    def test_feeder_jam_protocol_classification_is_exact(self) -> None:
+        cases = {
+            "FEED_JAM,100,200,nan,3,69420,69420,69420,Feeding,Pellet did not trigger sensor": dashboard_model.FeederJamEvent.JAMMED,
+            "NACK,FEED,JAMMED": dashboard_model.FeederJamEvent.JAMMED,
+            "ACK_CLEAR_JAM": dashboard_model.FeederJamEvent.CLEAR_ACK,
+            "NACK,CLEAR_JAM,FEED_ACTIVE": dashboard_model.FeederJamEvent.CLEAR_FEED_ACTIVE,
+            "NACK,CLEAR_JAM,NOT_JAMMED": dashboard_model.FeederJamEvent.CLEAR_NOT_JAMMED,
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                event = DashboardEvent.parse(raw)
+                assert event is not None
+                self.assertEqual(dashboard_model.feeder_jam_event(event), expected)
+
+    def test_unrelated_and_plain_feed_stop_events_do_not_change_jam_state(self) -> None:
+        for raw in (
+            "POKE_START,10,20,L,1,30,40,50,Eligible,nan",
+            "FEED_STOP,10,20,nan,1,30,40,50,Feeding,Complete",
+            "NACK,FEED,OTHER",
+        ):
+            with self.subTest(raw=raw):
+                event = DashboardEvent.parse(raw)
+                assert event is not None
+                self.assertIsNone(dashboard_model.feeder_jam_event(event))
+
     def test_typed_event_is_consumed_without_reparsing_raw_line(self) -> None:
         event = DashboardEvent.parse(
             "TASK_INFO,1000000,2000000,L,3,12500,2000500,70,ON,adaptive"

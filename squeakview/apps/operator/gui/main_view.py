@@ -56,6 +56,7 @@ class MainView:
     subject_combo: QtWidgets.QComboBox
     new_subject_btn: QtWidgets.QPushButton
     summary_label: QtWidgets.QLabel
+    clock_labels: dict[str, QtWidgets.QLabel]
     bottle_panel: BottleMeasurementPanel
     task_state_group: QtWidgets.QWidget
     stop_overlay: FinalizationOverlay
@@ -132,7 +133,15 @@ def build_main_view(
     preview_host = AspectRatioPreviewHost(preview, parent=preview_group)
     preview_layout.addWidget(preview_host, 1)
 
-    dashboard = BehaviorDashboard(window_sec=300.0, pellet_mode="auto")
+    dashboard = BehaviorDashboard(
+        window_sec=300.0,
+        pellet_mode="auto",
+        disk_root=(
+            window.project.paths.runs
+            if getattr(window, "project", None) is not None
+            else None
+        ),
+    )
     meters_only = dashboard.detach_meters()
     task_state_panel = dashboard.detach_task_panel()
     meters_group = QtWidgets.QWidget()
@@ -175,6 +184,39 @@ def build_main_view(
     meters_layout.addSpacing(6)
     meters_layout.addWidget(summary_label)
 
+    clock_group = QtWidgets.QWidget(window)
+    clock_group.setObjectName("workspaceCardContent")
+    clock_form = QtWidgets.QFormLayout(clock_group)
+    clock_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+    clock_form.setHorizontalSpacing(10)
+    clock_form.setVerticalSpacing(4)
+    clock_defaults = {
+        "validation_state": "NOT_CHECKED",
+        "ntp_synchronized": "Not checked",
+        "rtc_valid": "Not checked",
+        "median_offset_seconds": "—",
+        "median_round_trip_ms": "—",
+        "correction_state": "Not requested",
+        "validation_timestamp": "—",
+        "evidence_path": "—",
+    }
+    clock_titles = {
+        "validation_state": "Validation",
+        "ntp_synchronized": "Jetson NTP",
+        "rtc_valid": "Controller RTC",
+        "median_offset_seconds": "Median offset",
+        "median_round_trip_ms": "Median RTT",
+        "correction_state": "Correction",
+        "validation_timestamp": "Checked UTC",
+        "evidence_path": "Evidence",
+    }
+    clock_labels: dict[str, QtWidgets.QLabel] = {}
+    for key, initial in clock_defaults.items():
+        label = QtWidgets.QLabel(initial, clock_group)
+        label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        label.setWordWrap(key == "evidence_path")
+        clock_form.addRow(f"{clock_titles[key]}:", label)
+        clock_labels[key] = label
     bottle_panel = BottleMeasurementPanel(window)
     bottle_panel.setTitle("")
     bottle_panel.setProperty("embeddedCard", True)
@@ -229,6 +271,7 @@ def build_main_view(
     event_layout.addLayout(event_actions, 1)
     workspace.add_card("preview", "Live Preview", preview_group)
     workspace.add_card("system", "System Load", meters_group)
+    workspace.add_card("clock", "Clock Preflight", clock_group)
     workspace.add_card("task", "Live Task State", task_state_group)
     workspace.add_card("bottles", "Bottles", bottle_panel)
     workspace.add_card("behavior", "Behavior Dashboard", dashboard_group)
@@ -256,6 +299,7 @@ def build_main_view(
         subject_combo=subject_combo,
         new_subject_btn=new_subject_btn,
         summary_label=summary_label,
+        clock_labels=clock_labels,
         bottle_panel=bottle_panel,
         task_state_group=task_state_group,
         stop_overlay=stop_overlay,

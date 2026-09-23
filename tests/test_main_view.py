@@ -58,7 +58,7 @@ class MainViewTest(unittest.TestCase):
         self.assertIs(self.view.workspace.parent(), self.window)
         self.assertEqual(
             set(self.view.workspace.cards),
-            {"preview", "system", "task", "bottles", "behavior", "events"},
+            {"preview", "system", "clock", "task", "bottles", "behavior", "events"},
         )
         self.assertEqual(self.view.event_log.objectName(), "eventLog")
         self.assertIsInstance(self.view.event_dock, QtWidgets.QDockWidget)
@@ -102,6 +102,7 @@ class MainViewTest(unittest.TestCase):
             {
                 "Live Preview",
                 "System Load",
+                "Clock Preflight",
                 "Live Task State",
                 "Bottles",
                 "Behavior Dashboard",

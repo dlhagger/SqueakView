@@ -54,15 +54,27 @@ class SupervisorEntrypointTests(unittest.TestCase):
             server = mock.Mock()
             server.serve.return_value = 0
             server.last_error = None
+            server.last_warning = None
             socket_path = Path(temp_dir) / "operator.sock"
+            project_path = Path(temp_dir) / "project"
+            project_path.mkdir()
             mirror = mock.Mock()
+            session = mock.Mock()
+            session.project = mock.Mock()
+            user = mock.Mock()
             with (
                 mock.patch.object(entrypoint, "_install_log_mirror", return_value=mirror),
                 mock.patch.object(entrypoint, "SupervisorServer", return_value=server),
+                mock.patch.object(entrypoint.ProjectSession, "open", return_value=session),
+                mock.patch.object(entrypoint.AppPaths, "discover"),
+                mock.patch.object(entrypoint.UserPaths, "discover", return_value=user),
+                mock.patch.object(entrypoint, "RuntimeContext"),
                 mock.patch.object(entrypoint.signal, "signal"),
             ):
                 result = entrypoint.main(
                     [
+                        "--project",
+                        str(project_path),
                         "--socket",
                         str(socket_path),
                         "--gui-command",
@@ -77,12 +89,21 @@ class SupervisorEntrypointTests(unittest.TestCase):
                 on_gui_ready=entrypoint._mark_gui_ready,
             )
             mirror.close.assert_called_once_with()
+            session.close.assert_called_once_with()
 
     def test_early_server_initialization_failure_returns_nonzero(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            project_path = Path(temp_dir) / "project"
+            project_path.mkdir()
             mirror = mock.Mock()
+            session = mock.Mock()
+            session.project = mock.Mock()
             with (
                 mock.patch.object(entrypoint, "_install_log_mirror", return_value=mirror),
+                mock.patch.object(entrypoint.ProjectSession, "open", return_value=session),
+                mock.patch.object(entrypoint.AppPaths, "discover"),
+                mock.patch.object(entrypoint.UserPaths, "discover"),
+                mock.patch.object(entrypoint, "RuntimeContext"),
                 mock.patch.object(
                     entrypoint,
                     "SupervisorServer",
@@ -91,6 +112,8 @@ class SupervisorEntrypointTests(unittest.TestCase):
             ):
                 result = entrypoint.main(
                     [
+                        "--project",
+                        str(project_path),
                         "--socket",
                         str(Path(temp_dir) / "operator.sock"),
                         "--gui-command",
@@ -100,6 +123,7 @@ class SupervisorEntrypointTests(unittest.TestCase):
 
             self.assertEqual(result, 1)
             mirror.close.assert_called_once_with()
+            session.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

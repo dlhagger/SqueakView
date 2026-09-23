@@ -5,6 +5,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from squeakview.common.profiles import ProfileStore
+from squeakview.project import Project
 
 from .dialog_style import (
     DARK_DIALOG_STYLE,
@@ -23,15 +24,17 @@ class SessionLauncherDialog(ExperimentSessionMixin, SubjectSessionMixin, QtWidge
         self,
         parent=None,
         *,
+        project: Project,
         base_config: Optional[dict] = None,
-        profile_store: ProfileStore | None = None,
+        profile_store: ProfileStore,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Start Session")
         self.setModal(True)
         self.setMinimumWidth(640)
+        self.project = project
         self._base_config = dict(base_config or {})
-        self._profile_store = profile_store or ProfileStore()
+        self._profile_store = profile_store
         self._experiments = self._profile_store.list_experiments()
         self._subjects = self._profile_store.list_subjects()
         self._result_config: dict | None = None

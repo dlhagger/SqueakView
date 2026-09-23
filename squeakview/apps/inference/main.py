@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from squeakview import config as squeakview_config
 
 from . import service_maker_runner as runner
 from .contracts import InferenceConfig
@@ -54,7 +53,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    cfg_path = squeakview_config.resolve_workspace_path(args.cfg) if args.cfg else None
+    cfg_path = Path(args.cfg).expanduser().resolve() if args.cfg else None
     config = InferenceConfig(
         cfg_path=cfg_path,
         capture_backend=args.capture_backend,

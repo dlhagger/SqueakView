@@ -70,6 +70,10 @@ enum {
   PROP_METADATA_PROFILE,
   PROP_MAX_CONSECUTIVE_TIMEOUTS,
   PROP_CAPTURE_LOG_PATH,
+  PROP_FRAME_MANIFEST_PATH,
+  PROP_CAMERA_TELEMETRY_PATH,
+  PROP_ERROR_LOG_PATH,
+  PROP_CAMERA_RUNTIME_PATH,
   PROP_FAULT_AFTER_FRAMES,
   PROP_FAULT_KIND,
 };
@@ -95,6 +99,13 @@ struct _GstFlirSpinSrc {
   guint max_consecutive_timeouts;
   gchar* capture_log_path;
   FILE* capture_log;
+  gchar* frame_manifest_path;
+  FILE* frame_manifest;
+  gchar* camera_telemetry_path;
+  FILE* camera_telemetry;
+  gchar* error_log_path;
+  FILE* error_log;
+  gchar* camera_runtime_path;
   guint64 fault_after_frames;
   gchar* fault_kind;
   gboolean fault_injected;
@@ -121,6 +132,7 @@ struct _GstFlirSpinSrc {
   guint64 total_timeouts;
   guint64 total_incomplete;
   guint64 total_frame_gaps;
+  guint64 total_crc_failures;
   guint64 actual_stream_buffer_count;
   gchar* resolved_serial;
   gchar* device_model;
@@ -208,6 +220,44 @@ static std::string json_escape(const std::string& value) {
     }
   }
   return out.str();
+}
+
+static std::string csv_escape(const std::string& value) {
+  if (value.find_first_of(",\"\r\n") == std::string::npos) {
+    return value;
+  }
+  std::ostringstream out;
+  out << '"';
+  for (const char ch : value) {
+    if (ch == '"') {
+      out << "\"\"";
+    } else {
+      out << ch;
+    }
+  }
+  out << '"';
+  return out.str();
+}
+
+static bool write_diagnostic_event(
+    GstFlirSpinSrc* self,
+    const char* event_type,
+    guint64 host_unix_ns,
+    guint64 host_monotonic_ns,
+    const std::string& expected_frame_id,
+    const std::string& actual_frame_id,
+    const std::string& details) {
+  if (!self->error_log) {
+    return true;
+  }
+  std::ostringstream row;
+  row << host_unix_ns << ',' << host_monotonic_ns << ','
+      << event_type << ',' << self->camera_index << ','
+      << expected_frame_id << ',' << actual_frame_id << ','
+      << csv_escape(details) << '\n';
+  const std::string line = row.str();
+  return std::fwrite(line.data(), 1, line.size(), self->error_log) == line.size()
+      && std::fflush(self->error_log) == 0;
 }
 
 static std::optional<std::string> string_get(INodeMap& node_map, const char* node_name) {
@@ -716,6 +766,21 @@ static void close_camera(GstFlirSpinSrc* self) {
     std::fclose(self->capture_log);
     self->capture_log = nullptr;
   }
+  if (self->frame_manifest) {
+    std::fflush(self->frame_manifest);
+    std::fclose(self->frame_manifest);
+    self->frame_manifest = nullptr;
+  }
+  if (self->camera_telemetry) {
+    std::fflush(self->camera_telemetry);
+    std::fclose(self->camera_telemetry);
+    self->camera_telemetry = nullptr;
+  }
+  if (self->error_log) {
+    std::fflush(self->error_log);
+    std::fclose(self->error_log);
+    self->error_log = nullptr;
+  }
 }
 
 static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
@@ -730,6 +795,57 @@ static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
       // Every emitted source buffer is a scientific audit record. Line buffering
       // preserves the ledger tail even when normal pipeline teardown is unavailable.
       std::setvbuf(self->capture_log, nullptr, _IOLBF, 0);
+    }
+    if (self->frame_manifest_path && *self->frame_manifest_path) {
+      self->frame_manifest = std::fopen(self->frame_manifest_path, "w");
+      if (!self->frame_manifest) {
+        error = std::string("Failed to open frame manifest: ") + self->frame_manifest_path;
+        close_camera(self);
+        return FALSE;
+      }
+      // This is the canonical, source-owned frame index.  It is written while
+      // acquisition is active so shutdown never has to reconstruct millions
+      // of frame rows from the verbose JSON capture ledger.
+      std::setvbuf(self->frame_manifest, nullptr, _IOFBF, 1024 * 1024);
+      static constexpr const char* kFrameHeader =
+          "stream_id,camera_serial,deepstream_frame_number,source_sequence_index,source,raw_frame_index,pts_ns,dts_ns,duration_ns,host_monotonic_ns,host_unix_ns,status,camera_frame_id,camera_frame_id_available,stream_frame_id,chunk_frame_id,frame_id_delta_consistent,missing_frames_before,pipeline_missing_frames_before,camera_timestamp_ns,chunk_timestamp_raw,timestamp_increment_ns,gst_pts_ns,timestamp_origin,host_received_monotonic_ns,host_received_unix_ns,copy_complete_monotonic_ns,observer_monotonic_ns,exposure_us,gain_db,black_level,payload_crc_valid,image_status,source_width,source_height,source_pixel_format,metadata_status,inference_admitted\n";
+      if (std::fputs(kFrameHeader, self->frame_manifest) == EOF) {
+        error = std::string("Failed to write frame manifest header: ") + self->frame_manifest_path;
+        close_camera(self);
+        return FALSE;
+      }
+    }
+    if (self->camera_telemetry_path && *self->camera_telemetry_path) {
+      self->camera_telemetry = std::fopen(self->camera_telemetry_path, "w");
+      if (!self->camera_telemetry) {
+        error = std::string("Failed to open camera telemetry: ") + self->camera_telemetry_path;
+        close_camera(self);
+        return FALSE;
+      }
+      std::setvbuf(self->camera_telemetry, nullptr, _IOLBF, 0);
+      static constexpr const char* kTelemetryHeader =
+          "host_unix_ns,host_monotonic_ns,stream_id,camera_serial,source_sequence_index,camera_frame_id,sensor_temperature_c,mainboard_temperature_c,stream_started_frames,stream_delivered_frames,stream_incomplete_frames,stream_lost_frames,stream_dropped_frames,stream_input_buffers,stream_output_buffers\n";
+      if (std::fputs(kTelemetryHeader, self->camera_telemetry) == EOF) {
+        error = std::string("Failed to write camera telemetry header: ") + self->camera_telemetry_path;
+        close_camera(self);
+        return FALSE;
+      }
+    }
+    if (self->error_log_path && *self->error_log_path) {
+      self->error_log = std::fopen(self->error_log_path, "w");
+      if (!self->error_log) {
+        error = std::string("Failed to open camera error log: ") + self->error_log_path;
+        close_camera(self);
+        return FALSE;
+      }
+      std::setvbuf(self->error_log, nullptr, _IOLBF, 0);
+      static constexpr const char* kErrorHeader =
+          "host_unix_ns,host_monotonic_ns,event_type,stream_id,expected_frame_id,actual_frame_id,details\n";
+      if (std::fputs(kErrorHeader, self->error_log) == EOF) {
+        error = std::string("Failed to write camera error header: ") + self->error_log_path;
+        close_camera(self);
+        return FALSE;
+      }
     }
     self->system = new SystemPtr(System::GetInstance());
     self->camera_list = new CameraList((*self->system)->GetCameras());
@@ -761,6 +877,45 @@ static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
 
     configure_camera(self, *self->camera);
     latch_camera_clock(self, *self->camera);
+    if (self->camera_runtime_path && *self->camera_runtime_path) {
+      FILE* runtime = std::fopen(self->camera_runtime_path, "w");
+      if (!runtime) {
+        error = std::string("Failed to open camera runtime metadata: ") + self->camera_runtime_path;
+        close_camera(self);
+        return FALSE;
+      }
+      std::ostringstream document;
+      document << std::setprecision(17)
+          << "{\"schema_version\":\"1.0\",\"metadata_type\":\""
+          << FLIR_FRAME_META_DESCRIPTOR << "\",\"cameras\":[{"
+          << "\"camera_index\":" << self->camera_index
+          << ",\"camera_serial\":\"" << json_escape(self->resolved_serial ? self->resolved_serial : "") << "\""
+          << ",\"device_model\":\"" << json_escape(self->device_model ? self->device_model : "") << "\""
+          << ",\"firmware_version\":\"" << json_escape(self->firmware_version ? self->firmware_version : "") << "\""
+          << ",\"source_width\":" << self->actual_width
+          << ",\"source_height\":" << self->actual_height
+          << ",\"source_pixel_format\":\"" << json_escape(self->actual_pixel_format ? self->actual_pixel_format : "") << "\""
+          << ",\"actual_fps\":" << self->actual_fps
+          << ",\"configured_exposure_us\":" << self->actual_exposure_us
+          << ",\"configured_gain_db\":" << self->actual_gain_db
+          << ",\"configured_stream_buffer_count\":" << self->actual_stream_buffer_count
+          << ",\"timestamp_increment_ns\":" << self->timestamp_increment_ns
+          << ",\"timestamp_latch_available\":" << (self->have_timestamp_latch ? "true" : "false")
+          << ",\"timestamp_latch_raw\":" << (self->have_timestamp_latch ? std::to_string(self->timestamp_latch_value) : "null")
+          << ",\"timestamp_latch_host_monotonic_before_ns\":" << (self->have_timestamp_latch ? std::to_string(self->latch_host_monotonic_before_ns) : "null")
+          << ",\"timestamp_latch_host_monotonic_after_ns\":" << (self->have_timestamp_latch ? std::to_string(self->latch_host_monotonic_after_ns) : "null")
+          << ",\"timestamp_latch_host_unix_before_ns\":" << (self->have_timestamp_latch ? std::to_string(self->latch_host_unix_before_ns) : "null")
+          << ",\"timestamp_latch_host_unix_after_ns\":" << (self->have_timestamp_latch ? std::to_string(self->latch_host_unix_after_ns) : "null")
+          << ",\"enabled_chunks\":\"" << json_escape(self->enabled_chunks ? self->enabled_chunks : "") << "\"}]}\n";
+      const std::string content = document.str();
+      const bool wrote = std::fwrite(content.data(), 1, content.size(), runtime) == content.size();
+      const bool closed = std::fclose(runtime) == 0;
+      if (!wrote || !closed) {
+        error = std::string("Failed to write camera runtime metadata: ") + self->camera_runtime_path;
+        close_camera(self);
+        return FALSE;
+      }
+    }
     self->processor = new ImageProcessor();
     self->processor->SetColorProcessing(Spinnaker::SPINNAKER_COLOR_PROCESSING_ALGORITHM_HQ_LINEAR);
 
@@ -788,6 +943,7 @@ static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
     self->total_timeouts = 0;
     self->total_incomplete = 0;
     self->total_frame_gaps = 0;
+    self->total_crc_failures = 0;
     self->last_telemetry_frame = G_MAXUINT64;
     self->start_time = gst_util_get_timestamp();
     self->frame_duration = !self->trigger && self->actual_fps > 0.0
@@ -880,6 +1036,22 @@ static void gst_flir_spin_src_set_property(GObject* object, guint prop_id, const
       g_free(self->capture_log_path);
       self->capture_log_path = g_value_dup_string(value);
       break;
+    case PROP_FRAME_MANIFEST_PATH:
+      g_free(self->frame_manifest_path);
+      self->frame_manifest_path = g_value_dup_string(value);
+      break;
+    case PROP_CAMERA_TELEMETRY_PATH:
+      g_free(self->camera_telemetry_path);
+      self->camera_telemetry_path = g_value_dup_string(value);
+      break;
+    case PROP_ERROR_LOG_PATH:
+      g_free(self->error_log_path);
+      self->error_log_path = g_value_dup_string(value);
+      break;
+    case PROP_CAMERA_RUNTIME_PATH:
+      g_free(self->camera_runtime_path);
+      self->camera_runtime_path = g_value_dup_string(value);
+      break;
     case PROP_FAULT_AFTER_FRAMES:
       self->fault_after_frames = g_value_get_uint64(value);
       break;
@@ -948,6 +1120,18 @@ static void gst_flir_spin_src_get_property(GObject* object, guint prop_id, GValu
     case PROP_CAPTURE_LOG_PATH:
       g_value_set_string(value, self->capture_log_path);
       break;
+    case PROP_FRAME_MANIFEST_PATH:
+      g_value_set_string(value, self->frame_manifest_path);
+      break;
+    case PROP_CAMERA_TELEMETRY_PATH:
+      g_value_set_string(value, self->camera_telemetry_path);
+      break;
+    case PROP_ERROR_LOG_PATH:
+      g_value_set_string(value, self->error_log_path);
+      break;
+    case PROP_CAMERA_RUNTIME_PATH:
+      g_value_set_string(value, self->camera_runtime_path);
+      break;
     case PROP_FAULT_AFTER_FRAMES:
       g_value_set_uint64(value, self->fault_after_frames);
       break;
@@ -969,6 +1153,10 @@ static void gst_flir_spin_src_finalize(GObject* object) {
   g_free(self->camera_serial);
   g_free(self->metadata_profile);
   g_free(self->capture_log_path);
+  g_free(self->frame_manifest_path);
+  g_free(self->camera_telemetry_path);
+  g_free(self->error_log_path);
+  g_free(self->camera_runtime_path);
   g_free(self->fault_kind);
   g_free(self->resolved_serial);
   g_free(self->device_model);
@@ -1154,6 +1342,21 @@ static GstFlowReturn copy_image_to_buffer(
                 G_TYPE_UINT64,
                 *camera_frame_id,
                 nullptr)));
+    if (!write_diagnostic_event(
+            self,
+            "camera_frame_gap",
+            host_received_unix_ns,
+            host_received_monotonic_ns,
+            std::to_string(expected),
+            std::to_string(*camera_frame_id),
+            std::string("{\"missing_frames\":") +
+                std::to_string(missing_frames_before) + "}")) {
+      GST_ELEMENT_ERROR(
+          self, RESOURCE, WRITE, ("Failed to write camera diagnostic event"),
+          ("path=%s", self->error_log_path ? self->error_log_path : ""));
+      gst_buffer_unref(buffer);
+      return GST_FLOW_ERROR;
+    }
   }
   if (camera_frame_id) {
     self->last_frame_id = *camera_frame_id;
@@ -1224,6 +1427,23 @@ static GstFlowReturn copy_image_to_buffer(
     try {
       crc_valid = image->CheckCRC();
       crc_checked = true;
+      if (!crc_valid) {
+        ++self->total_crc_failures;
+        if (!write_diagnostic_event(
+                self,
+                "payload_crc_failure",
+                host_received_unix_ns,
+                host_received_monotonic_ns,
+                "",
+                camera_frame_id ? std::to_string(*camera_frame_id) : "",
+                "{}")) {
+          GST_ELEMENT_ERROR(
+              self, RESOURCE, WRITE, ("Failed to write camera diagnostic event"),
+              ("path=%s", self->error_log_path ? self->error_log_path : ""));
+          gst_buffer_unref(buffer);
+          return GST_FLOW_ERROR;
+        }
+      }
     } catch (...) {
     }
   }
@@ -1256,6 +1476,41 @@ static GstFlowReturn copy_image_to_buffer(
     stream_input_buffers = integer_get(stream_map, "StreamInputBufferCount");
     stream_output_buffers = integer_get(stream_map, "StreamOutputBufferCount");
     self->last_telemetry_frame = self->frame_count;
+  }
+  if (telemetry_sample && self->camera_telemetry) {
+    const auto uint_field = [](const std::optional<guint64>& value) {
+      return value ? std::to_string(*value) : std::string();
+    };
+    const auto double_field = [](const std::optional<double>& value) {
+      if (!value) {
+        return std::string();
+      }
+      std::ostringstream text;
+      text << std::setprecision(17) << *value;
+      return text.str();
+    };
+    std::ostringstream row;
+    row << host_received_unix_ns << ',' << host_received_monotonic_ns << ','
+        << self->camera_index << ','
+        << csv_escape(self->resolved_serial ? self->resolved_serial : "") << ','
+        << self->frame_count << ',' << uint_field(camera_frame_id) << ','
+        << double_field(sensor_temperature_c) << ','
+        << double_field(mainboard_temperature_c) << ','
+        << uint_field(stream_started_frames) << ','
+        << uint_field(stream_delivered_frames) << ','
+        << uint_field(stream_incomplete_frames) << ','
+        << uint_field(stream_lost_frames) << ','
+        << uint_field(stream_dropped_frames) << ','
+        << uint_field(stream_input_buffers) << ','
+        << uint_field(stream_output_buffers) << '\n';
+    const std::string line = row.str();
+    if (std::fwrite(line.data(), 1, line.size(), self->camera_telemetry) != line.size()) {
+      GST_ELEMENT_ERROR(
+          self, RESOURCE, WRITE, ("Failed to write camera telemetry"),
+          ("path=%s", self->camera_telemetry_path ? self->camera_telemetry_path : ""));
+      gst_buffer_unref(buffer);
+      return GST_FLOW_ERROR;
+    }
   }
 
   const auto image_status = image->GetImageStatus();
@@ -1324,6 +1579,7 @@ static GstFlowReturn copy_image_to_buffer(
       << ",\"total_timeouts\":" << self->total_timeouts
       << ",\"total_incomplete\":" << self->total_incomplete
       << ",\"total_frame_gap_events\":" << self->total_frame_gaps
+      << ",\"total_crc_failures\":" << self->total_crc_failures
       << ",\"telemetry_sample\":" << (telemetry_sample ? "true" : "false")
       << ",\"sensor_temperature_c\":" << (sensor_temperature_c ? std::to_string(*sensor_temperature_c) : "null")
       << ",\"mainboard_temperature_c\":" << (mainboard_temperature_c ? std::to_string(*mainboard_temperature_c) : "null")
@@ -1350,6 +1606,73 @@ static GstFlowReturn copy_image_to_buffer(
           WRITE,
           ("Failed to write FLIR capture ledger"),
           ("path=%s", self->capture_log_path ? self->capture_log_path : ""));
+      gst_buffer_unref(buffer);
+      return GST_FLOW_ERROR;
+    }
+  }
+  if (self->frame_manifest) {
+    const auto uint_field = [](const std::optional<guint64>& value) {
+      return value ? std::to_string(*value) : std::string();
+    };
+    const auto double_field = [](const std::optional<double>& value) {
+      if (!value) {
+        return std::string();
+      }
+      std::ostringstream text;
+      text << std::setprecision(17) << *value;
+      return text.str();
+    };
+    std::ostringstream row;
+    row << self->camera_index << ','
+        << csv_escape(self->resolved_serial ? self->resolved_serial : "") << ','
+        << self->frame_count << ','
+        << self->frame_count << ','
+        << "flirspinsrc:" << self->camera_index << ','
+        << self->frame_count << ','
+        << pts << ','
+        << pts << ','
+        << self->frame_duration << ','
+        << host_received_monotonic_ns << ','
+        << host_received_unix_ns << ','
+        << "ok,"
+        << uint_field(camera_frame_id) << ','
+        << (camera_frame_id ? "1" : "0") << ','
+        << uint_field(transport_frame_id) << ','
+        << uint_field(chunk_frame_id) << ','
+        << (frame_id_delta_consistent
+                ? (*frame_id_delta_consistent ? "1" : "0")
+                : "") << ','
+        << missing_frames_before << ','
+        << 0 << ','
+        << uint_field(transport_timestamp_ns) << ','
+        << uint_field(chunk_timestamp_raw) << ','
+        << self->timestamp_increment_ns << ','
+        << pts << ','
+        << timestamp_origin << ','
+        << host_received_monotonic_ns << ','
+        << host_received_unix_ns << ','
+        << copy_complete_monotonic_ns << ','
+        << copy_complete_monotonic_ns << ','
+        << double_field(chunk_exposure_us) << ','
+        << double_field(chunk_gain_db) << ','
+        << double_field(chunk_black_level) << ','
+        << (crc_checked ? (crc_valid ? "1" : "0") : "") << ','
+        << csv_escape(image_status_description ? image_status_description : "") << ','
+        << image->GetWidth() << ','
+        << image->GetHeight() << ','
+        << csv_escape(image->GetPixelFormatName().c_str()) << ','
+        << "ok,"  // metadata_status, inference_admitted
+        << '\n';
+    const std::string line = row.str();
+    const bool flush_due = (self->frame_count + 1) % 100 == 0;
+    if (std::fwrite(line.data(), 1, line.size(), self->frame_manifest) != line.size() ||
+        (flush_due && std::fflush(self->frame_manifest) != 0)) {
+      GST_ELEMENT_ERROR(
+          self,
+          RESOURCE,
+          WRITE,
+          ("Failed to write canonical frame manifest"),
+          ("path=%s", self->frame_manifest_path ? self->frame_manifest_path : ""));
       gst_buffer_unref(buffer);
       return GST_FLOW_ERROR;
     }
@@ -1479,6 +1802,22 @@ static GstFlowReturn gst_flir_spin_src_create(GstPushSrc* push_src, GstBuffer** 
                   G_TYPE_STRING,
                   Spinnaker::Image::GetImageStatusDescription(status),
                   nullptr)));
+      if (!write_diagnostic_event(
+              self,
+              "incomplete_frame",
+              host_received_unix_ns,
+              host_received_monotonic_ns,
+              "",
+              "",
+              std::string("{\"status\":\"") +
+                  json_escape(Spinnaker::Image::GetImageStatusDescription(status)) +
+                  "\"}")) {
+        GST_ELEMENT_ERROR(
+            self, RESOURCE, WRITE, ("Failed to write camera diagnostic event"),
+            ("path=%s", self->error_log_path ? self->error_log_path : ""));
+        image->Release();
+        return GST_FLOW_ERROR;
+      }
       image->Release();
       if (self->drop_incomplete) {
         continue;
@@ -1682,6 +2021,42 @@ static void gst_flir_spin_src_class_init(GstFlirSpinSrcClass* klass) {
           static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(
       object_class,
+      PROP_FRAME_MANIFEST_PATH,
+      g_param_spec_string(
+          "frame-manifest-path",
+          "Frame manifest path",
+          "Canonical CSV frame index written for every source buffer before downstream delivery",
+          "",
+          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      object_class,
+      PROP_CAMERA_TELEMETRY_PATH,
+      g_param_spec_string(
+          "camera-telemetry-path",
+          "Camera telemetry path",
+          "Low-rate CSV camera and transport telemetry written live during acquisition",
+          "",
+          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      object_class,
+      PROP_ERROR_LOG_PATH,
+      g_param_spec_string(
+          "error-log-path",
+          "Camera error log path",
+          "CSV camera integrity events written live during acquisition",
+          "",
+          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      object_class,
+      PROP_CAMERA_RUNTIME_PATH,
+      g_param_spec_string(
+          "camera-runtime-path",
+          "Camera runtime metadata path",
+          "JSON snapshot of the resolved camera identity and acquisition configuration",
+          "",
+          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      object_class,
       PROP_FAULT_AFTER_FRAMES,
       g_param_spec_uint64(
           "fault-after-frames",
@@ -1736,6 +2111,13 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   self->max_consecutive_timeouts = DEFAULT_MAX_CONSECUTIVE_TIMEOUTS;
   self->capture_log_path = g_strdup("");
   self->capture_log = nullptr;
+  self->frame_manifest_path = g_strdup("");
+  self->frame_manifest = nullptr;
+  self->camera_telemetry_path = g_strdup("");
+  self->camera_telemetry = nullptr;
+  self->error_log_path = g_strdup("");
+  self->error_log = nullptr;
+  self->camera_runtime_path = g_strdup("");
   self->fault_after_frames = 0;
   self->fault_kind = g_strdup("");
   self->fault_injected = FALSE;
@@ -1761,6 +2143,7 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   self->total_timeouts = 0;
   self->total_incomplete = 0;
   self->total_frame_gaps = 0;
+  self->total_crc_failures = 0;
   self->actual_stream_buffer_count = 0;
   self->resolved_serial = g_strdup("");
   self->device_model = g_strdup("");

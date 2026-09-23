@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 from pathlib import Path
 
@@ -18,9 +18,7 @@ MAX_CLASS_LABEL_BYTES = 1024 * 1024
 class InferenceConfig:
     """CLI-compatible configuration validated before pipeline construction."""
 
-    cfg_path: Path | None = field(
-        default_factory=lambda: Path.cwd() / "config_infer_primary_11m.txt"
-    )
+    cfg_path: Path | None = None
     capture_backend: str = "flir_direct"
     num_cameras: int = 1
     camera_serials: tuple[str, ...] = ()

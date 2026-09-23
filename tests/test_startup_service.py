@@ -46,6 +46,17 @@ class _Serial:
         self.events.append(f"serial-negotiate:{requested_lease_ms}:{timeout_s}")
         return object()
 
+    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None:
+        self.events.append(f"serial-negotiate-v2:{timeout_s}")
+
+    def exchange_time_sync(
+        self, sequence: int, jetson_send_ns: int, *, timeout_s: float
+    ) -> tuple[str, int]:
+        raise AssertionError("clock transport should be owned by validate_clock hook")
+
+    def exchange_set_rtc(self, unix_seconds: int, *, timeout_s: float) -> str:
+        raise AssertionError("clock transport should be owned by validate_clock hook")
+
 
 class StartupServiceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -82,7 +93,9 @@ class StartupServiceTests(unittest.TestCase):
 
         return startup.StartupHooks(
             log=lambda message: self.events.append(f"log:{message}"),
-            resolve_workspace_path=lambda path: Path(path).resolve(),
+            resolve_task_path=lambda path: Path(path).resolve(),
+            resolve_model_path=lambda path: Path(path).resolve(),
+            resolve_failure_plan_path=lambda path: Path(path).resolve(),
             load_failure_plan=lambda _path: (_ for _ in ()).throw(AssertionError("unexpected failure plan")),
             validate_model=lambda _path: (_ for _ in ()).throw(AssertionError("unexpected model")),
             assert_storage_ready=lambda: self.events.append("storage") or {"free_bytes": 1_000_000},
@@ -100,6 +113,8 @@ class StartupServiceTests(unittest.TestCase):
             create_serial=lambda _cfg, _plan: self.events.append("serial-create") or self.serial,
             set_serial=lambda handle: self.events.append(f"serial-set:{handle is not None}"),
             arm_serial_runtime=lambda: self.events.append("serial-arm"),
+            validate_clock=lambda _handle, _prepared: self.events.append("clock-validate")
+            or {"result": "PASS", "reason": "CLOCK_WITHIN_TOLERANCE"},
             spawn_capture=lambda _cfg: self.events.append("capture-spawn") or self.capture,
             set_capture=lambda handle: self.events.append(f"capture-set:{handle is not None}"),
             after_capture_spawn=lambda _run: self.events.append("capture-barrier"),
@@ -144,6 +159,7 @@ class StartupServiceTests(unittest.TestCase):
             "serial-set:True",
             "serial-open",
             "serial-arm",
+            "clock-validate",
             "capture-spawn",
             "capture-set:True",
             "ready-wait:30.0",
@@ -182,6 +198,80 @@ class StartupServiceTests(unittest.TestCase):
             self.events.index("capture-spawn"),
         )
         self.assertIn("serial-marker:WATCHDOG_V1_NEGOTIATED", self.events)
+
+    def test_v2_negotiates_before_clock_and_capture_spawn(self) -> None:
+        result = startup.start_run(
+            startup.StartupRequest(
+                RunRequest(
+                    task_cfg=self.task,
+                    inference_enabled=False,
+                    serial_enabled=True,
+                    trigger_on=True,
+                    controller_protocol="v2",
+                ),
+                False,
+            ),
+            self.hooks(),
+        )
+
+        self.assertTrue(result.started)
+        self.assertLess(
+            self.events.index("serial-negotiate-v2:3.0"),
+            self.events.index("clock-validate"),
+        )
+        self.assertLess(
+            self.events.index("serial-negotiate-v2:3.0"),
+            self.events.index("capture-spawn"),
+        )
+        self.assertIn("serial-marker:PROTOCOL_V2_NEGOTIATED", self.events)
+
+    def test_v2_negotiation_failure_blocks_clock_and_capture(self) -> None:
+        self.serial.negotiate_protocol_v2 = lambda **_kwargs: (  # type: ignore[method-assign]
+            (_ for _ in ()).throw(RuntimeError("unsupported controller"))
+        )
+
+        result = startup.start_run(
+            startup.StartupRequest(
+                RunRequest(
+                    task_cfg=self.task,
+                    inference_enabled=False,
+                    serial_enabled=True,
+                    trigger_on=True,
+                ),
+                False,
+            ),
+            self.hooks(),
+        )
+
+        self.assertFalse(result.started)
+        self.assertIn("protocol-v2 negotiation failed", result.error or "")
+        self.assertNotIn("clock-validate", self.events)
+        self.assertNotIn("capture-spawn", self.events)
+
+    def test_clock_preflight_failure_blocks_capture_and_controller_start(self) -> None:
+        hooks = replace(
+            self.hooks(),
+            validate_clock=lambda _handle, _prepared: {
+                "result": "FAIL",
+                "reason": "JETSON_NTP_NOT_SYNCHRONIZED",
+            },
+        )
+        result = startup.start_run(
+            startup.StartupRequest(
+                RunRequest(
+                    task_cfg=self.task,
+                    inference_enabled=False,
+                    serial_enabled=True,
+                    trigger_on=True,
+                ),
+                False,
+            ),
+            hooks,
+        )
+        self.assertFalse(result.started)
+        self.assertIn("JETSON_NTP_NOT_SYNCHRONIZED", result.error or "")
+        self.assertNotIn("capture-spawn", self.events)
+        self.assertFalse(any(item.startswith("serial-send:START") for item in self.events))
 
     def test_experimental_watchdog_negotiation_failure_prevents_capture(self) -> None:
         self.serial.negotiate_watchdog_v1 = lambda **_kwargs: (_ for _ in ()).throw(
@@ -348,7 +438,7 @@ class StartupServiceTests(unittest.TestCase):
         )
 
         self.assertFalse(result.started)
-        self.assertIn("build_engine/build_engine.ipynb", result.error)
+        self.assertIn("Project Setup", result.error)
         self.assertNotIn("storage", self.events)
         self.assertNotIn("lock-acquire", self.events)
 

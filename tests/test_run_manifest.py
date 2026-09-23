@@ -35,7 +35,11 @@ class RunManifestServiceTests(unittest.TestCase):
                 experiment_name="study",
                 mouse_id="mouse-1",
             ),
-            workspace=self.root,
+            application_root=self.root,
+            project_root=self.root,
+            project_id="00000000-0000-0000-0000-000000000001",
+            project_name="Test",
+            runs_root=self.root,
             created_at="2026-09-02T10:00:00",
             storage={"free_bytes": 1234},
             model_snapshot=None,
@@ -92,6 +96,17 @@ class RunManifestServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(result["created_at"], "2026-09-02T10:00:00")
+        self.assertEqual(result["schema_version"], "3.0")
+        self.assertEqual(result["application"], {"root": str(self.root)})
+        self.assertNotIn("workspace", result)
+        self.assertEqual(
+            result["project"],
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "Test",
+                "root": str(self.root),
+            },
+        )
         self.assertEqual(result["platform"], {"jetson_model": "test-device"})
         self.assertEqual(result["git"], {"commit": "abc", "dirty": False})
         self.assertEqual(result["storage"]["free_bytes"], 1234)
@@ -127,7 +142,53 @@ class RunManifestServiceTests(unittest.TestCase):
         self.assertEqual(result["actual_outputs"], {"inventory": "snapshot"})
         self.assertEqual(result["bottles"], {"complete": True})
 
-    def test_triggered_serial_capture_declares_alignment_output(self) -> None:
+    def test_legacy_triggered_serial_capture_declares_alignment_output(self) -> None:
+        context = replace(
+            self.context,
+            config=replace(
+                self.context.config,
+                serial_enabled=True,
+                trigger_on=True,
+                controller_protocol="legacy",
+            ),
+        )
+
+        result = self.service.build(
+            self.run_dir,
+            context,
+            output_snapshot=lambda _path: {},
+            bottle_snapshot=lambda _path: {},
+        )
+
+        self.assertTrue(result["serial"]["alignment_required"])
+        self.assertEqual(
+            result["expected_outputs"]["alignment_summary"],
+            "alignment_summary.json",
+        )
+        self.assertIn(
+            "controller_protocol_not_v2",
+            result["production_disqualifiers"],
+        )
+
+    def test_v2_manifest_embeds_final_transport_summary(self) -> None:
+        diagnostics = self.run_dir / "diagnostics"
+        diagnostics.mkdir()
+        summary = {
+            "schema_version": 1,
+            "protocol": "mousehouse_v2",
+            "boot_id": 99,
+            "session_id": 2,
+            "integrity_latched": False,
+            "counts": {
+                "frames_received": 12,
+                "frames_stored": 12,
+                "duplicates": 0,
+            },
+        }
+        run_context.atomic_write_json(
+            diagnostics / "controller_v2_summary.json",
+            summary,
+        )
         context = replace(
             self.context,
             config=replace(
@@ -144,10 +205,12 @@ class RunManifestServiceTests(unittest.TestCase):
             bottle_snapshot=lambda _path: {},
         )
 
-        self.assertTrue(result["serial"]["alignment_required"])
-        self.assertEqual(
-            result["expected_outputs"]["alignment_summary"],
-            "alignment_summary.json",
+        self.assertEqual(result["serial"]["controller_protocol"], "v2")
+        self.assertFalse(result["serial"]["alignment_required"])
+        self.assertEqual(result["serial"]["v2_transport"], summary)
+        self.assertNotIn(
+            "controller_protocol_not_v2",
+            result["production_disqualifiers"],
         )
 
     def test_build_persists_qualification_case_binding(self) -> None:
@@ -183,7 +246,11 @@ class RunManifestServiceTests(unittest.TestCase):
                 inference_enabled=True,
                 serial_enabled=False,
             ),
-            workspace=self.context.workspace,
+            application_root=self.context.application_root,
+            project_root=self.context.project_root,
+            project_id=self.context.project_id,
+            project_name=self.context.project_name,
+            runs_root=self.context.runs_root,
             created_at=self.context.created_at,
             storage=self.context.storage,
             model_snapshot=model_snapshot,
@@ -260,7 +327,7 @@ class RunManifestServiceTests(unittest.TestCase):
         )
         self.assertNotEqual(
             result["native_plugins"]["deepstream_yolo_parser"]["sha256"],
-            result["native_plugins"]["workspace_deepstream_yolo_parser_build"]["sha256"],
+            result["native_plugins"]["application_deepstream_yolo_parser_build"]["sha256"],
         )
         self.assertEqual(result["capture"]["exposure_us"], 4321.0)
         self.assertEqual(
@@ -285,7 +352,11 @@ class RunManifestServiceTests(unittest.TestCase):
                 inference_enabled=False,
                 task_cfg=source,
             ),
-            workspace=self.context.workspace,
+            application_root=self.context.application_root,
+            project_root=self.context.project_root,
+            project_id=self.context.project_id,
+            project_name=self.context.project_name,
+            runs_root=self.context.runs_root,
             created_at=self.context.created_at,
             storage=self.context.storage,
             model_snapshot=None,
@@ -318,7 +389,11 @@ class RunManifestServiceTests(unittest.TestCase):
     def test_in_process_owner_is_explicitly_nonproduction(self) -> None:
         context = RunManifestContext(
             config=self.context.config,
-            workspace=self.context.workspace,
+            application_root=self.context.application_root,
+            project_root=self.context.project_root,
+            project_id=self.context.project_id,
+            project_name=self.context.project_name,
+            runs_root=self.context.runs_root,
             created_at=self.context.created_at,
             storage=self.context.storage,
             model_snapshot=None,
@@ -343,7 +418,7 @@ class RunManifestServiceTests(unittest.TestCase):
 
     def test_terminal_update_preserves_acquisition_provenance(self) -> None:
         original = {
-            "schema_version": "2.0",
+            "schema_version": "3.0",
             "created_at": "original-time",
             "platform": {"jetson_model": "original-device"},
             "git": {"commit": "original", "dirty": False},
@@ -445,7 +520,11 @@ class RunManifestServiceTests(unittest.TestCase):
         plan = FailurePlan("1.0", "serial_controller", "read_error", 10)
         context = RunManifestContext(
             config=self.context.config,
-            workspace=self.context.workspace,
+            application_root=self.context.application_root,
+            project_root=self.context.project_root,
+            project_id=self.context.project_id,
+            project_name=self.context.project_name,
+            runs_root=self.context.runs_root,
             created_at=self.context.created_at,
             storage=self.context.storage,
             model_snapshot=None,

@@ -102,7 +102,12 @@ class QualificationMatrixTests(unittest.TestCase):
         (run_dir / "run_manifest.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "2.0",
+                    "schema_version": "3.0",
+                    "project": {
+                        "id": "00000000-0000-0000-0000-000000000001",
+                        "name": "Qualification",
+                        "root": str(run_dir.parent),
+                    },
                     "production_eligible": production_eligible,
                     "platform": {
                         "device_model": "NVIDIA Jetson Orin Nano Super",

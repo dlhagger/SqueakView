@@ -127,6 +127,8 @@ class ExperimentSessionMixin:
         draft["experiment_mode"] = "sandbox"
         config_dialog = _create_config_dialog(
             self,
+            project=self.project,
+            profile_store=self._profile_store,
             title=f"Experiment Defaults: {name_dialog.experiment_name}",
             config=draft,
             show_session_setup=False,
@@ -160,6 +162,8 @@ class ExperimentSessionMixin:
         config.update(dict(experiment.config or {}))
         config_dialog = _create_config_dialog(
             self,
+            project=self.project,
+            profile_store=self._profile_store,
             title=f"Edit Experiment Defaults: {experiment.name}",
             config=config,
             show_session_setup=False,
@@ -215,4 +219,3 @@ class ExperimentSessionMixin:
         self._reload_profiles()
         self._remove_experiment_references(experiment.slug)
         self._reload_profiles()
-

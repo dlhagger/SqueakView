@@ -10,31 +10,26 @@ INFERENCE_ENABLED="${INFERENCE_ENABLED:-1}"
 SERIAL_ENABLED="${SERIAL_ENABLED:-0}"
 SERIAL_PORT="${SERIAL_PORT:-/dev/ttyACM0}"
 CFG="${DS_CFG:-${SQUEAKVIEW_DS_CFG:-}}"
-if [ -z "$CFG" ] && [ -n "${SQUEAKVIEW_MODEL_NAME:-}" ]; then
-  CFG="models/${SQUEAKVIEW_MODEL_NAME}/configs/${SQUEAKVIEW_MODEL_NAME}.txt"
+PROJECT_ROOT="${SQUEAKVIEW_PROJECT:-}"
+if [ -z "$CFG" ] && [ -n "${SQUEAKVIEW_MODEL_NAME:-}" ] && [ -n "$PROJECT_ROOT" ]; then
+  CFG="$PROJECT_ROOT/models/${SQUEAKVIEW_MODEL_NAME}/configs/${SQUEAKVIEW_MODEL_NAME}.txt"
 fi
 
-resolve_repo_path() {
+resolve_project_path() {
   local raw="$1"
   if [ -z "$raw" ]; then
     return 0
   fi
   case "$raw" in
     /*)
-      if [ -e "$raw" ]; then
-        printf '%s\n' "$raw"
-      elif [[ "$raw" == */models/* ]]; then
-        printf '%s/models/%s\n' "$ROOT" "${raw#*/models/}"
-      elif [[ "$raw" == */native/* ]]; then
-        printf '%s/native/%s\n' "$ROOT" "${raw#*/native/}"
-      elif [[ "$raw" == */tasks/* ]]; then
-        printf '%s/tasks/%s\n' "$ROOT" "${raw#*/tasks/}"
-      else
-        printf '%s\n' "$raw"
-      fi
+      printf '%s\n' "$raw"
       ;;
     *)
-      printf '%s/%s\n' "$ROOT" "$raw"
+      if [ -z "$PROJECT_ROOT" ]; then
+        printf '[FAIL] Relative scientific paths require SQUEAKVIEW_PROJECT.\n' >&2
+        return 1
+      fi
+      printf '%s/%s\n' "$PROJECT_ROOT" "$raw"
       ;;
   esac
 }
@@ -51,57 +46,11 @@ esac
 
 if [ "$INFERENCE_ENABLED" -eq 1 ] && [ -z "$CFG" ]; then
   printf '[FAIL] Inference is enabled but no model was selected.\n'
-  printf '       Set DS_CFG=models/<model_name>/configs/<model_name>.txt\n'
-  printf '       or set SQUEAKVIEW_MODEL_NAME=<model_name>.\n'
+  printf '       Select a model in the open SqueakView project.\n'
   exit 1
 fi
 
-CFG="$(resolve_repo_path "$CFG")"
-CFG_DIR=""
-CFG_STEM=""
-MODEL_DIR=""
-POSE_META=""
-ENGINE=""
-PARSER=""
-CLASS_LABELS=""
-KEYPOINT_LABELS=""
-if [ "$INFERENCE_ENABLED" -eq 1 ]; then
-  CFG_DIR="$(cd "$(dirname "$CFG")" 2>/dev/null && pwd)"
-  CFG_STEM="$(basename "$CFG" .txt)"
-  MODEL_DIR="$(cd "$CFG_DIR/.." 2>/dev/null && pwd)"
-  POSE_META="$CFG_DIR/$CFG_STEM.pose.json"
-fi
-
-cfg_value() {
-  local key="$1"
-  awk -F= -v key="$key" '
-    $1 == key {
-      sub(/^[[:space:]]+/, "", $2)
-      sub(/[[:space:]]+$/, "", $2)
-      print $2
-      exit
-    }
-  ' "$CFG"
-}
-
-resolve_infer_path() {
-  local raw="$1"
-  if [ -z "$raw" ]; then
-    return 0
-  fi
-  case "$raw" in
-    /*) resolve_repo_path "$raw" ;;
-    *) printf '%s/%s\n' "$CFG_DIR" "$raw" ;;
-  esac
-}
-
-if [ "$INFERENCE_ENABLED" -eq 1 ]; then
-  ENGINE="$(resolve_infer_path "$(cfg_value model-engine-file)")"
-  PARSER="$(resolve_infer_path "$(cfg_value custom-lib-path)")"
-  CLASS_LABELS="$(resolve_infer_path "$(cfg_value labelfile-path)")"
-  KEYPOINT_LABELS="$MODEL_DIR/labels/labels.txt"
-fi
-
+CFG="$(resolve_project_path "$CFG")" || exit 1
 fail=0
 
 pass() {
@@ -334,10 +283,14 @@ check_ffmpeg_decode_path
 if [ "$CAPTURE_BACKEND" = "flir_direct" ]; then
   if gst-inspect-1.0 flirspinsrc >/dev/null 2>&1; then
     pass "GStreamer element 'flirspinsrc' is available"
-    if gst-inspect-1.0 flirspinsrc 2>/dev/null | grep -q 'capture-log-path'; then
-      pass "GStreamer element 'flirspinsrc' supports the source capture ledger"
+    FLIR_PROPERTIES="$(gst-inspect-1.0 flirspinsrc 2>/dev/null)"
+    if printf '%s' "$FLIR_PROPERTIES" | grep -q 'frame-manifest-path' \
+      && printf '%s' "$FLIR_PROPERTIES" | grep -q 'camera-telemetry-path' \
+      && printf '%s' "$FLIR_PROPERTIES" | grep -q 'error-log-path' \
+      && printf '%s' "$FLIR_PROPERTIES" | grep -q 'camera-runtime-path'; then
+      pass "GStreamer element 'flirspinsrc' supports live scientific ledgers"
     else
-      printf '[FAIL] flirspinsrc is stale: capture-log-path is unavailable\n'
+      printf '[FAIL] flirspinsrc is stale: live frame/diagnostic outputs are unavailable\n'
       fail=1
     fi
   else

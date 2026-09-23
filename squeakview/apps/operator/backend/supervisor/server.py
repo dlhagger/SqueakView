@@ -24,6 +24,7 @@ from squeakview.apps.operator.backend.events import BackendEvent, RunPhase
 from squeakview.apps.operator.backend import manifest
 from squeakview.apps.operator.backend.manager import OperatorBackend
 from squeakview.common.dashboard import DashboardEvent
+from squeakview.project import PROJECT_ENV, RuntimeContext
 
 from .protocol import (
     CommandEnvelope,
@@ -50,6 +51,7 @@ _STRING_TUPLE_FIELDS = {"camera_serials"}
 _MUTATING_COMMANDS = {
     "start_run",
     "stop_run",
+    "clear_feeder_jam",
     "save_bottle_measurements",
     "shutdown_server",
 }
@@ -91,7 +93,13 @@ def _request_from_payload(payload: Mapping[str, object]) -> RunRequest:
         if missing:
             problems.append(f"missing fields: {', '.join(missing)}")
         raise ValueError("run configuration must contain exact fields; " + "; ".join(problems))
-    bool_fields = {"trigger_on", "inference_enabled", "serial_enabled", "preview_enabled"}
+    bool_fields = {
+        "trigger_on",
+        "inference_enabled",
+        "serial_enabled",
+        "allow_rtc_correction",
+        "preview_enabled",
+    }
     for name in bool_fields:
         if not isinstance(payload[name], bool):
             raise ValueError(f"run configuration {name} must be boolean")
@@ -173,12 +181,14 @@ class SupervisorServer:
         self,
         socket_path: Path,
         *,
+        runtime_context: RuntimeContext,
         backend_factory: Callable[..., OperatorBackend] = OperatorBackend,
         gui_connect_timeout_s: float = DEFAULT_GUI_CONNECT_TIMEOUT_S,
         gui_lease_timeout_s: float = DEFAULT_GUI_LEASE_TIMEOUT_S,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.socket_path = Path(socket_path).resolve()
+        self.runtime_context = runtime_context
         self._client: socket.socket | None = None
         self._client_lock = threading.Lock()
         self._sequence = 0
@@ -201,6 +211,13 @@ class SupervisorServer:
         self._dropped_lock = threading.Lock()
         self._loss_thread: threading.Thread | None = None
         self._operation_lock = threading.Lock()
+        self._async_stop_lock = threading.Lock()
+        self._async_stop_thread: threading.Thread | None = None
+        # Once Stop has been accepted, acquisition shutdown and finalization
+        # are owned by the supervisor rather than by the GUI connection.  A
+        # presentation-channel failure after this point must not invalidate an
+        # otherwise sound scientific run.
+        self._stop_accepted = threading.Event()
         self._mutation_ledger: OrderedDict[
             str, tuple[str, Mapping[str, object], bool]
         ] = OrderedDict()
@@ -209,9 +226,11 @@ class SupervisorServer:
         self.gui_lease_timeout_s = max(1.0, float(gui_lease_timeout_s))
         self._monotonic = monotonic
         self.last_error: str | None = None
+        self.last_warning: str | None = None
         self.backend = backend_factory(
             self._emit_log,
             self._emit_dashboard,
+            runtime_context=runtime_context,
             acquisition_owner=manifest.DURABLE_SUPERVISOR_OWNER,
         )
         self.backend.subscribe(self._emit_backend_event)
@@ -270,7 +289,13 @@ class SupervisorServer:
         )
 
     def _sender(self, client: socket.socket) -> None:
-        writer = SocketEnvelopeWriter(client)
+        # The socket's 250 ms timeout belongs to the receive loop so heartbeat
+        # expiry is noticed promptly. Outbound traffic receives the complete
+        # GUI lease interval before the connection is declared lost.
+        writer = SocketEnvelopeWriter(
+            client,
+            send_timeout_s=self.gui_lease_timeout_s,
+        )
         while not self._stopping.is_set():
             item: _Outbound | None = None
             try:
@@ -299,8 +324,12 @@ class SupervisorServer:
                 )
                 if item.sent is not None:
                     item.sent.set()
-            except (OSError, ProtocolError):
-                self._signal_client_loss("supervisor IPC send failed")
+            except (OSError, ProtocolError) as exc:
+                detail = str(exc).strip() or repr(exc)
+                self._signal_client_loss(
+                    "supervisor IPC send failed: "
+                    f"{type(exc).__name__}: {detail}"
+                )
                 return
 
     def _snapshot(self) -> dict[str, object]:
@@ -340,6 +369,46 @@ class SupervisorServer:
         self._renew_gui_lease()
         return True
 
+    def _run_async_stop(self) -> None:
+        """Own one complete stop without occupying the IPC command worker."""
+
+        try:
+            self.backend.stop_run()
+        except Exception as exc:
+            error = f"asynchronous stop failed: {type(exc).__name__}: {exc}"
+            self._emit_log(f"[SUPERVISOR] {error}")
+            try:
+                self.backend.abort_run(error)
+            except Exception as abort_exc:
+                self._emit_log(
+                    "[SUPERVISOR] asynchronous stop recovery failed: "
+                    f"{type(abort_exc).__name__}: {abort_exc}"
+                )
+
+    def _request_async_stop(self) -> bool:
+        """Start finalization once and return without waiting for completion."""
+
+        with self._async_stop_lock:
+            existing = self._async_stop_thread
+            if existing is not None and existing.is_alive():
+                return False
+            if self.backend.snapshot().phase in {RunPhase.IDLE, RunPhase.FINALIZED, RunPhase.FAILED}:
+                return False
+            worker = threading.Thread(
+                target=self._run_async_stop,
+                name="squeakview-supervisor-stop",
+                daemon=False,
+            )
+            self._async_stop_thread = worker
+            self._stop_accepted.set()
+            try:
+                worker.start()
+            except Exception:
+                self._stop_accepted.clear()
+                self._async_stop_thread = None
+                raise
+            return True
+
     def _dispatch(self, command: CommandEnvelope) -> tuple[object, bool]:
         payload = command.payload
         if command.name == "ping":
@@ -350,6 +419,7 @@ class SupervisorServer:
             config_payload = payload.get("config", payload)
             if not isinstance(config_payload, Mapping):
                 raise ValueError("start_run config must be an object")
+            self._stop_accepted.clear()
             started = self.backend.start_run(_request_from_payload(config_payload))
             return {
                 "started": started,
@@ -357,8 +427,10 @@ class SupervisorServer:
                 "snapshot": self._snapshot(),
             }, False
         if command.name == "stop_run":
-            self.backend.stop_run()
-            return {"snapshot": self._snapshot()}, False
+            accepted = self._request_async_stop()
+            return {"accepted": accepted, "snapshot": self._snapshot()}, False
+        if command.name == "clear_feeder_jam":
+            return {"response": self.backend.clear_feeder_jam()}, False
         if command.name == "save_bottle_measurements":
             bottles = payload.get("bottles")
             if bottles is not None and not isinstance(bottles, Mapping):
@@ -471,18 +543,27 @@ class SupervisorServer:
             self.backend.abort_run("operator GUI lost")
 
     def _signal_client_loss(self, error: str | None = None) -> None:
+        stop_already_accepted = self._stop_accepted.is_set()
         with self._loss_lock:
             if (
                 error
                 and not self._graceful_shutdown.is_set()
-                and self.last_error is None
             ):
-                self.last_error = error
+                if stop_already_accepted:
+                    if self.last_warning is None:
+                        self.last_warning = (
+                            f"{error}; operator connection was lost after Stop was "
+                            "accepted, so durable finalization continued"
+                        )
+                elif self.last_error is None:
+                    self.last_error = error
             if self._client_lost.is_set():
                 return
             self._client_lost.set()
         self._stopping.set()
         self._close_client()
+        if stop_already_accepted:
+            return
         self.backend.cancel_operator_lease()
         self._loss_thread = threading.Thread(
             target=self._finalize_client_loss,
@@ -576,6 +657,7 @@ class SupervisorServer:
         listener = self._prepare_listener()
         gui_env = os.environ.copy()
         gui_env[SOCKET_ENV] = str(self.socket_path)
+        gui_env[PROJECT_ENV] = str(self.runtime_context.project.paths.root)
         gui: subprocess.Popen[bytes] | None = None
         worker: threading.Thread | None = None
         client: socket.socket | None = None
@@ -689,6 +771,8 @@ class SupervisorServer:
                     gui.wait(timeout=5.0)
             if self._loss_thread is not None:
                 self._loss_thread.join()
+            if self._async_stop_thread is not None:
+                self._async_stop_thread.join()
             if worker is not None and worker.ident is not None:
                 worker.join()
             self._unlink_owned_socket()

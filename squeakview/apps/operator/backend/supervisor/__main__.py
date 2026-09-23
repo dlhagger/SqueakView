@@ -14,17 +14,39 @@ from typing import Sequence
 
 from .server import SupervisorServer
 from squeakview.common.log_mirror import LineBufferedLogMirror
+from squeakview.project import (
+    AppPaths,
+    ProjectPaths,
+    ProjectSession,
+    RuntimeContext,
+    UserPaths,
+    validate_external_output_path,
+)
 
 
 SUPERVISOR_LOG_ENV = "SQUEAKVIEW_SUPERVISOR_LOGFILE"
 LAUNCH_STATUS_ENV = "SQUEAKVIEW_LAUNCH_STATUS_FILE"
 
 
-def _install_log_mirror() -> LineBufferedLogMirror | None:
+def _install_log_mirror(
+    *, project_root: Path | None = None
+) -> LineBufferedLogMirror | None:
     raw_path = os.environ.get(SUPERVISOR_LOG_ENV, "").strip()
     if not raw_path:
         return None
-    mirror = LineBufferedLogMirror(Path(raw_path), sys.stdout)
+    app = AppPaths.discover()
+    project = (
+        ProjectPaths.from_existing_root(project_root)
+        if project_root is not None
+        else None
+    )
+    path = validate_external_output_path(
+        Path(raw_path),
+        app=app,
+        project=project,
+        label="supervisor launch log",
+    )
+    mirror = LineBufferedLogMirror(path, sys.stdout)
     sys.stdout = mirror
     sys.stderr = mirror
     return mirror
@@ -72,6 +94,12 @@ def _mark_gui_ready() -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--project",
+        type=Path,
+        required=True,
+        help="existing SqueakView project directory to own for this session",
+    )
+    parser.add_argument(
         "--socket",
         type=Path,
         help="private Unix socket path (default: a new mode-0700 runtime directory)",
@@ -88,17 +116,37 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        mirror = _install_log_mirror()
+        mirror = _install_log_mirror(project_root=args.project)
     except Exception as exc:
         print(f"SqueakView supervisor log setup failed: {exc}", file=sys.stderr)
         return 1
+    project_session: ProjectSession | None = None
+    try:
+        app_paths = AppPaths.discover()
+        user_paths = UserPaths.discover()
+        user_paths.validate_for_app(app_paths)
+        requested_project = ProjectPaths.from_existing_root(args.project)
+        app_paths.validate_for_project(requested_project)
+        user_paths.validate_for_project(requested_project)
+        user_paths.ensure()
+        project_session = ProjectSession.open(args.project)
+        runtime_context = RuntimeContext(
+            app=app_paths,
+            project=project_session.project,
+            user=user_paths,
+        )
+    except Exception as exc:
+        print(f"SqueakView project could not be opened: {exc}", file=sys.stderr)
+        if mirror is not None:
+            mirror.close()
+        return 1
+
     runtime_dir: Path | None = None
     if args.socket is None:
-        base = os.environ.get("XDG_RUNTIME_DIR")
         runtime_dir = Path(
             tempfile.mkdtemp(
                 prefix="squeakview-supervisor-",
-                dir=base if base and Path(base).is_dir() else None,
+                dir=runtime_context.user.runtime,
             )
         )
         os.chmod(runtime_dir, 0o700)
@@ -107,7 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         socket_path = args.socket
 
     try:
-        server = SupervisorServer(socket_path)
+        server = SupervisorServer(socket_path, runtime_context=runtime_context)
     except Exception as exc:
         print(f"SqueakView supervisor initialization failed: {exc}", file=sys.stderr)
         if mirror is not None:
@@ -117,6 +165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runtime_dir.rmdir()
             except OSError:
                 pass
+        project_session.close()
         return 1
 
     shutdown_requested = threading.Event()
@@ -145,6 +194,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = 1
         if server.last_error:
             print(f"SqueakView supervisor failed: {server.last_error}", file=sys.stderr)
+        if server.last_warning:
+            print(f"SqueakView supervisor warning: {server.last_warning}", file=sys.stderr)
         return result
     finally:
         watcher_finished.set()
@@ -157,6 +208,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runtime_dir.rmdir()
             except OSError:
                 pass
+        if project_session is not None:
+            project_session.close()
 
 
 if __name__ == "__main__":

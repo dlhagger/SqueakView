@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "owners": {
+    "application": {
+      "mutability": "install_only",
+      "examples": [
+        "squeakview/",
+        "native/",
+        "scripts/",
+        "resources/",
+        "build_engine/"
+      ]
+    },
+    "project": {
+      "mutability": "durable_scientific",
+      "metadata_files": [
+        "squeakview_project.json"
+      ],
+      "session_files": [
+        ".squeakview.lock"
+      ],
+      "relative_roots": [
+        "runs/",
+        "models/",
+        "model_sources/",
+        "tasks/",
+        "profiles/",
+        "qualification/"
+      ]
+    },
+    "user_config": {
+      "mutability": "durable_presentation",
+      "location": "${XDG_CONFIG_HOME:-~/.config}/SqueakView/"
+    },
+    "user_state": {
+      "mutability": "durable_operational",
+      "location": "${XDG_STATE_HOME:-~/.local/state}/SqueakView/"
+    },
+    "runtime": {
+      "mutability": "ephemeral",
+      "location": "${XDG_RUNTIME_DIR}/squeakview/"
+    }
+  },
+  "forbidden_runtime_write_owner": "application"
+}

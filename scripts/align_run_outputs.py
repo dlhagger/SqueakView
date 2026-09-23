@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,26 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from squeakview.common.bounded_input import read_stable_regular_file  # noqa: E402
+from squeakview.common import run_context  # noqa: E402
 from squeakview.common.run_context import atomic_write_json  # noqa: E402
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _latest_run_dir() -> Path | None:
-    marker = _repo_root() / "runs" / ".latest_run"
-    try:
-        text = read_stable_regular_file(
-            marker, max_bytes=4096, label="latest-run marker"
-        ).decode("utf-8", errors="strict").strip()
-    except (OSError, UnicodeDecodeError, ValueError):
-        return None
-    if not text:
-        return None
-    path = Path(text)
-    return path if path.exists() else None
+from squeakview.project import AppPaths, open_project  # noqa: E402
 
 
 def build_alignment(
@@ -69,7 +53,13 @@ def parse_args() -> argparse.Namespace:
         "run_dir",
         nargs="?",
         type=Path,
-        help="Run directory. Defaults to runs/.latest_run.",
+        help="Run directory. Defaults to the active project's latest run.",
+    )
+    parser.add_argument(
+        "--project",
+        type=Path,
+        default=(Path(os.environ["SQUEAKVIEW_PROJECT"]) if os.environ.get("SQUEAKVIEW_PROJECT") else None),
+        help="project used to resolve the latest run when run_dir is omitted",
     )
     parser.add_argument(
         "--out-dir",
@@ -106,10 +96,21 @@ def validation_passed(summary: dict[str, Any]) -> bool:
 
 def main() -> int:
     args = parse_args()
-    run_dir = args.run_dir or _latest_run_dir()
+    project = open_project(args.project) if args.project is not None else None
+    if project is not None:
+        AppPaths.discover().validate_for_project(project.paths)
+    run_dir = args.run_dir or (
+        run_context.latest_run_dir(project.paths.runs) if project is not None else None
+    )
     if run_dir is None:
-        raise SystemExit("No run_dir given and runs/.latest_run is missing")
+        raise SystemExit("No run_dir given and no project latest-run marker is available")
     run_dir = run_dir.resolve()
+    if project is not None:
+        run_dir = project.paths.resolve_path(
+            run_dir,
+            within=project.paths.runs,
+            must_exist=True,
+        )
     out_dir = (args.out_dir or run_dir).resolve()
     summary = build_alignment(
         run_dir,

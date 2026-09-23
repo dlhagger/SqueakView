@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Install SqueakView's OS-level dependencies, build its native components, and
-# grant the desktop user access to USB serial controllers. Run this as the
-# intended desktop user; the script invokes sudo only for privileged steps.
+# Provision OS-level dependencies and serial permissions, then invoke the
+# separate unprivileged native builder. Run this as the intended desktop user;
+# the script invokes sudo only for privileged steps.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_JOBS="${SQUEAKVIEW_BUILD_JOBS:-$(nproc)}"
 
 if [ "$(id -u)" -eq 0 ]; then
   TARGET_USER="${SQUEAKVIEW_DESKTOP_USER:-${SUDO_USER:-}}"
@@ -26,6 +25,52 @@ if ! id "$TARGET_USER" >/dev/null 2>&1; then
   exit 2
 fi
 
+TARGET_USER_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+if [ -z "$TARGET_USER_HOME" ] || [ ! -d "$TARGET_USER_HOME" ]; then
+  printf '[FAIL] Could not resolve the home directory for %s.\n' "$TARGET_USER" >&2
+  exit 2
+fi
+
+PROJECTS_PARENT_RAW="${SQUEAKVIEW_PROJECTS_DIR:-$TARGET_USER_HOME/Documents/SqueakView Projects}"
+case "$PROJECTS_PARENT_RAW" in
+  /*) ;;
+  *)
+    printf '[FAIL] SQUEAKVIEW_PROJECTS_DIR must be an absolute path: %s\n' "$PROJECTS_PARENT_RAW" >&2
+    exit 2
+    ;;
+esac
+if [ -L "$PROJECTS_PARENT_RAW" ] && [ ! -e "$PROJECTS_PARENT_RAW" ]; then
+  printf '[FAIL] Project parent is a dangling symbolic link: %s\n' "$PROJECTS_PARENT_RAW" >&2
+  exit 2
+fi
+PROJECTS_PARENT="$(readlink -m -- "$PROJECTS_PARENT_RAW")"
+case "$PROJECTS_PARENT" in
+  "$ROOT"|"$ROOT"/*)
+    printf '[FAIL] Project parent must be outside the application checkout: %s\n' "$PROJECTS_PARENT" >&2
+    exit 2
+    ;;
+esac
+case "$ROOT" in
+  "$PROJECTS_PARENT"|"$PROJECTS_PARENT"/*)
+    printf '[FAIL] Project parent may not contain the application checkout: %s\n' "$PROJECTS_PARENT" >&2
+    exit 2
+    ;;
+esac
+if [ -L "$PROJECTS_PARENT" ] || { [ -e "$PROJECTS_PARENT" ] && [ ! -d "$PROJECTS_PARENT" ]; }; then
+  printf '[FAIL] Project parent exists but is not a real directory: %s\n' "$PROJECTS_PARENT" >&2
+  exit 2
+elif [ -d "$PROJECTS_PARENT" ]; then
+  printf '[PASS] Existing project parent left unchanged: %s\n' "$PROJECTS_PARENT"
+elif [ "$(id -u)" -eq 0 ]; then
+  TARGET_GROUP="$(id -gn "$TARGET_USER")"
+  install -d -m 0700 -o "$TARGET_USER" -g "$TARGET_GROUP" "$PROJECTS_PARENT"
+  printf '[PASS] Created project parent: %s\n' "$PROJECTS_PARENT"
+else
+  mkdir -p -- "$PROJECTS_PARENT"
+  chmod 0700 "$PROJECTS_PARENT"
+  printf '[PASS] Created project parent: %s\n' "$PROJECTS_PARENT"
+fi
+
 printf 'Configuring this Jetson for SqueakView (desktop user: %s)\n' "$TARGET_USER"
 "${AS_ROOT[@]}" apt-get install -y \
   ffmpeg \
@@ -39,68 +84,22 @@ printf 'Configuring this Jetson for SqueakView (desktop user: %s)\n' "$TARGET_US
   libgstreamer1.0-dev \
   libgstreamer-plugins-base1.0-dev
 
-required_paths=(
-  /opt/spinnaker/include
-  /opt/spinnaker/lib
-  /opt/nvidia/deepstream/deepstream/sources/includes
-  /usr/local/cuda/bin/nvcc
-)
-for path in "${required_paths[@]}"; do
-  if [ ! -e "$path" ]; then
-    printf '[FAIL] Required vendor SDK path is missing: %s\n' "$path" >&2
+if [ "$(id -u)" -eq 0 ]; then
+  if ! command -v runuser >/dev/null 2>&1; then
+    printf '[FAIL] runuser is required to keep native build outputs owned by %s.\n' "$TARGET_USER" >&2
     exit 1
   fi
-done
-
-CUDA_VER="${CUDA_VER:-$(/usr/local/cuda/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1)}"
-if [ -z "$CUDA_VER" ] || [ ! -x "/usr/local/cuda-$CUDA_VER/bin/nvcc" ]; then
-  printf '[FAIL] Could not resolve a versioned CUDA toolkit from nvcc (detected: %s).\n' "${CUDA_VER:-none}" >&2
-  exit 1
+  BUILD_ENV=()
+  for name in CUDA_VER SQUEAKVIEW_BUILD_JOBS SQUEAKVIEW_DEEPSTREAM_SDK GST_PLUGIN_PATH; do
+    if [ -n "${!name:-}" ]; then
+      BUILD_ENV+=("$name=${!name}")
+    fi
+  done
+  runuser -u "$TARGET_USER" -- env "${BUILD_ENV[@]}" \
+    bash "$ROOT/scripts/build_native.sh"
+else
+  bash "$ROOT/scripts/build_native.sh"
 fi
-
-printf 'Building FLIR GStreamer source with %s parallel job(s)...\n' "$BUILD_JOBS"
-cmake \
-  -S "$ROOT/native/flir_gst_source" \
-  -B "$ROOT/native/flir_gst_source/build"
-cmake --build "$ROOT/native/flir_gst_source/build" --parallel "$BUILD_JOBS"
-
-printf 'Building DeepStream YOLO parser against CUDA %s...\n' "$CUDA_VER"
-make \
-  -C "$ROOT/native/nvdsinfer_custom_impl_yolo" \
-  "CUDA_VER=$CUDA_VER" \
-  -j"$BUILD_JOBS"
-
-FLIR_PLUGIN="$ROOT/native/flir_gst_source/build/gstflirspinsrc.so"
-YOLO_PARSER="$ROOT/native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
-for output in "$FLIR_PLUGIN" "$YOLO_PARSER"; do
-  if [ ! -s "$output" ]; then
-    printf '[FAIL] Required native build output is missing or empty: %s\n' "$output" >&2
-    exit 1
-  fi
-  if ldd "$output" 2>/dev/null | grep -q 'not found'; then
-    printf '[FAIL] Native build output has unresolved runtime dependencies: %s\n' "$output" >&2
-    ldd "$output" 2>/dev/null | grep 'not found' >&2 || true
-    exit 1
-  fi
-done
-
-if ! nm -D "$YOLO_PARSER" 2>/dev/null | grep -Eq '[[:space:]]NvDsInferParseYolo26Pose$'; then
-  printf '[FAIL] DeepStream parser is missing required symbol NvDsInferParseYolo26Pose: %s\n' "$YOLO_PARSER" >&2
-  exit 1
-fi
-
-FLIR_INSPECT="$(
-  GST_PLUGIN_PATH="$ROOT/native/flir_gst_source/build:/opt/nvidia/deepstream/deepstream/lib/gst-plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
-    gst-inspect-1.0 flirspinsrc
-)"
-case "$FLIR_INSPECT" in
-  *capture-log-path*) ;;
-  *)
-    printf '[FAIL] Built flirspinsrc is stale: capture-log-path is unavailable.\n' >&2
-    exit 1
-    ;;
-esac
-printf '[PASS] Native FLIR and DeepStream components built successfully.\n'
 
 if ! getent group dialout >/dev/null; then
   printf '[FAIL] The required dialout group does not exist on this system.\n' >&2

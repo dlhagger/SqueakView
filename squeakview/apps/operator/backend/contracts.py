@@ -8,7 +8,6 @@ from typing import Callable, Mapping, Protocol
 
 from squeakview.apps.operator.backend.events import BackendEvent, RunSnapshot
 
-from squeakview import config as squeakview_config
 from squeakview.common.immutable import deep_freeze
 
 
@@ -21,7 +20,7 @@ class RunRequest:
     pixel_format: str | None = "Mono8"
     trigger_on: bool = False
     trigger_activation: str = "rising"
-    ds_cfg: Path | None = squeakview_config.DEFAULT_INFER_CONFIG
+    ds_cfg: Path | None = None
     inference_enabled: bool = True
     num_cameras: int = 1
     camera_serials: tuple[str, ...] = ()
@@ -30,7 +29,8 @@ class RunRequest:
     serial_enabled: bool = True
     serial_port: str = "/dev/ttyACM0"
     serial_baud: int = 115200
-    controller_protocol: str = "legacy"
+    allow_rtc_correction: bool = False
+    controller_protocol: str = "v2"
     controller_watchdog_lease_ms: int = 1500
     arduino_fps: int = 30
     preview_window_id: int | None = None
@@ -82,6 +82,8 @@ class BackendProtocol(Protocol):
     def start_run(self, config: RunRequest) -> bool: ...
 
     def stop_run(self) -> None: ...
+
+    def clear_feeder_jam(self) -> str: ...
 
     def shutdown(self) -> None: ...
 

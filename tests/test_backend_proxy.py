@@ -7,6 +7,7 @@ import stat
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -157,6 +158,22 @@ class SupervisorBackendProxyTest(unittest.TestCase):
         self.assertEqual(proxy.launch_cfg, runtime)
         self.assertEqual(proxy.state.run_dir, Path("/tmp/run-1"))
         self.assertTrue(proxy.state.inference.is_running())
+
+    def test_clear_jam_command_returns_exact_controller_response(self) -> None:
+        proxy = self.proxy()
+
+        def serve() -> None:
+            command = self.fake.receive()
+            self.assertEqual(command.name, "clear_feeder_jam")
+            self.assertEqual(command.payload, {})
+            self.fake.respond(command, {"response": "ACK_CLEAR_JAM"})
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        try:
+            self.assertEqual(proxy.clear_feeder_jam(), "ACK_CLEAR_JAM")
+        finally:
+            thread.join()
 
     def test_malformed_start_snapshot_closes_lease_as_uncertain_active(self) -> None:
         proxy = self.proxy()
@@ -387,6 +404,54 @@ class SupervisorBackendProxyTest(unittest.TestCase):
         self.assertFalse(proxy.state.inference.is_running())
         self.assertTrue(proxy.finalization_in_progress)
 
+    def test_stop_ack_is_async_and_waits_for_terminal_event_without_rpc_timeout(self) -> None:
+        proxy = self.proxy()
+        proxy._apply_phase(RunPhase.RECORDING, Path("/tmp/long-run"))
+        terminal_delay = 0.15
+
+        def serve() -> None:
+            command = self.fake.receive()
+            self.assertEqual(command.name, "stop_run")
+            self.fake.respond(
+                command,
+                {
+                    "accepted": True,
+                    "snapshot": {
+                        "schema_version": "1.0",
+                        "phase": "recording",
+                        "run_dir": "/tmp/long-run",
+                        "error": None,
+                        "capture_running": True,
+                        "finalization_in_progress": False,
+                    },
+                },
+            )
+            time.sleep(terminal_delay)
+            self.fake.event(
+                "backend_event",
+                {
+                    "schema_version": "1.0",
+                    "type": "phase_changed",
+                    "phase": "finalized",
+                    "run_dir": "/tmp/long-run",
+                    "message": None,
+                    "payload": {"previous_phase": "validating"},
+                    "host_unix_ns": 123,
+                },
+            )
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        started = time.monotonic()
+        proxy.stop_run()
+        elapsed = time.monotonic() - started
+        thread.join()
+
+        self.assertGreaterEqual(elapsed, terminal_delay)
+        self.assertFalse(proxy._closed.is_set())
+        self.assertEqual(proxy.current_snapshot.phase, RunPhase.FINALIZED)
+        self.assertFalse(proxy.finalization_in_progress)
+
     def test_shutdown_response_then_eof_is_not_reported_as_connection_loss(self) -> None:
         emit = mock.Mock()
         proxy = SupervisorBackendProxy(Path("/unused.sock"), emit)
@@ -470,6 +535,9 @@ class BackendFactoryPolicyTest(unittest.TestCase):
 
         backend = mock.sentinel.backend
         emit = mock.Mock()
+        project = mock.Mock()
+        project.paths.root = Path("/tmp/test-project")
+        session = mock.Mock(project=project)
         with (
             mock.patch.dict(
                 os.environ,
@@ -479,6 +547,15 @@ class BackendFactoryPolicyTest(unittest.TestCase):
             mock.patch.object(
                 main_window, "OperatorBackend", return_value=backend
             ) as backend_constructor,
+            mock.patch.object(
+                main_window, "project_from_environment", return_value=project
+            ),
+            mock.patch.object(
+                main_window.ProjectSession, "open", return_value=session
+            ),
+            mock.patch.object(main_window.UserPaths, "discover") as user_paths,
+            mock.patch.object(main_window.AppPaths, "discover"),
+            mock.patch.object(main_window, "RuntimeContext"),
         ):
             result = main_window._production_backend_factory(emit)
 
@@ -488,6 +565,7 @@ class BackendFactoryPolicyTest(unittest.TestCase):
             backend_constructor.call_args.kwargs["acquisition_owner"],
             "in_process_dev",
         )
+        user_paths.return_value.ensure.assert_called_once_with()
 
 
 if __name__ == "__main__":

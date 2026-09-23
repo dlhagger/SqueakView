@@ -21,7 +21,7 @@ from squeakview.common.bounded_input import read_json_object, read_stable_regula
 from squeakview.common.device_context import file_identity
 
 
-WORKSPACE = squeakview_config.WORKSPACE
+APPLICATION_ROOT = squeakview_config.APP_ROOT
 
 INFERENCE_ENTRY = "squeakview.apps.inference.main"
 POST_RUN_ENTRY = "squeakview.apps.inference.post_run"
@@ -95,8 +95,7 @@ def _deepstream_runtime_env() -> dict[str, str]:
 def _resolve_infer_config_path(raw: str, config_dir: Path) -> Path:
     path = Path(raw.strip().strip('"')).expanduser()
     if path.is_absolute():
-        resolved = squeakview_config.resolve_workspace_path(path)
-        return resolved if resolved is not None else path
+        return path.resolve()
     return (config_dir / path).resolve()
 
 
@@ -361,7 +360,7 @@ def _spawn(
         args,
         emit,
         name,
-        workspace=WORKSPACE,
+        workspace=APPLICATION_ROOT,
         extra_env=extra_env,
         on_exit=on_exit,
         output_log_path=output_log_path,
@@ -388,9 +387,8 @@ def spawn_inference(
             if Path(config.ds_cfg).expanduser().resolve() != ds_cfg.resolve():
                 raise RuntimeError("capture config does not match prepared DeepStream config")
         else:
-            ds_cfg = squeakview_config.resolve_workspace_path(config.ds_cfg)
-            if ds_cfg is not None:
-                ds_cfg = _localize_deepstream_config(ds_cfg, config.run_dir, emit)
+            ds_cfg = Path(config.ds_cfg).expanduser().resolve()
+            ds_cfg = _localize_deepstream_config(ds_cfg, config.run_dir, emit)
         args += ["--cfg", str(ds_cfg)]
     args += ["--capture-backend", backend]
     args += ["--num-cameras", str(max(1, int(getattr(config, "num_cameras", 1))))]
@@ -492,7 +490,7 @@ def spawn_post_run(
         args.append("--align")
     env = os.environ.copy()
     env.update(_deepstream_runtime_env())
-    package_root = str(WORKSPACE)
+    package_root = str(APPLICATION_ROOT)
     current_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
         f"{package_root}{os.pathsep}{current_pythonpath}"
@@ -506,7 +504,7 @@ def spawn_post_run(
     try:
         return subprocess.Popen(
             args,
-            cwd=str(WORKSPACE),
+            cwd=str(APPLICATION_ROOT),
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             env=env,

@@ -36,6 +36,7 @@ _ACQUISITION_OWNERS = frozenset(
 )
 TASK_CONFIG_SNAPSHOT_PATH = Path("config/task.yaml")
 MAX_TASK_CONFIG_BYTES = 1024 * 1024
+RUN_MANIFEST_SCHEMA_VERSION = "3.0"
 
 
 def _preflight_evidence_valid(value: Mapping[str, object] | None) -> bool:
@@ -154,7 +155,11 @@ class RunManifestContext:
     """Immutable references needed to describe one acquisition run."""
 
     config: RunRequest
-    workspace: Path
+    application_root: Path
+    project_root: Path
+    project_id: str
+    project_name: str
+    runs_root: Path
     created_at: str | None
     storage: Mapping[str, Any]
     model_snapshot: Mapping[str, Any] | None
@@ -164,6 +169,7 @@ class RunManifestContext:
     acquisition_owner: str = IN_PROCESS_DEV_OWNER
     task_config_snapshot: Mapping[str, object] | None = None
     preflight_evidence: Mapping[str, object] | None = None
+    clock_validation: Mapping[str, object] | None = None
     qualification_case: Mapping[str, object] | None = None
     controller_watchdog: Mapping[str, object] | None = None
 
@@ -223,11 +229,11 @@ class RunManifestService:
         return info
 
     @staticmethod
-    def git_snapshot(workspace: Path) -> dict[str, Any]:
+    def git_snapshot(application_root: Path) -> dict[str, Any]:
         try:
             commit = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
-                cwd=str(workspace),
+                cwd=str(application_root),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -235,7 +241,7 @@ class RunManifestService:
             )
             dirty = subprocess.run(
                 ["git", "status", "--short"],
-                cwd=str(workspace),
+                cwd=str(application_root),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -317,10 +323,14 @@ class RunManifestService:
         artifacts = run_context.run_artifacts(run_dir)
         experiment = (cfg.experiment_name or "").strip() or None
         mouse_id = (cfg.mouse_id or "").strip() or None
+        runs_root = Path(context.runs_root).resolve(strict=True)
+        resolved_run_dir = Path(run_dir).resolve(strict=True)
         try:
-            relative_run_dir = run_dir.relative_to(run_context.RUNS_DIR).as_posix()
-        except ValueError:
-            relative_run_dir = str(run_dir)
+            relative_run_dir = resolved_run_dir.relative_to(runs_root).as_posix()
+        except ValueError as exc:
+            raise ValueError(
+                f"run directory is outside the active project: {resolved_run_dir}"
+            ) from exc
         inventory = output_snapshot or self.output_snapshot
         bottles = bottle_snapshot or self.bottle_snapshot
         disqualifiers = production_disqualifiers(
@@ -330,6 +340,16 @@ class RunManifestService:
         )
         if cfg.controller_protocol == "watchdog_v1_experimental":
             disqualifiers = (*disqualifiers, "controller_watchdog_unqualified")
+        if cfg.serial_enabled and cfg.controller_protocol != "v2":
+            disqualifiers = (*disqualifiers, "controller_protocol_not_v2")
+        v2_summary_path = run_dir / "diagnostics" / "controller_v2_summary.json"
+        v2_transport = (
+            run_context.read_json_required(v2_summary_path)
+            if cfg.serial_enabled
+            and cfg.controller_protocol == "v2"
+            and v2_summary_path.exists()
+            else None
+        )
         storage = dict(context.storage)
         storage_policy = resolve_storage_reserve_policy()
         storage["reserve_supervision"] = {
@@ -338,20 +358,25 @@ class RunManifestService:
             "failure_policy": "fatal_graceful_capture_shutdown",
         }
         return {
-            "schema_version": "2.0",
+            "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
             "run_id": run_dir.name,
             "run_directory": str(run_dir),
             "run_directory_relative": relative_run_dir,
             "created_at": context.created_at,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "workspace": str(context.workspace),
+            "application": {"root": str(context.application_root)},
+            "project": {
+                "id": context.project_id,
+                "name": context.project_name,
+                "root": str(context.project_root),
+            },
             "process_topology": {
                 "acquisition_owner": context.acquisition_owner,
             },
             "platform": dict(context.device_context or device_context_snapshot()),
             "native_plugins": {
                 "flir_gstreamer_source": file_identity(
-                    context.workspace
+                    context.application_root
                     / "native/flir_gst_source/build/gstflirspinsrc.so"
                 ),
                 "deepstream_yolo_parser": (
@@ -359,16 +384,16 @@ class RunManifestService:
                     if context.effective_deepstream is not None
                     and isinstance(context.effective_deepstream.get("custom_parser"), Mapping)
                     else file_identity(
-                        context.workspace
+                        context.application_root
                         / "native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
                     )
                 ),
-                "workspace_deepstream_yolo_parser_build": file_identity(
-                    context.workspace
+                "application_deepstream_yolo_parser_build": file_identity(
+                    context.application_root
                     / "native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
                 ),
             },
-            "git": self.git_snapshot(context.workspace),
+            "git": self.git_snapshot(context.application_root),
             "failure_injection": (
                 dict(context.failure_plan)
                 if context.failure_plan is not None
@@ -486,11 +511,31 @@ class RunManifestService:
                 if context.preflight_evidence is not None
                 else None
             ),
+            "clock_validation": (
+                dict(context.clock_validation)
+                if context.clock_validation is not None
+                else None
+            ),
             "serial": {
                 "enabled": cfg.serial_enabled,
                 "port": cfg.serial_port if cfg.serial_enabled else None,
                 "baud": cfg.serial_baud if cfg.serial_enabled else None,
-                "alignment_required": bool(cfg.serial_enabled and cfg.trigger_on),
+                "alignment_required": bool(
+                    cfg.serial_enabled
+                    and cfg.trigger_on
+                    and cfg.controller_protocol != "v2"
+                ),
+                "v2_journal": (
+                    "diagnostics/controller_v2.jsonl"
+                    if cfg.serial_enabled and cfg.controller_protocol == "v2"
+                    else None
+                ),
+                "v2_summary": (
+                    "diagnostics/controller_v2_summary.json"
+                    if cfg.serial_enabled and cfg.controller_protocol == "v2"
+                    else None
+                ),
+                "v2_transport": v2_transport,
                 "controller_protocol": cfg.controller_protocol,
                 "watchdog": (
                     dict(context.controller_watchdog)
@@ -597,9 +642,10 @@ class RunManifestService:
                 context.created_at is None
                 or status.get("state") in self.TERMINAL_STATES
             ):
-                if str(existing.get("schema_version")) != "2.0":
+                if str(existing.get("schema_version")) != RUN_MANIFEST_SCHEMA_VERSION:
                     raise ValueError(
-                        "unsupported completed run manifest schema; expected 2.0"
+                        "unsupported completed run manifest schema; expected "
+                        f"{RUN_MANIFEST_SCHEMA_VERSION}"
                     )
                 inventory = output_snapshot or self.output_snapshot
                 bottles = bottle_snapshot or self.bottle_snapshot

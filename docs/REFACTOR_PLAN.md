@@ -99,7 +99,7 @@ version is part of required platform provenance. The selected task YAML is
 copied atomically and boundedly to `config/task.yaml`, with its source path,
 run-relative path, size, and hash.
 
-The checked-in `qualification/HARD_POWER_LOSS_PROTOCOL.md` defines the physical
+The checked-in `docs/qualification/HARD_POWER_LOSS_PROTOCOL.md` defines the physical
 test and retained evidence. The evaluator now treats every nonterminal persisted
 run state as a failed qualification gate, so an interrupted acquisition cannot
 be mistaken for an incomplete-but-otherwise-valid matrix cell.
@@ -136,17 +136,19 @@ released automatically after a process crash.
    compute capability, Jetson model, and Jetson Linux. Schema-3 model selection
    rejects any runtime mismatch before acquisition. Existing schema-2 packages
    remain readable only as a migration path and must be rebuilt with the
-   updated notebook to gain the strict identity gate.
+   Project Setup builder to gain the strict identity gate.
 
-   On September 8, 2026 this JetPack 7.2.1 Orin Nano Super built the custom
-   `mousehouse_best.pt` source into a separately named
-   `models/mousehouse_jp721` schema-3 candidate. Independent strict validation
-   matched CUDA 13.2, TensorRT 10.16.2.10, compute capability 8.7, device/L4T
-   identity, and every path-bound artifact digest. A bounded `trtexec` check
-   executed the plan successfully with input `1x3x640x640` and output
-   `1x300x63`; its non-truncated execution report is itself hashed by the model
-   manifest. The older `models/mousehouse` schema-2 package was deliberately
-   preserved and remains production-ineligible.
+   On September 16, 2026 the clean-break Project Setup workflow built the
+   project-owned `mousehouse_v2.pt` source into the `Test` project's
+   `models/mousehouse` schema-3 package. Independent strict validation matched
+   CUDA 13.2, TensorRT 10.16.2.10, compute capability 8.7, device/L4T identity,
+   the explicit 1 GiB builder-workspace ceiling, and every path-bound artifact
+   digest. A bounded `trtexec` check executed the plan successfully with input
+   `1x3x640x640` and output `1x300x63`; its non-truncated execution report is
+   itself hashed by the model manifest. A subsequent GUI run loaded that exact
+   project package and passed its 2,672-frame capture, MP4-count, alignment,
+   feeder-jam, and shutdown checks. The repository-local model package is now a
+   legacy ignored artifact and is not a runtime model source.
 
    The same device also completed an operator-observed bounded direct-source
    FLIR smoke test with
@@ -246,6 +248,11 @@ with an explicit count. GUI loss is tested before run creation and during
 recording/finalization. Startup cancellation and controller `START` are
 lease-atomic, and the supervisor remains alive until ordered finalization and
 terminal persistence finish.
+Run stop is asynchronous at the IPC boundary: the command worker acknowledges
+ownership immediately, a non-daemon supervisor worker performs ordered shutdown,
+and the GUI waits for terminal lifecycle events while continuing its main-loop
+lease. Accelerated blocked-finalizer tests verify stop acknowledgement and
+progress snapshots without requiring an hours-long acquisition.
 
 A bounded lease emitted by a Qt-main-loop timer also makes a frozen GUI fail
 closed; a proxy background thread cannot renew that lease by itself. The
@@ -341,17 +348,20 @@ be inventoried outside their run directories with bounded streaming SHA-256;
 the archive verifier rejects missing, extra, symlinked, special, traversing, or
 modified copied evidence and never copies or bundles large videos itself.
 The recording validator does not accept a duration/header estimate as proof.
-Routine shutdown validates the final MP4 sample-size, timing,
-sample-to-chunk, and chunk-offset tables and reconciles that exact sample count
-with the durable final capture/admission indices and controller count. It does
-not scan full ledgers, hash or decode the complete recording, or perform
-alignment. Explicit offline analysis performs row-level reconciliation and
-alignment; qualification additionally hashes the artifacts, rejects
-substitutions or unexpected files, and may explicitly require full decode or
-A/B decoder agreement.
+The FLIR source writes canonical `frames.csv` rows during acquisition. Routine
+shutdown validates the final MP4 sample-size, timing, sample-to-chunk, and
+chunk-offset tables against the live manifest and durable final
+capture/admission indices. Triggered runs then generate controller/camera
+alignment automatically. Shutdown does not reconstruct `frames.csv`, hash or
+decode the complete recording, or perform detailed object reconciliation.
+The source also writes low-rate camera telemetry, camera integrity events, and
+the resolved camera runtime snapshot live, so those diagnostic artifacts do
+not require post-run reconstruction. Deferred object statistics are recorded
+as unavailable (`null`), never as a misleading measured zero.
+Qualification may explicitly request the deeper object or decode checks.
 
-Future development should add richer progress/checkpointing to explicit
-offline analysis, optimize multi-million-row reconciliation, and add a
+Future development should add richer progress/checkpointing to optional deep
+analysis and add a
 bounded complete compressed-bitstream scan that does not depend on
 `qtdemux`'s per-sample index. None of those items changes the non-leaky
 recording path or blocks the metadata/sample-table validation policy above.
@@ -362,7 +372,7 @@ trigger epoch starts immediately after `START_SENT` and continues through the
 end of the bounded serial ledger: every `CAMERA_HIGH` in that epoch, including
 the shutdown tail after `CAPTURE_STOP_REQUESTED`, must map bijectively to one
 recorded camera frame. The summary records unmatched epoch and tail counts;
-explicit analysis and later qualification both fail closed unless those counts
+automatic alignment and later qualification both fail closed unless those counts
 are zero and the video/frame-ledger count also matches. Qualification binds the
 exact alignment-summary bytes it parsed into its source evidence.
 
@@ -451,16 +461,17 @@ The repository implementation is not the same as scientific qualification.
 The following work intentionally remains open and must not be inferred from a
 green unit-test suite:
 
-1. Select and qualify the device-built `mousehouse_jp721` schema-3 candidate in
-   the real GUI pipeline. Promote it to the canonical deployment name only if
-   that name is operationally required; do not overwrite the preserved
-   schema-2 `models/mousehouse` package merely to rename it. Fresh devices must
-   rebuild their own schema-3 plan because generated model packages are not
-   portable repository content.
-2. Run the short, one-hour, and full-duration on-device matrix with real
+1. Completed on 2026-09-16 for the clean-break project workflow: a fresh
+   project built the schema-3 `mousehouse` package on-device, selected it as the
+   project default, and used that exact engine in a successful 2,672-frame GUI
+   smoke. Generated engines remain project-owned, device-local artifacts and
+   are never portable repository content.
+2. Run the remaining one-hour and full-duration on-device matrix with real
    camera/controller hardware, approve evidence-derived limits, and retain the
-   resulting qualification summaries. Include the physical serial-fault and
-   hard-power-loss protocols.
+   resulting qualification summaries. The short recording, feeder-jam, and
+   normal shutdown path, relaunch restoration, and second-project isolation have
+   passed; safe-bench GUI loss, physical serial fault, and hard-power-loss
+   evidence remain.
 3. Run a matched DeepStream debug-off/debug-on pair and confirm that NVIDIA
    latency records are actually present before accepting the instrumentation;
    then measure its acquisition overhead with the checked-in comparison tool.

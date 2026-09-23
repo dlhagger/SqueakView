@@ -88,7 +88,9 @@ class ServiceMakerApp:
         self.pipeline_factory = pipeline_factory
         self.probe_factory = probe_factory
         if config.run_dir is None:
-            self.run_dir = run_context.timestamped_run_dir("ds")
+            raise ValueError(
+                "run_dir is required; acquisition output must belong to an open project"
+            )
         else:
             self.run_dir = Path(config.run_dir).expanduser()
             self.run_dir.mkdir(parents=True, exist_ok=True)

@@ -39,15 +39,15 @@ ALLOW_INPROCESS_BACKEND_ENV = "SQUEAKVIEW_ALLOW_INPROCESS_BACKEND"
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _SOCKET_IO_TIMEOUT_SECONDS = 1.0
 _COMMAND_TIMEOUT_SECONDS = 120.0
-# Normal stop performs only bounded ledger-tail and MP4 sample-table checks.
-# Allow ample time for EOS/container closure without masking a stuck shutdown
-# behind the offline analysis worker's former multi-hour ceiling.
+# Server shutdown is allowed to wait for an already-running finalizer. Normal
+# run stop is acknowledged asynchronously and has no GUI-side completion timer.
 _FINALIZE_TIMEOUT_SECONDS = 180.0
 _MAX_PENDING_COMMANDS = 32
 _MAX_PENDING_HEARTBEATS = 1
 _MUTATING_COMMANDS = {
     "start_run",
     "stop_run",
+    "clear_feeder_jam",
     "save_bottle_measurements",
     "shutdown_server",
 }
@@ -226,6 +226,8 @@ class SupervisorBackendProxy:
         self._failure_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._closed = threading.Event()
+        self._stop_terminal = threading.Event()
+        self._connection_error: RuntimeError | None = None
         self._intentional_close = False
         self._shutdown_requested = False
         self._last_sequence: int | None = None
@@ -386,11 +388,23 @@ class SupervisorBackendProxy:
             raise
 
     def stop_run(self) -> None:
-        result = self._command("stop_run", {}, timeout=_FINALIZE_TIMEOUT_SECONDS)
-        if isinstance(result, Mapping):
-            snapshot = result.get("snapshot", result)
-            if isinstance(snapshot, Mapping) and "phase" in snapshot:
-                self._apply_snapshot(snapshot)
+        self._stop_terminal.clear()
+        result = self._command("stop_run", {})
+        if not isinstance(result, Mapping) or set(result) != {"accepted", "snapshot"}:
+            raise RuntimeError("supervisor returned an invalid asynchronous stop acknowledgement")
+        if type(result["accepted"]) is not bool or not isinstance(result["snapshot"], Mapping):
+            raise RuntimeError("supervisor returned malformed asynchronous stop fields")
+        snapshot = self._apply_snapshot(result["snapshot"])
+        if result["accepted"] and snapshot.phase not in {RunPhase.FINALIZED, RunPhase.FAILED}:
+            # The stop worker can be scheduled immediately after the command
+            # acknowledgement. Represent accepted remote ownership locally
+            # until its first phase event arrives.
+            self._apply_phase(RunPhase.STOPPING, snapshot.run_dir)
+        while not self._stop_terminal.wait(0.25):
+            if self._closed.is_set():
+                break
+        if self._connection_error is not None:
+            raise self._connection_error
 
     def save_bottle_measurements(
         self,
@@ -407,6 +421,19 @@ class SupervisorBackendProxy:
         if not isinstance(result, Mapping):
             raise RuntimeError("supervisor returned invalid bottle metadata")
         return dict(result)
+
+    def clear_feeder_jam(self) -> str:
+        result = self._command("clear_feeder_jam", {})
+        if not isinstance(result, Mapping) or set(result) != {"response"}:
+            raise RuntimeError("supervisor returned an invalid CLEAR_JAM result")
+        response = result["response"]
+        if response not in {
+            "ACK_CLEAR_JAM",
+            "NACK,CLEAR_JAM,FEED_ACTIVE",
+            "NACK,CLEAR_JAM,NOT_JAMMED",
+        }:
+            raise RuntimeError("supervisor returned an unknown CLEAR_JAM response")
+        return str(response)
 
     def shutdown(self) -> None:
         if self._closed.is_set():
@@ -587,6 +614,8 @@ class SupervisorBackendProxy:
                 self.state.inference = _RemoteCaptureHandle()
             self.state.inference.running = active
             self._finalization_in_progress = finalizing
+        if phase in {RunPhase.FINALIZED, RunPhase.FAILED}:
+            self._stop_terminal.set()
 
     def _apply_snapshot(self, payload: Mapping[str, object]) -> RunSnapshot:
         try:
@@ -623,6 +652,8 @@ class SupervisorBackendProxy:
         failure = RuntimeError(
             f"SqueakView supervisor connection lost: {type(error).__name__}: {error}"
         )
+        self._connection_error = failure
+        self._stop_terminal.set()
         for request in pending:
             request.error = failure
             request.ready.set()

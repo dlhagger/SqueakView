@@ -71,7 +71,7 @@ The infrared LED strip is cut to the length required for the chamber geometry an
 | Microcontroller and logger | Adafruit Feather RP2040 Adalogger — 8 MB Flash with microSD Card, Product ID 5980 | Adafruit | 1 | $14.95 | Core RP2040 controller with removable-storage logging |
 | Capacitive-touch controller | Adafruit 12-Key Capacitive Touch Sensor Breakout — MPR121, Product ID 1982 | Adafruit | 1 | $7.95 | Supports capacitive-touch lick detection |
 | I²C cable | STEMMA QT / Qwiic JST SH 4-Pin Cable — 50 mm, Product ID 4399 | Adafruit | 1 | $0.95 | Connects STEMMA QT / Qwiic-compatible modules |
-| Real-time clock | DS3231 Precision RTC FeatherWing, Product ID 3028 | Adafruit | 1 | Confirm current price | Provides battery-backed timekeeping |
+| Real-time clock | PCF8523 real-time clock module | Adafruit or equivalent | 1 | Confirm current price | Sole battery-backed controller RTC; do not attach a DS3231 concurrently because both use fixed I²C address `0x68` |
 | RTC backup battery | CR1220 coin cell | Adafruit or equivalent | 1 | User-selected | Required for battery-backed RTC operation |
 | Controller microSD card | Compatible microSD card | Multiple suppliers | 1 | User-selected | Stores local controller event logs |
 | Feather USB data cable | USB data cable compatible with Feather RP2040 Adalogger | Multiple suppliers | 1 | User-selected | Used for programming, power, and serial communication |

@@ -223,6 +223,24 @@ class AlignmentIntegrationTests(unittest.TestCase):
             summary,
         )
 
+        deferred_out = self.run_dir / "deferred_analysis"
+        deferred_summary = streaming.build_alignment(
+            self.run_dir,
+            deferred_out,
+            video_validation=validated_video,
+            include_objects=False,
+        )
+        self.assertTrue(
+            deferred_summary["processing"]["object_validation_deferred"]
+        )
+        self.assertIsNone(deferred_summary["counts"]["object_observations"])
+        self.assertIsNone(
+            deferred_summary["validation"]["objects_missing_frame_count"]
+        )
+        self.assertIsNone(
+            deferred_summary["validation"]["object_mapping_method_counts"]
+        )
+
         offline_objects = self.run_dir / "offline_objects.csv"
         write_csv(
             offline_objects, OBJECT_HEADER,

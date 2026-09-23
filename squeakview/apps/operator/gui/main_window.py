@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -52,7 +53,13 @@ from squeakview.apps.operator.gui.session_controller import (
     resolve_config_paths,
 )
 from squeakview.common.profiles import ExperimentProfile, ProfileStore, SubjectProfile
-from squeakview import config as squeakview_config
+from squeakview.project import (
+    AppPaths,
+    ProjectSession,
+    RuntimeContext,
+    UserPaths,
+    project_from_environment,
+)
 
 
 GUI_HEARTBEAT_INTERVAL_MS = 1_000
@@ -93,13 +100,30 @@ def _production_backend_factory(
         emit_log(
             "[GUI] WARNING: explicit development mode uses an in-process backend"
         )
-        return OperatorBackend(
+        project = project_from_environment()
+        user_paths = UserPaths.discover()
+        app_paths = AppPaths.discover()
+        app_paths.validate_for_project(project.paths)
+        user_paths.validate_for_app(app_paths)
+        user_paths.validate_for_project(project.paths)
+        user_paths.ensure()
+        session = ProjectSession.open(project.paths.root)
+        backend = OperatorBackend(
             emit_log,
             ingest_dashboard,
             on_run_started=on_run_started,
             on_run_failed=on_run_failed,
+            runtime_context=RuntimeContext(
+                app=app_paths,
+                project=session.project,
+                user=user_paths,
+            ),
             acquisition_owner=manifest.IN_PROCESS_DEV_OWNER,
         )
+        # The explicit development backend owns the same lifetime lock as the
+        # production supervisor; process exit is its final fallback release.
+        backend._development_project_session = session
+        return backend
     # Raise the actionable error from the shared environment parser.  A GUI
     # started outside the durable launcher must never acquire cameras itself.
     supervisor_socket_from_environment()
@@ -116,17 +140,23 @@ class MainWindow(QtWidgets.QMainWindow):
     run_failed = QtCore.Signal(str)
     backend_event = QtCore.Signal(object)
     dashboard_event = QtCore.Signal(object)
+    clear_jam_finished = QtCore.Signal(str)
+    clear_jam_failed = QtCore.Signal(str)
 
     def __init__(self, *, backend_factory=None) -> None:
         super().__init__()
         self.log_msg.connect(self._append_log)
-        self.setWindowTitle("SqueakView")
+        self.project = project_from_environment()
+        self.setWindowTitle(f"SqueakView — {self.project.metadata.name}")
         self.resize(1280, 820)
         self.setMinimumSize(1024, 700)
 
         self._config_data: dict | None = None
         self._preview_window_id: int | None = None
-        self._profile_store = ProfileStore()
+        self._profile_store = ProfileStore(
+            self.project.paths.profiles,
+            project_paths=self.project.paths,
+        )
         self._experiments: list[ExperimentProfile] = []
         self._subjects: list[SubjectProfile] = []
         self._profile_selection_updating = False
@@ -139,6 +169,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_failed.connect(self._on_backend_run_failed)
         self.backend_event.connect(self._on_backend_event)
         self.dashboard_event.connect(self._on_dashboard_event)
+        self.clear_jam_finished.connect(self._on_clear_jam_finished)
+        self.clear_jam_failed.connect(self._on_clear_jam_failed)
+        self._clear_jam_thread = None
 
         self.backend: BackendProtocol = (backend_factory or _production_backend_factory)(
             self._emit_log,
@@ -159,6 +192,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             self.experiment_combo,
             self.subject_combo,
+            project=self.project,
             store=self._profile_store,
             commit=self._apply_config,
             emit=self._emit_log,
@@ -318,12 +352,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn = view.stop_btn
         self.preview = view.preview
         self.dashboard = view.dashboard
+        clear_jam_handler = getattr(self, "_on_clear_jam_requested", None)
+        if callable(clear_jam_handler):
+            self.dashboard.clear_jam_requested.connect(clear_jam_handler)
         self._profile_group = view.profile_group
         self.experiment_combo = view.experiment_combo
         self.new_experiment_btn = view.new_experiment_btn
         self.subject_combo = view.subject_combo
         self.new_subject_btn = view.new_subject_btn
         self.summary_label = view.summary_label
+        self.clock_labels = view.clock_labels
         self.bottle_panel = view.bottle_panel
         self.task_state_group = view.task_state_group
         self.stop_overlay = view.stop_overlay
@@ -350,7 +388,7 @@ class MainWindow(QtWidgets.QMainWindow):
         apply_main_window_theme(self)
 
     def _default_config_data(self) -> dict:
-        return default_config_data()
+        return default_config_data(self.project)
 
     def _make_fluid_combo(self) -> QtWidgets.QComboBox:
         return self.bottle_panel._make_fluid_combo()
@@ -481,7 +519,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _apply_config(self, data: dict) -> None:
-        resolved = resolve_config_paths(data)
+        resolved = resolve_config_paths(data, project=self.project)
         data = resolved.data
         ds_cfg = resolved.ds_cfg
         task_cfg = resolved.task_cfg
@@ -494,6 +532,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.summary_label.setText(presentation.summary_html)
         self.preview.set_info(presentation.preview_info)
         self._emit_log("[GUI] Configuration committed.")
+        self._reset_clock_preflight_display()
         try:
             if task_cfg is not None:
                 self.dashboard.apply_task_config(task_cfg)
@@ -502,11 +541,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.run_btn.setEnabled(True)
 
+    def _reset_clock_preflight_display(self) -> None:
+        values = {
+            "validation_state": "NOT_CHECKED",
+            "ntp_synchronized": "Not checked",
+            "rtc_valid": "Not checked",
+            "median_offset_seconds": "—",
+            "median_round_trip_ms": "—",
+            "correction_state": "Authorized" if bool(
+                self._config_data.get("allow_rtc_correction", False)
+            ) else "Not authorized",
+            "validation_timestamp": "—",
+            "evidence_path": "—",
+        }
+        for key, text in values.items():
+            label = self.clock_labels.get(key)
+            if label is not None:
+                label.setText(text)
+
     def _build_launch_config(self) -> process.LaunchConfig:
         return build_launch_config(
             self._config_data,
             bottles=self._collect_bottle_payload(include_final=False, strict=False),
             preview_window_id=self._preview_window_id,
+            project=self.project,
         )
 
     # ---- Helpers --------------------------------------------------------
@@ -532,7 +590,65 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(object)
     def _on_dashboard_event(self, event: DashboardEvent) -> None:
+        was_jammed = self.dashboard.feeder_jammed
         self.dashboard.ingest_event(event)
+        if self.dashboard.feeder_jammed and not was_jammed:
+            behavior_dock = self.workspace.cards.get("behavior")
+            if behavior_dock is not None:
+                behavior_dock.show()
+                behavior_dock.raise_()
+
+    @QtCore.Slot()
+    def _on_clear_jam_requested(self) -> None:
+        if self._clear_jam_thread is not None and self._clear_jam_thread.is_alive():
+            return
+        self._emit_log("[GUI] Sending CLEAR_JAM after operator confirmation")
+
+        def worker() -> None:
+            try:
+                response = self.backend.clear_feeder_jam()
+            except Exception as exc:
+                self.clear_jam_failed.emit(str(exc))
+                return
+            self.clear_jam_finished.emit(response)
+
+        self._clear_jam_thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name="squeakview-clear-feeder-jam",
+        )
+        self._clear_jam_thread.start()
+
+    @QtCore.Slot(str)
+    def _on_clear_jam_finished(self, response: str) -> None:
+        if response == "ACK_CLEAR_JAM":
+            self.dashboard.clear_jam_alert()
+            self._emit_log("[GUI] Feeder jam latch cleared by ACK_CLEAR_JAM")
+        elif response == "NACK,CLEAR_JAM,FEED_ACTIVE":
+            message = (
+                "Clear Jam was rejected: wait until the current feed stops, "
+                "then inspect the mechanism and try again."
+            )
+            self.dashboard.clear_jam_failed(message)
+            self._emit_log(f"[GUI] {message}")
+        elif response == "NACK,CLEAR_JAM,NOT_JAMMED":
+            message = (
+                "The firmware reports that no jam is currently latched. "
+                "The warning remains active because no ACK_CLEAR_JAM was received."
+            )
+            self.dashboard.clear_jam_failed(message)
+            self._emit_log(f"[GUI] {message}")
+        else:
+            self._on_clear_jam_failed(f"unrecognized controller response: {response}")
+
+    @QtCore.Slot(str)
+    def _on_clear_jam_failed(self, error: str) -> None:
+        message = (
+            f"Clear Jam failed: {error}. Inspect and physically clear the feeder; "
+            "the jam warning remains active."
+        )
+        self.dashboard.clear_jam_failed(message)
+        self._emit_log(f"[GUI] {message}")
 
     @QtCore.Slot()
     def _send_supervisor_heartbeat(self) -> None:
@@ -549,7 +665,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _open_run_folder(self) -> None:
-        target = self.backend.current_snapshot.run_dir or squeakview_config.RUNS_DIR
+        target = self.backend.current_snapshot.run_dir or self.project.paths.runs
         path = Path(target)
         if not path.exists():
             self._emit_log(f"[GUI] Run folder does not exist: {path}")

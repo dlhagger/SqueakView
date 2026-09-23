@@ -4,6 +4,7 @@ import dataclasses
 import threading
 import time
 import unittest
+from unittest import mock
 
 from squeakview.apps.operator.backend.supervisor.protocol import (
     MAX_FRAME_BYTES,
@@ -152,6 +153,24 @@ class SupervisorProtocolTest(unittest.TestCase):
         decoded = NewlineFrameDecoder().feed(bytes(connection.buffer))
         self.assertEqual(len(decoded), 2)
         self.assertEqual({item.name for item in decoded}, {"ping", "log"})
+
+    def test_writer_deadline_is_independent_of_socket_read_timeout(self) -> None:
+        connection = mock.Mock()
+        connection.send.side_effect = BlockingIOError
+        writer = SocketEnvelopeWriter(connection, send_timeout_s=0.01)
+
+        started = time.monotonic()
+        with (
+            mock.patch(
+                "squeakview.apps.operator.backend.supervisor.protocol.select.select",
+                return_value=([], [], []),
+            ),
+            self.assertRaisesRegex(TimeoutError, "delivery exceeded"),
+        ):
+            writer.send(EventEnvelope("log", 1, {"message": "blocked"}))
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        connection.settimeout.assert_not_called()
 
     def test_clean_socket_eof_is_distinct_from_protocol_failure(self) -> None:
         with self.assertRaises(EOFError):

@@ -6,9 +6,11 @@ import signal
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
+import squeakview_gui
 from squeakview.apps.operator import main as operator_main
 from squeakview.apps.operator.backend.supervisor import __main__ as supervisor_main
 from squeakview.common.log_mirror import DEFAULT_LOG_MAX_BYTES
@@ -88,6 +90,31 @@ class OperatorSignalLifecycleTest(unittest.TestCase):
 
 
 class OperatorLauncherTest(unittest.TestCase):
+    def test_direct_gui_refuses_log_output_inside_application_checkout(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        forbidden = root / ".forbidden-runtime-log"
+        stderr = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": temp_dir,
+                    "XDG_CONFIG_HOME": str(Path(temp_dir) / "config"),
+                    "XDG_STATE_HOME": str(Path(temp_dir) / "state"),
+                    "XDG_RUNTIME_DIR": str(Path(temp_dir) / "runtime"),
+                    squeakview_gui.LOG_ENV: str(forbidden),
+                },
+                clear=True,
+            ),
+            redirect_stderr(stderr),
+        ):
+            result = squeakview_gui.main()
+
+        self.assertEqual(result, 1)
+        self.assertIn("outside the application checkout", stderr.getvalue())
+        self.assertFalse(forbidden.exists())
+
     def test_launcher_detaches_only_the_durable_supervisor(self) -> None:
         root = Path(__file__).resolve().parents[1]
         script = (root / "squeakview.sh").read_text()
@@ -95,6 +122,8 @@ class OperatorLauncherTest(unittest.TestCase):
         supervisor = "-m squeakview.apps.operator.backend.supervisor"
         gui = '--gui-command "$PYTHON_BIN" "$ROOT/squeakview_gui.py"'
         self.assertIn(supervisor, script)
+        self.assertIn('--project "$PROJECT_PATH"', script)
+        self.assertIn("squeakview.apps.project_launcher", script)
         self.assertIn(gui, script)
         self.assertLess(script.index(supervisor), script.index(gui))
         self.assertNotIn("SQUEAKVIEW_ALLOW_INPROCESS_BACKEND", script)
@@ -102,9 +131,12 @@ class OperatorLauncherTest(unittest.TestCase):
         self.assertIn("SQUEAKVIEW_LAUNCH_STATUS_FILE", script)
         self.assertIn("GUI_READY", script)
         self.assertIn("SQUEAKVIEW_LAUNCH_TIMEOUT_S", script)
+        self.assertIn('assert_external_log_path "Launch log directory"', script)
+        self.assertIn('"$ROOT"|"$ROOT"/*', script)
+        self.assertIn('"$PROJECT_PATH"|"$PROJECT_PATH"/*', script)
         self.assertNotIn('>"$SUPERVISOR_LOG_PATH"', script)
 
-    def test_launcher_returns_nonzero_when_supervisor_exits_before_gui_ready(self) -> None:
+    def test_launcher_returns_nonzero_when_project_selection_fails(self) -> None:
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmp:
             temp_dir = Path(tmp)
@@ -126,8 +158,7 @@ class OperatorLauncherTest(unittest.TestCase):
             )
 
             self.assertNotEqual(completed.returncode, 0)
-            self.assertIn("exited during launch", completed.stderr)
-            self.assertEqual(list((temp_dir / "logs").glob(".squeakview_launch.*")), [])
+            self.assertIn("No SqueakView project was selected", completed.stderr)
 
     def test_supervisor_uses_the_bounded_log_mirror(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,6 +183,21 @@ class OperatorLauncherTest(unittest.TestCase):
 
             self.assertEqual(path.read_text(), "supervisor diagnostic\n")
 
+    def test_supervisor_refuses_log_output_inside_application_checkout(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        forbidden = root / ".forbidden-supervisor-log"
+        with (
+            mock.patch.dict(
+                supervisor_main.os.environ,
+                {supervisor_main.SUPERVISOR_LOG_ENV: str(forbidden)},
+                clear=True,
+            ),
+            self.assertRaisesRegex(ValueError, "outside the application checkout"),
+        ):
+            supervisor_main._install_log_mirror()
+
+        self.assertFalse(forbidden.exists())
+
 
 class JetsonSetupScriptTest(unittest.TestCase):
     def test_setup_is_one_run_build_group_and_reboot_workflow(self) -> None:
@@ -165,18 +211,40 @@ class JetsonSetupScriptTest(unittest.TestCase):
         self.assertIn("gstreamer1.0-plugins-good", script)
         self.assertIn("gstreamer1.0-plugins-bad", script)
         self.assertIn("gstreamer1.0-plugins-ugly", script)
-        self.assertIn('cmake --build "$ROOT/native/flir_gst_source/build"', script)
-        self.assertIn('-C "$ROOT/native/nvdsinfer_custom_impl_yolo"', script)
+        self.assertIn('bash "$ROOT/scripts/build_native.sh"', script)
+        self.assertIn('runuser -u "$TARGET_USER"', script)
+        self.assertIn("keep native build outputs owned", script)
+        self.assertIn('TARGET_USER_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"', script)
+        self.assertIn('SQUEAKVIEW_PROJECTS_DIR:-$TARGET_USER_HOME/Documents/SqueakView Projects', script)
+        self.assertIn("Project parent is a dangling symbolic link", script)
+        self.assertIn("Project parent must be outside the application checkout", script)
+        self.assertIn("Project parent may not contain the application checkout", script)
+        self.assertIn("Existing project parent left unchanged", script)
+        self.assertIn("Created project parent", script)
 
     def test_setup_verifies_both_native_runtime_outputs_and_contracts(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        script = (root / "scripts" / "setup_jetson.sh").read_text()
+        script = (root / "scripts" / "build_native.sh").read_text()
 
         self.assertIn("gstflirspinsrc.so", script)
         self.assertIn("libnvdsinfer_custom_impl_Yolo.so", script)
         self.assertIn("ldd \"$output\"", script)
         self.assertIn("NvDsInferParseYolo26Pose", script)
         self.assertIn("capture-log-path", script)
+
+
+class PreflightScriptTest(unittest.TestCase):
+    def test_model_selection_is_project_rooted_without_dead_path_resolver(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts" / "preflight.sh").read_text()
+
+        self.assertIn('PROJECT_ROOT="${SQUEAKVIEW_PROJECT:-}"', script)
+        self.assertIn(
+            'CFG="$PROJECT_ROOT/models/${SQUEAKVIEW_MODEL_NAME}/configs/'
+            '${SQUEAKVIEW_MODEL_NAME}.txt"',
+            script,
+        )
+        self.assertNotIn("resolve_repo_path", script)
 
 
 class DetachedLaunchReadinessTest(unittest.TestCase):

@@ -34,6 +34,14 @@ class SerialHandle(Protocol):
         self, *, requested_lease_ms: int, timeout_s: float
     ) -> object: ...
 
+    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None: ...
+
+    def exchange_time_sync(
+        self, sequence: int, jetson_send_ns: int, *, timeout_s: float
+    ) -> tuple[str, int]: ...
+
+    def exchange_set_rtc(self, unix_seconds: int, *, timeout_s: float) -> str: ...
+
 
 class CaptureHandle(Protocol):
     def is_running(self) -> bool: ...
@@ -108,7 +116,9 @@ class StartupResult:
 @dataclass(frozen=True, slots=True)
 class StartupHooks:
     log: Callable[[str], None]
-    resolve_workspace_path: Callable[[Path], Path | None]
+    resolve_task_path: Callable[[Path], Path]
+    resolve_model_path: Callable[[Path], Path]
+    resolve_failure_plan_path: Callable[[Path], Path]
     load_failure_plan: Callable[[Path], FailurePlan]
     validate_model: Callable[[Path], ModelSelection]
     assert_storage_ready: Callable[[], Mapping[str, Any]]
@@ -137,6 +147,7 @@ class StartupHooks:
     create_serial: Callable[[RunRequest, FailurePlan | None], SerialHandle]
     set_serial: Callable[[SerialHandle | None], None]
     arm_serial_runtime: Callable[[], None]
+    validate_clock: Callable[[SerialHandle, PreparedRun], Mapping[str, Any]]
     spawn_capture: Callable[[RunRequest], CaptureHandle]
     set_capture: Callable[[CaptureHandle | None], None]
     after_capture_spawn: Callable[[Path], None]
@@ -170,6 +181,7 @@ def validate_startup_policy(config: RunRequest) -> None:
         "trigger_on",
         "inference_enabled",
         "serial_enabled",
+        "allow_rtc_correction",
         "preview_enabled",
     )
     for name in bool_fields:
@@ -229,9 +241,9 @@ def validate_startup_policy(config: RunRequest) -> None:
         raise ValueError(
             "serial_port must be non-empty when serial acquisition is enabled"
         )
-    if config.controller_protocol not in {"legacy", "watchdog_v1_experimental"}:
+    if config.controller_protocol not in {"legacy", "watchdog_v1_experimental", "v2"}:
         raise ValueError(
-            "controller_protocol must be 'legacy' or 'watchdog_v1_experimental'"
+            "controller_protocol must be 'legacy', 'watchdog_v1_experimental', or 'v2'"
         )
     if config.controller_protocol == "watchdog_v1_experimental" and not (
         config.serial_enabled and config.trigger_on
@@ -261,16 +273,23 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
     if not cfg.task_cfg:
         return _reject(hooks, "task config required; aborting run", prefix="BACKEND")
 
-    cfg = replace(
-        cfg,
-        task_cfg=hooks.resolve_workspace_path(cfg.task_cfg),
-        ds_cfg=(hooks.resolve_workspace_path(cfg.ds_cfg) if cfg.ds_cfg else None),
-        failure_plan=(
-            hooks.resolve_workspace_path(cfg.failure_plan)
-            if cfg.failure_plan
-            else None
-        ),
-    )
+    try:
+        cfg = replace(
+            cfg,
+            task_cfg=hooks.resolve_task_path(cfg.task_cfg),
+            ds_cfg=(hooks.resolve_model_path(cfg.ds_cfg) if cfg.ds_cfg else None),
+            failure_plan=(
+                hooks.resolve_failure_plan_path(cfg.failure_plan)
+                if cfg.failure_plan
+                else None
+            ),
+        )
+    except (OSError, ValueError) as exc:
+        return _reject(
+            hooks,
+            f"scientific input path is outside the active project: {exc}",
+            prefix="BACKEND",
+        )
     if cfg.task_cfg is None or not Path(cfg.task_cfg).exists():
         return _reject(hooks, f"task config missing: {cfg.task_cfg}", prefix="BACKEND")
     try:
@@ -325,7 +344,7 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
             return _reject(
                 hooks,
                 "selected model package has no verified TensorRT engine build identity; "
-                "rebuild it on this device with build_engine/build_engine.ipynb to create "
+                "rebuild it on this device from the Project Setup screen to create "
                 "a schema-3 model manifest before starting inference",
                 prefix="MODEL",
             )
@@ -441,6 +460,11 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
 
     serial_handle: SerialHandle | None = None
     if cfg.serial_enabled:
+        if cfg.controller_protocol != "v2":
+            hooks.log(
+                "[SER] WARNING: legacy controller transport is a non-production "
+                "bench override; protocol v2 is required for scientific runs"
+            )
         if not hooks.serial_available():
             error = (
                 "Serial controller support was requested, but pyserial is not installed. "
@@ -480,6 +504,67 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
             hooks.log(f"[SER] {error}")
             hooks.finalize_failure(error, True)
             return StartupResult(started=False, prepared=prepared, serial=serial_handle, error=error)
+        if cfg.controller_protocol == "v2":
+            try:
+                # PROTO,2 is idempotent. Negotiating first supports both a
+                # freshly booted v1 controller and a controller that remained
+                # in v2 after an earlier run. TIME_SYNC/SET_RTC are accepted as
+                # framed command results while v2 is idle.
+                serial_handle.negotiate_protocol_v2(timeout_s=3.0)
+                serial_handle.log_marker("PROTOCOL_V2_NEGOTIATED")
+                hooks.log("[SER] controller protocol v2 active")
+            except Exception as exc:
+                error = f"controller protocol-v2 negotiation failed: {exc}"
+                hooks.log(f"[SER] {error}")
+                hooks.finalize_failure(error, False)
+                return StartupResult(
+                    started=False, prepared=prepared, serial=serial_handle, error=error
+                )
+        try:
+            clock_record = hooks.validate_clock(serial_handle, prepared)
+        except Exception as exc:
+            error = f"controller clock preflight failed: {type(exc).__name__}: {exc}"
+            hooks.log(f"[CLOCK] {error}")
+            hooks.finalize_failure(error, False)
+            return StartupResult(
+                started=False, prepared=prepared, serial=serial_handle, error=error
+            )
+        if clock_record.get("result") != "PASS":
+            reason = str(clock_record.get("reason") or "VALIDATION_ERROR")
+            detail = str(clock_record.get("detail") or "").strip()
+            error = f"controller clock preflight failed: {reason}"
+            guidance = {
+                "JETSON_NTP_NOT_SYNCHRONIZED": (
+                    "Synchronize the Jetson clock with NTP before retrying; RTC correction "
+                    "is unsafe while the host clock is unsynchronized."
+                ),
+                "CONTROLLER_RTC_INVALID": (
+                    "The controller RTC is unset or invalid. Inspect the PCF8523 and enable "
+                    "explicit RTC correction authorization in Configure before retrying."
+                ),
+                "CLOCK_OFFSET_OUT_OF_TOLERANCE": (
+                    "The controller RTC exceeds the ±1.5-second limit. Enable explicit RTC "
+                    "correction authorization in Configure before retrying."
+                ),
+                "DEVICE_BUSY": (
+                    "Wait until the current controller session or feed has stopped, then retry."
+                ),
+                "TIME_SYNC_TIMEOUT": (
+                    "The controller did not answer TIME_SYNC; check the USB connection and retry."
+                ),
+                "SET_RTC_TIMEOUT": (
+                    "The controller did not acknowledge SET_RTC; its clock was not accepted."
+                ),
+            }.get(reason)
+            if detail:
+                error += f" — {detail}"
+            if guidance:
+                error += f" {guidance}"
+            hooks.log(f"[CLOCK] {error}")
+            hooks.finalize_failure(error, False)
+            return StartupResult(
+                started=False, prepared=prepared, serial=serial_handle, error=error
+            )
         if cfg.controller_protocol == "watchdog_v1_experimental":
             try:
                 serial_handle.negotiate_watchdog_v1(

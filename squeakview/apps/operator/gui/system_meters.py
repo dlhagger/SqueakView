@@ -10,7 +10,6 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtWidgets
 
-from squeakview import config as squeakview_config
 from squeakview.apps.operator.gui.run_health import read_latest_system_telemetry
 
 try:
@@ -29,7 +28,13 @@ class JetsonMeters(QtCore.QObject):
 
     updated = QtCore.Signal(float, float, float, float, str)
 
-    def __init__(self, parent=None, interval_ms: int = 500) -> None:
+    def __init__(
+        self,
+        parent=None,
+        interval_ms: int = 500,
+        *,
+        disk_root: Path | None = None,
+    ) -> None:
         super().__init__(parent)
         self._have_tegrastats = shutil.which("tegrastats") is not None
         self._proc = None
@@ -40,6 +45,7 @@ class JetsonMeters(QtCore.QObject):
         self._timer.timeout.connect(self._drain)
         self._timer.start(interval_ms)
         self._last_io = None  # (timestamp, read_bytes, write_bytes)
+        self._disk_root = Path(disk_root or "/").resolve()
         self._io_device = self._resolve_disk_device()
 
         self._interval_ms = interval_ms
@@ -175,7 +181,7 @@ class JetsonMeters(QtCore.QObject):
         if not psutil:
             return None
         try:
-            target = Path(squeakview_config.RUNS_DIR).resolve()
+            target = self._disk_root
             best = None
             best_len = -1
             for part in psutil.disk_partitions(all=False):

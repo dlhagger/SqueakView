@@ -13,7 +13,6 @@ from typing import Any, Iterator, Mapping
 
 from squeakview.apps.inference.video_probe import probe_video_frames
 from squeakview.common.bounded_csv import BoundedCsvError, MAX_CSV_RECORD_BYTES
-from squeakview.common.diagnostics.evidence_identity import stable_file_identity
 from squeakview.common.run_context import atomic_write_json
 
 
@@ -205,17 +204,19 @@ def _input_snapshot(paths: dict[str, Path], *, required: frozenset[str]) -> dict
             raise ValueError(f"scientific alignment input must not be a symlink: {path}")
         if metadata is not None and not stat.S_ISREG(metadata.st_mode):
             raise ValueError(f"scientific alignment input is not a regular file: {path}")
-        identity = stable_file_identity(path)
-        if name in required and identity.get("available") is not True:
+        available = metadata is not None
+        if name in required and not available:
             raise ValueError(
-                f"required scientific alignment input is unavailable: {path}: "
-                f"{identity.get('error')}"
+                f"required scientific alignment input is unavailable: {path}"
             )
         snapshot[name] = {
             "path": str(path),
-            "available": identity.get("available") is True,
-            "size_bytes": identity.get("size_bytes"),
-            "sha256": identity.get("sha256"),
+            "available": available,
+            "device": int(metadata.st_dev) if metadata is not None else None,
+            "inode": int(metadata.st_ino) if metadata is not None else None,
+            "size_bytes": int(metadata.st_size) if metadata is not None else None,
+            "mtime_ns": int(metadata.st_mtime_ns) if metadata is not None else None,
+            "ctime_ns": int(metadata.st_ctime_ns) if metadata is not None else None,
         }
     return snapshot
 
@@ -350,7 +351,6 @@ def _index_detection_counts(db: sqlite3.Connection, path: Path) -> None:
 
 
 def _first_frame(path: Path) -> dict[str, str]:
-    first: dict[str, str] | None = None
     for row in _reader(
         path,
         required_columns=frozenset(
@@ -361,11 +361,8 @@ def _first_frame(path: Path) -> dict[str, str]:
         _required_uint(row, "raw_frame_index", source="frames.csv")
         _required_uint(row, "camera_timestamp_ns", source="frames.csv")
         _required_uint(row, "pts_ns", source="frames.csv")
-        if first is None:
-            first = row
-    if first is None:
-        raise RuntimeError("frames.csv contains no camera_frame_id values")
-    return first
+        return row
+    raise RuntimeError("frames.csv contains no camera_frame_id values")
 
 
 def _write_frames(
@@ -583,6 +580,7 @@ def build_alignment(
     *,
     objects_path: Path | None = None,
     video_validation: Mapping[str, object] | None = None,
+    include_objects: bool = True,
 ) -> dict[str, Any]:
     raw_run_dir = Path(run_dir).absolute()
     raw_out_dir = Path(out_dir).absolute()
@@ -600,10 +598,11 @@ def build_alignment(
     evidence_paths = {
         "frames": frames_path,
         "serial": serial_path,
-        "objects": objects_path,
         "errors": run_dir / "diagnostics" / "errors.csv",
         "video": run_dir / "raw.mp4",
     }
+    if include_objects:
+        evidence_paths["objects"] = objects_path
     source_evidence = _input_snapshot(
         evidence_paths, required=frozenset({"frames", "serial"})
     )
@@ -619,7 +618,8 @@ def build_alignment(
     try:
         db = _open_index(index_path)
         serial = _index_serial(db, serial_path)
-        _index_detection_counts(db, objects_path)
+        if include_objects:
+            _index_detection_counts(db, objects_path)
         first_frame = _first_frame(frames_path)
         first_high_count, first_high_rp, _ = serial["first_high"]
         first_camera_id = int(_to_int(first_frame.get("camera_frame_id")))
@@ -662,7 +662,20 @@ def build_alignment(
                 (epoch["shutdown_marker_index"],),
             ).fetchone()[0]
         )
-        observations = _write_detections(db, objects_path)
+        observations = (
+            _write_detections(db, objects_path)
+            if include_objects
+            else {
+                "count": 0,
+                "missing": 0,
+                "ts_mismatch": 0,
+                "pts_mismatch": 0,
+                "failed": 0,
+                "fallback": 0,
+                "methods": {},
+                "samples": {"missing": [], "ts": [], "pts": []},
+            }
+        )
         median = serial["median_interval_us"]
         tolerance = max(1000.0, median / 2.0) if median is not None else None
         within = (
@@ -718,7 +731,8 @@ def build_alignment(
             "frame_alignment": epoch,
             "start_marker_seen": serial["start_marker_seen"],
             "counts": {"recorded_frames": frames["count"], "camera_high_events": serial["camera_high_events"],
-                       "serial_rows": serial["serial_rows"], "object_observations": observations["count"],
+                       "serial_rows": serial["serial_rows"],
+                       "object_observations": observations["count"] if include_objects else None,
                        "drop_events": _data_rows(run_dir / "diagnostics" / "errors.csv"),
                        "frame_gaps_detected": frames["gap_count"],
                        "camera_frames_missing": frames["missing_camera_frames"],
@@ -733,21 +747,22 @@ def build_alignment(
             "validation": {
                 "video_total_nb_frames": video_frames,
                 "video_frame_count_matches_frames_csv": video_frames == frames["count"] if video_frames is not None else None,
-                "objects_missing_frame_count": observations["missing"],
-                "object_ts_mismatch_count": observations["ts_mismatch"],
-                "object_pts_mismatch_count": observations["pts_mismatch"],
-                "object_mapping_method_counts": observations["methods"],
+                "objects_missing_frame_count": observations["missing"] if include_objects else None,
+                "object_ts_mismatch_count": observations["ts_mismatch"] if include_objects else None,
+                "object_pts_mismatch_count": observations["pts_mismatch"] if include_objects else None,
+                "object_mapping_method_counts": observations["methods"] if include_objects else None,
                 "video_mapping_source_counts": {"single_file_frames_csv": frames["count"]},
-                "object_mapping_failed_rows": observations["failed"],
-                "object_mapping_fallback_rows": observations["fallback"],
-                "object_missing_frames_sample": observations["samples"]["missing"],
-                "object_ts_mismatches_sample": observations["samples"]["ts"],
-                "object_pts_mismatches_sample": observations["samples"]["pts"],
+                "object_mapping_failed_rows": observations["failed"] if include_objects else None,
+                "object_mapping_fallback_rows": observations["fallback"] if include_objects else None,
+                "object_missing_frames_sample": observations["samples"]["missing"] if include_objects else None,
+                "object_ts_mismatches_sample": observations["samples"]["ts"] if include_objects else None,
+                "object_pts_mismatches_sample": observations["samples"]["pts"] if include_objects else None,
             },
             "frame_gaps": frames["gaps"], "raw_video_info": video_info,
             "processing": {
                 "mode": "streaming_disk_backed",
                 "index": "temporary_sqlite",
+                "object_validation_deferred": not include_objects,
                 "source_evidence": source_evidence,
             },
         }

@@ -17,7 +17,7 @@ class AcquisitionLockTests(unittest.TestCase):
             self.assertTrue(first.acquire())
             self.assertTrue(first.held)
             self.assertFalse(second.acquire())
-            self.assertIn("pid=", path.read_text())
+            self.assertIn('"pid":', path.read_text())
 
             first.release()
             self.assertTrue(second.acquire())
@@ -31,6 +31,19 @@ class AcquisitionLockTests(unittest.TestCase):
             lock.release()
             lock.release()
             self.assertFalse(lock.held)
+
+    def test_refuses_symlink_lock_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.write_text("preserve")
+            link = root / "lock"
+            link.symlink_to(target)
+
+            with self.assertRaises(OSError):
+                AcquisitionLock(link).acquire()
+
+            self.assertEqual(target.read_text(), "preserve")
 
 
 if __name__ == "__main__":
