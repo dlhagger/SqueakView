@@ -241,6 +241,23 @@ class PreflightServiceTests(unittest.TestCase):
         )
         self.assertIn("/dev/ttyACM*", message)
 
+    def test_undetermined_suspend_policy_is_actionable(self) -> None:
+        message = preflight.failure_message(
+            "[FAIL] Desktop suspend policy could not be determined."
+        )
+
+        self.assertIn("acquisition was not started", message)
+        self.assertIn("sleep-inactive-ac-timeout 0", message)
+
+    def test_enabled_suspend_policy_is_actionable(self) -> None:
+        message = preflight.failure_message(
+            "[FAIL] Automatic desktop suspend is enabled after 3600 second(s) "
+            "on AC power."
+        )
+
+        self.assertIn("automatic desktop suspend", message.lower())
+        self.assertIn("sleep-inactive-ac-timeout 0", message)
+
     def test_evidence_snapshot_is_structured_and_hashes_bounded_output(self) -> None:
         output = (
             "[PASS] ffprobe is installed (/usr/bin/ffprobe)\n"

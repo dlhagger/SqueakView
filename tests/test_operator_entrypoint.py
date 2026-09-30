@@ -246,6 +246,15 @@ class PreflightScriptTest(unittest.TestCase):
         )
         self.assertNotIn("resolve_repo_path", script)
 
+    def test_gnome_nothing_action_is_accepted_as_suspend_disabled(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts" / "preflight.sh").read_text()
+
+        self.assertIn(
+            'if [ "$timeout" = "0" ] || [[ "$action" == *nothing* ]]; then',
+            script,
+        )
+
 
 class DetachedLaunchReadinessTest(unittest.TestCase):
     def test_status_acknowledgement_requires_private_owned_regular_file(self) -> None:

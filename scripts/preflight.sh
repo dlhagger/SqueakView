@@ -97,7 +97,10 @@ check_desktop_suspend_policy() {
   timeout="$(gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 2>/dev/null || true)"
   action="$(gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 2>/dev/null || true)"
   timeout="${timeout//[^0-9]/}"
-  if [ "$timeout" = "0" ]; then
+  # GNOME represents Automatic Suspend: Off as action='nothing' but may retain
+  # the previously configured timeout. Either representation proves that an
+  # idle AC session will not suspend during acquisition.
+  if [ "$timeout" = "0" ] || [[ "$action" == *nothing* ]]; then
     pass "Automatic desktop suspend on AC power is disabled"
   elif [ -n "$timeout" ] && [[ "$action" == *suspend* ]]; then
     printf '[FAIL] Automatic desktop suspend is enabled after %s second(s) on AC power.\n' "$timeout"

@@ -214,6 +214,20 @@ def failure_message(output: str) -> str:
             "Jetson VIC/NVMM path.\n\nRun sudo apt update && sudo apt "
             "full-upgrade, reboot, and run scripts/preflight.sh again."
         )
+    if (
+        "desktop suspend policy could not be determined" in lowered
+        or "desktop suspend policy unavailable" in lowered
+        or "automatic desktop suspend is enabled" in lowered
+    ):
+        return (
+            "SqueakView could not confirm that automatic desktop suspend is "
+            "disabled, so acquisition was not started. Suspending during a run "
+            "could interrupt the scientific recording.\n\n"
+            "Disable automatic suspend while the Jetson is plugged in, or run:\n"
+            "gsettings set org.gnome.settings-daemon.plugins.power "
+            "sleep-inactive-ac-timeout 0\n\n"
+            "Then start the run again."
+        )
     if "does not have effective dialout access" in lowered:
         return (
             "This login session cannot access the serial controller.\n\n"
