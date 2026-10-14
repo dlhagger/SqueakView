@@ -53,7 +53,9 @@ for output in "$FLIR_PLUGIN" "$YOLO_PARSER"; do
   fi
 done
 
-if ! nm -D "$YOLO_PARSER" 2>/dev/null | grep -Eq '[[:space:]]NvDsInferParseYolo26Pose$'; then
+# Read all nm output: grep -q can close the pipe early and make nm fail with
+# SIGPIPE under pipefail even when the required symbol is present.
+if ! nm -D "$YOLO_PARSER" 2>/dev/null | grep -E '[[:space:]]NvDsInferParseYolo26Pose$' >/dev/null; then
   printf '[FAIL] DeepStream parser is missing required symbol NvDsInferParseYolo26Pose: %s\n' "$YOLO_PARSER" >&2
   exit 1
 fi

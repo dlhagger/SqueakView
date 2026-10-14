@@ -84,6 +84,21 @@ printf 'Configuring this Jetson for SqueakView (desktop user: %s)\n' "$TARGET_US
   libgstreamer1.0-dev \
   libgstreamer-plugins-base1.0-dev
 
+# Configure serial permissions before compilation so a failed native build
+# cannot skip this device-provisioning step.
+if ! getent group dialout >/dev/null; then
+  printf '[FAIL] The required dialout group does not exist on this system.\n' >&2
+  exit 1
+fi
+
+if id -nG "$TARGET_USER" | tr ' ' '\n' | grep -Fxq dialout; then
+  printf '[PASS] %s already has serial-port access through dialout.\n' "$TARGET_USER"
+else
+  "${AS_ROOT[@]}" usermod -aG dialout "$TARGET_USER"
+  printf '[PASS] Added %s to dialout.\n' "$TARGET_USER"
+  printf '[ACTION REQUIRED] Sign out and back in (or reboot) before using a serial controller.\n'
+fi
+
 if [ "$(id -u)" -eq 0 ]; then
   if ! command -v runuser >/dev/null 2>&1; then
     printf '[FAIL] runuser is required to keep native build outputs owned by %s.\n' "$TARGET_USER" >&2
@@ -99,19 +114,6 @@ if [ "$(id -u)" -eq 0 ]; then
     bash "$ROOT/scripts/build_native.sh"
 else
   bash "$ROOT/scripts/build_native.sh"
-fi
-
-if ! getent group dialout >/dev/null; then
-  printf '[FAIL] The required dialout group does not exist on this system.\n' >&2
-  exit 1
-fi
-
-if id -nG "$TARGET_USER" | tr ' ' '\n' | grep -Fxq dialout; then
-  printf '[PASS] %s already has serial-port access through dialout.\n' "$TARGET_USER"
-else
-  "${AS_ROOT[@]}" usermod -aG dialout "$TARGET_USER"
-  printf '[PASS] Added %s to dialout.\n' "$TARGET_USER"
-  printf '[ACTION REQUIRED] Sign out and back in (or reboot) before using a serial controller.\n'
 fi
 
 printf '[PASS] FFmpeg/ffprobe is installed.\n'
