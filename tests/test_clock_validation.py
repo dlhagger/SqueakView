@@ -153,6 +153,19 @@ class ClockValidationTests(unittest.TestCase):
         transport.reply_override = "CLOCK_SYNC,broken"
         self.assertEqual(validate(transport)["reason"], "MALFORMED_CLOCK_SYNC")
 
+    def test_rtc_anchor_failure_blocks_run_with_actionable_diagnostic(self) -> None:
+        transport = FakeTransport(rtc_status="RTC_INVALID")
+        transport.set_rtc_error = RuntimeError("NACK,SET_RTC,ANCHOR_FAILED")
+        result = validate(transport, correct=True)
+        self.assertEqual(result["result"], "FAIL")
+        self.assertEqual(result["reason"], "SET_RTC_ANCHOR_FAILED")
+        self.assertEqual(result["validation_state"], "CORRECTION_FAILED")
+        self.assertIn("correction was authorized and sent", result["detail"])
+        self.assertIn("PCF8523", result["detail"])
+        self.assertFalse(result["correction_applied"])
+        self.assertEqual(transport.set_rtc_calls, [1_800_000_000])
+        self.assertEqual(result["after_samples"], [])
+
     def test_mismatched_sequence(self) -> None:
         transport = FakeTransport()
         transport.reply_override = (

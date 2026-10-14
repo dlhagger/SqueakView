@@ -142,6 +142,14 @@ def summarize_samples(
 
 
 def _nack_reason(line: str, command: str) -> ClockValidationError:
+    if command == "SET_RTC" and line == "NACK,SET_RTC,ANCHOR_FAILED":
+        return ClockValidationError(
+            "SET_RTC_ANCHOR_FAILED",
+            "RTC correction was authorized and sent, but the controller could not "
+            "establish a valid RTC clock anchor. Check the controller firmware and "
+            "PCF8523 RTC, including whether the clock is running. "
+            f"Controller response: {line}",
+        )
     if line == f"NACK,{command},DEVICE_BUSY":
         return ClockValidationError(
             "DEVICE_BUSY", "Controller session or feeder is active; clock access was rejected"
