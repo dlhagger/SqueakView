@@ -30,7 +30,7 @@ class RecordingLivenessTests(unittest.TestCase):
             environ={"SQUEAKVIEW_RECORDING_STALL_TIMEOUT_S": "3.5"},
         )
 
-        self.assertEqual(normal.configured_timeout_s, 8.0)
+        self.assertEqual(normal.configured_timeout_s, 30.0)
         self.assertEqual(fault.configured_timeout_s, 2.0)
         self.assertEqual(override.effective_timeout_ns, 3_500_000_000)
         self.assertEqual(
@@ -39,7 +39,7 @@ class RecordingLivenessTests(unittest.TestCase):
                 failure_injection=False,
                 environ={"SQUEAKVIEW_RECORDING_STALL_TIMEOUT_S": "inf"},
             ).configured_timeout_s,
-            8.0,
+            30.0,
         )
 
     def test_source_with_no_frames_is_not_reported_as_stalled(self) -> None:

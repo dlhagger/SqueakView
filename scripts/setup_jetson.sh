@@ -74,6 +74,7 @@ fi
 printf 'Configuring this Jetson for SqueakView (desktop user: %s)\n' "$TARGET_USER"
 "${AS_ROOT[@]}" apt-get install -y \
   ffmpeg \
+  vlc \
   build-essential \
   cmake \
   pkg-config \

@@ -40,12 +40,12 @@ def resolve_recording_liveness_policy(
     try:
         configured = float(
             values.get("SQUEAKVIEW_RECORDING_STALL_TIMEOUT_S", "")
-            or (2.0 if failure_injection else max(8.0, 5.0 / float(fps)))
+            or (2.0 if failure_injection else max(30.0, 5.0 / float(fps)))
         )
         if not math.isfinite(configured):
             raise ValueError("timeout must be finite")
     except (ValueError, ZeroDivisionError):
-        configured = 8.0
+        configured = 30.0
     return RecordingLivenessPolicy(
         configured_timeout_s=configured,
         effective_timeout_ns=int(max(1.0, configured) * 1_000_000_000),
