@@ -462,6 +462,21 @@ class SupervisorServerTests(unittest.TestCase):
         self.assertLessEqual(len(frame), MAX_FRAME_BYTES)
         self.assertIn("presentation truncated", queued.payload["message"])
 
+    def test_default_heartbeat_lease_allows_thirty_seconds(self) -> None:
+        clock = [0.0]
+        server = SupervisorServer(
+            self.socket_path,
+            runtime_context=self.runtime_context,
+            backend_factory=FakeBackend,
+            monotonic=lambda: clock[0],
+        )
+        server._renew_gui_lease()
+        for elapsed in (10.1, 29.9, 30.0):
+            clock[0] = elapsed
+            self.assertFalse(server._gui_lease_expired())
+        clock[0] = 30.1
+        self.assertTrue(server._gui_lease_expired())
+
     def test_heartbeat_renews_lease_inline_during_long_command(self) -> None:
         clock = [0.0]
         server = SupervisorServer(

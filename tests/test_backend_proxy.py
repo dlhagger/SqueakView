@@ -313,6 +313,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
         proxy._closed = threading.Event()
         proxy._shutdown_requested = False
         proxy._heartbeats = queue.Queue(maxsize=1)
+        proxy._stall_diagnostics = mock.Mock()
         proxy._pending = {}
 
         self.assertTrue(proxy.heartbeat())

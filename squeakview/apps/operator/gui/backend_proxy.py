@@ -32,6 +32,7 @@ from squeakview.apps.operator.backend.supervisor.protocol import (
     SocketEnvelopeWriter,
 )
 from squeakview.common.dashboard import DashboardEvent
+from squeakview.apps.operator.gui.stall_diagnostics import GuiStallDiagnostics
 
 
 SUPERVISOR_SOCKET_ENV = "SQUEAKVIEW_SUPERVISOR_SOCKET"
@@ -237,6 +238,7 @@ class SupervisorBackendProxy:
         self._heartbeats: queue.Queue[CommandEnvelope] = queue.Queue(
             maxsize=_MAX_PENDING_HEARTBEATS
         )
+        self._stall_diagnostics = GuiStallDiagnostics()
         self._reader_thread = threading.Thread(
             target=self._read_events,
             name="squeakview-supervisor-events",
@@ -299,6 +301,7 @@ class SupervisorBackendProxy:
 
         if self._closed.is_set() or self._shutdown_requested:
             return False
+        self._stall_diagnostics.generated()
         try:
             self._heartbeats.put_nowait(
                 CommandEnvelope(
@@ -320,6 +323,7 @@ class SupervisorBackendProxy:
             try:
                 with self._send_lock:
                     self._writer.send(heartbeat)
+                self._stall_diagnostics.sent()
             except Exception as exc:
                 if not self._intentional_close:
                     self._connection_failed(exc)
@@ -465,6 +469,7 @@ class SupervisorBackendProxy:
             pass
         self._socket.close()
         self._closed.set()
+        self._stall_diagnostics.close()
 
     def _command(
         self,
@@ -614,6 +619,7 @@ class SupervisorBackendProxy:
                 self.state.inference = _RemoteCaptureHandle()
             self.state.inference.running = active
             self._finalization_in_progress = finalizing
+        self._stall_diagnostics.set_run(run_dir, active or finalizing)
         if phase in {RunPhase.FINALIZED, RunPhase.FAILED}:
             self._stop_terminal.set()
 
@@ -642,6 +648,7 @@ class SupervisorBackendProxy:
                 self._intentional_close = True
                 self._closed.set()
                 self._socket.close()
+                self._stall_diagnostics.close()
                 return
             self._closed.set()
             try:
@@ -653,6 +660,7 @@ class SupervisorBackendProxy:
             f"SqueakView supervisor connection lost: {type(error).__name__}: {error}"
         )
         self._connection_error = failure
+        self._stall_diagnostics.close(str(failure))
         self._stop_terminal.set()
         for request in pending:
             request.error = failure

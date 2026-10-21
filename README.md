@@ -874,6 +874,23 @@ See [data_viz/README.md](data_viz/README.md) for downstream source-data rules.
 
 ## Diagnostics
 
+During supervised acquisition the GUI automatically records stall evidence in
+`diagnostics/gui_stalls.jsonl` inside the run. A background monitor captures
+Python thread stacks after 3, 6, and 9 seconds without GUI progress or heartbeat
+transmission, plus recovery and connection-loss evidence. Records include UTC
+time, hostname, process ID, run ID, and heartbeat timing. Compare `gui_stall`
+with `heartbeat_send_stall` to distinguish event-loop delays from sender delays.
+Stacks capture call sites, not local variable values; native calls may require
+additional diagnosis. A native extension holding Python's GIL indefinitely can
+also prevent this Python monitor from running.
+
+Diagnostic output is best-effort, limited to 2 MiB per run, and written only by
+a daemon thread; acquisition and scientific logging never wait for it. There
+are no per-frame diagnostic writes or video/ledger scans. Storage failure or
+exhausting the cap can leave evidence unavailable. This instrumentation does
+not change the shutdown policy. The GUI heartbeat timeout is 30 seconds;
+stall diagnostics begin after 3 seconds, before that timeout.
+
 Show optional DeepStream plugin warnings that the GUI normally filters:
 
 ```bash
