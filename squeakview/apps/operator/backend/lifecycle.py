@@ -163,6 +163,7 @@ def finalize_run(
                     stop_failures: list[str] = []
                     if (
                         request.controller_protocol == "v2"
+                        and request.trigger_on
                         and request.controller_started
                         and not serial_handle.wait_for_camera_stop(timeout_s=3.0)
                     ):

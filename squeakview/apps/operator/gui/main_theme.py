@@ -5,6 +5,19 @@ from __future__ import annotations
 from PySide6 import QtWidgets
 
 
+BOTTLE_HISTORY_HEADER_STYLE = """
+    QHeaderView::section {
+        background-color: #242e46;
+        color: #d7e0f5;
+        padding: 7px 8px;
+        border: none;
+        border-right: 1px solid #3b4763;
+        border-bottom: 1px solid #3b4763;
+        font-weight: 600;
+    }
+"""
+
+
 MAIN_WINDOW_STYLESHEET = """
             QMainWindow {
                 background-color: #171821;
@@ -143,6 +156,63 @@ MAIN_WINDOW_STYLESHEET = """
                 margin-top: 0;
                 padding: 8px 10px 10px 10px;
             }
+            QLabel#bottleLickStatus {
+                background-color: #14192a;
+                border: 1px solid #303b55;
+                border-radius: 6px;
+                color: #d7e0f5;
+                padding: 8px;
+            }
+            QToolButton#bottleHistoryToggle {
+                color: #d7e0f5;
+                background-color: #222a40;
+                border: 1px solid #3b4763;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-weight: 600;
+            }
+            QToolButton#bottleHistoryToggle:hover, QToolButton#bottleHistoryToggle:checked {
+                background-color: #2d3855;
+                border-color: #6275a4;
+            }
+            QLabel#bottleHistoryEmpty {
+                color: #b7c2dc;
+                background-color: #14192a;
+                border: 1px solid #303b55;
+                border-radius: 6px;
+                padding: 12px;
+            }
+            QPushButton[compact="true"] {
+                min-height: 20px;
+                padding: 4px 8px;
+                font-size: 12px;
+            }
+            QTableWidget#bottleHistory {
+                color: #e8ecff;
+                background-color: #111629;
+                alternate-background-color: #1b2338;
+                gridline-color: #303b55;
+                border: 1px solid #3b4763;
+                border-radius: 5px;
+                selection-background-color: #354b89;
+                selection-color: #ffffff;
+                outline: 0;
+            }
+            QTableWidget#bottleHistory::item { padding: 5px 8px; }
+            QTableWidget#bottleHistory QTableCornerButton::section { background-color: #242e46; }
+            QTableWidget#bottleHistory QScrollBar:horizontal {
+                background-color: #111629; height: 10px; margin: 0;
+            }
+            QTableWidget#bottleHistory QScrollBar:vertical {
+                background-color: #111629; width: 10px; margin: 0;
+            }
+            QTableWidget#bottleHistory QScrollBar::handle {
+                background-color: #526181; border-radius: 4px; min-width: 24px; min-height: 24px;
+            }
+            QTableWidget#bottleHistory QScrollBar::add-line,
+            QTableWidget#bottleHistory QScrollBar::sub-line { width: 0; height: 0; }
+            QTableWidget#bottleHistory QScrollBar::add-page,
+            QTableWidget#bottleHistory QScrollBar::sub-page { background: none; }
             QMenu {
                 background-color: #11162a;
                 color: #e8ecff;

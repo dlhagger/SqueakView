@@ -53,6 +53,9 @@ _MUTATING_COMMANDS = {
     "stop_run",
     "clear_feeder_jam",
     "save_bottle_measurements",
+    "begin_bottle_swap",
+    "resume_bottle_swap",
+    "update_bottle_history_weight",
     "shutdown_server",
 }
 
@@ -431,6 +434,30 @@ class SupervisorServer:
             return {"accepted": accepted, "snapshot": self._snapshot()}, False
         if command.name == "clear_feeder_jam":
             return {"response": self.backend.clear_feeder_jam()}, False
+        if command.name == "bottle_swap_snapshot":
+            force_probe = payload.get("force_probe", False)
+            if type(force_probe) is not bool:
+                raise ValueError("force_probe must be boolean")
+            return self.backend.bottle_swap_snapshot(force_probe=force_probe), False
+        if command.name == "bottle_history_page":
+            return self.backend.bottle_history_page(payload.get("offset", 0), payload.get("limit", 50)), False
+        if command.name == "begin_bottle_swap":
+            sides = payload.get("sides")
+            if not isinstance(sides, (list, tuple)) or not sides or any(
+                side not in {"left", "right"} for side in sides
+            ):
+                raise ValueError("select left, right, or both bottles")
+            return self.backend.begin_bottle_swap(list(sides)), False
+        if command.name == "resume_bottle_swap":
+            replacements = payload.get("replacements")
+            if not isinstance(replacements, Mapping):
+                raise ValueError("replacement bottles must be an object")
+            return self.backend.resume_bottle_swap(dict(replacements)), False
+        if command.name == "update_bottle_history_weight":
+            bottle_id, weight = payload.get("bottle_id"), payload.get("weight")
+            if not isinstance(bottle_id, str) or isinstance(weight, bool) or not isinstance(weight, (int, float)):
+                raise ValueError("bottle identity and final weight are required")
+            return self.backend.update_bottle_history_weight(bottle_id, weight), False
         if command.name == "save_bottle_measurements":
             bottles = payload.get("bottles")
             if bottles is not None and not isinstance(bottles, Mapping):
@@ -738,6 +765,10 @@ class SupervisorServer:
                         "operator GUI sent an invalid heartbeat"
                     )
                     break
+                if envelope.name == "stop_run":
+                    interrupt = getattr(self.backend, "interrupt_bottle_swap_for_stop", None)
+                    if callable(interrupt):
+                        interrupt()
                 try:
                     self._commands.put_nowait(envelope)
                 except queue.Full:

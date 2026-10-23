@@ -13,11 +13,13 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Callable, Iterable
 
 from squeakview.common import controller_protocol_v2 as protocol_v2
+from squeakview.common.bottle_control import SWAP_ID, parse_bottle_state
 from squeakview.common.failure_injection import FailurePlan
 from squeakview.common.controller_watchdog import (
     ControllerCapabilities,
@@ -144,6 +146,10 @@ class SerialHandle:
         self._ttl_seen = threading.Event()
         self._stop_ack_seen = threading.Event()
         self._stop_ack_count: int | None = None
+        self._behavior_start_seen = threading.Event()
+        self._behavior_start_error: str | None = None
+        self._behavior_start_pending = False
+        self._behavior_start_lock = threading.Lock()
         self._clear_jam_lock = threading.Lock()
         self._clear_jam_pending = False
         self._clear_jam_response_seen = threading.Event()
@@ -154,6 +160,12 @@ class SerialHandle:
         self._clock_response_seen = threading.Event()
         self._clock_response: tuple[str, int] | None = None
         self._clock_error: str | None = None
+        self._bottle_condition = threading.Condition()
+        self._bottle_command_lock = threading.Lock()
+        self._bottle_generation = 0
+        self._bottle_responses: deque[tuple[int, dict[str, object]]] = deque(maxlen=32)
+        self._bottle_state: dict[str, object] | None = None
+        self._bottle_counts = {"left": 0, "right": 0}
         self._protocol_mode = "v1"
         self._protocol_v2_pending = False
         self._protocol_v2_seen = threading.Event()
@@ -377,6 +389,11 @@ class SerialHandle:
             self._protocol_v2_seen.clear()
             self._v1_input.clear()
             self._v2_decoder.reset()
+            with self._bottle_condition:
+                self._bottle_generation = 0
+                self._bottle_responses.clear()
+                self._bottle_state = None
+                self._bottle_counts = {"left": 0, "right": 0}
             self._write_queue = queue.PriorityQueue()
             self._v2_queue = queue.Queue(maxsize=MAX_BUFFERED_V2_RECORDS)
             with self._ttl_lock:
@@ -642,6 +659,14 @@ class SerialHandle:
             raise OSError("qualification-injected serial reader failure")
         if count_read:
             self._read_count += 1
+        if self._protocol_mode == "v2":
+            self._ingest_bottle_line(line)
+        if self._behavior_start_pending:
+            if line.startswith("ACK_START_BEHAVIOR,"):
+                self._behavior_start_seen.set()
+            elif line.startswith("NACK,START_BEHAVIOR,") or line.startswith("NACK,UNKNOWN,"):
+                self._behavior_start_error = line
+                self._behavior_start_seen.set()
         if self._protocol_v2_pending and line == "ACK_PROTO,2":
             self._protocol_mode = "v2"
             self._protocol_v2_pending = False
@@ -1053,12 +1078,112 @@ class SerialHandle:
     def send_line(self, text: str) -> None:
         self._send_line(text)
 
+    def _ingest_bottle_line(self, line: str) -> None:
+        """Observe only records already committed to the reliable journal."""
+        with self._bottle_condition:
+            if line.startswith(("ACK_START,", "ACK_START_BEHAVIOR,")):
+                self._bottle_counts = {"left": 0, "right": 0}
+                self._bottle_state = None
+                self._bottle_responses.clear()
+            elif line.startswith("BOTTLE_STATE,"):
+                state = parse_bottle_state(line)
+                self._bottle_generation += 1
+                self._bottle_state = state
+                for side in ("left", "right"):
+                    self._bottle_counts[side] = max(
+                        self._bottle_counts[side], int(state[f"{side}_count"])
+                    )
+                self._bottle_responses.append((self._bottle_generation, state))
+                self._bottle_condition.notify_all()
+            elif line.startswith("DRINK_START,"):
+                fields = line.split(",")
+                if len(fields) >= 5 and fields[3] in {"LD", "RD"}:
+                    side = "left" if fields[3] == "LD" else "right"
+                    if fields[4].isascii() and fields[4].isdecimal():
+                        self._bottle_counts[side] = max(self._bottle_counts[side], int(fields[4]))
+
+    @property
+    def bottle_control_snapshot(self) -> dict[str, object]:
+        with self._bottle_condition:
+            return {
+                "controller": dict(self._bottle_state) if self._bottle_state else None,
+                "counts": dict(self._bottle_counts),
+            }
+
+    def exchange_bottle_control(
+        self, action: str, swap_id: str | None = None, *, timeout_s: float = 15.0,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, object]:
+        """Wait for a durable, matching response; send through the existing writer."""
+        if action not in {"status", "pause", "resume"}:
+            raise ValueError("unknown bottle control action")
+        if action != "status" and (not isinstance(swap_id, str) or not SWAP_ID.fullmatch(swap_id)):
+            raise ValueError("a 32-character swap identity is required")
+        if self._protocol_mode != "v2":
+            raise RuntimeError("bottle swapping requires reliable controller protocol v2")
+        if not self._bottle_command_lock.acquire(blocking=False):
+            raise RuntimeError("another bottle command is pending")
+        try:
+            with self._bottle_condition:
+                after = self._bottle_generation
+            command = "BOTTLE_STATUS" if action == "status" else f"BOTTLE_{action.upper()},{swap_id}"
+            self.send_line(command)
+            deadline = time.monotonic() + timeout_s
+            with self._bottle_condition:
+                while True:
+                    if cancelled is not None and cancelled():
+                        raise RuntimeError("Bottle operation interrupted by experiment Stop")
+                    for generation, response in self._bottle_responses:
+                        if generation <= after:
+                            continue
+                        if action != "status" and response["swap_id"] != swap_id:
+                            continue
+                        if action == "pause" and response["state"] not in {"PAUSED", "FAILED"}:
+                            continue
+                        if action == "resume" and response["state"] not in {"ACTIVE", "FAILED"}:
+                            continue
+                        if response["reason"] == "SESSION_STOPPED":
+                            raise RuntimeError("controller session stopped during bottle operation")
+                        return dict(response)
+                    if self._stop.is_set() or self.fatal_error:
+                        raise ConnectionError("controller unavailable during bottle operation")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"bottle {action} not confirmed; controller state is unconfirmed")
+                    self._bottle_condition.wait(min(remaining, 0.1))
+        finally:
+            self._bottle_command_lock.release()
+
     def send_start(self, fps: int) -> None:
         """Persist the legacy START epoch boundary before the atomic write."""
 
         if type(fps) is not int or fps <= 0:
             raise ValueError("controller FPS must be a positive integer")
         self._send_line(f"START,{fps}", marker_before="START_SENT")
+
+    def send_behavior_start(self, *, timeout_s: float = 3.0) -> None:
+        """Start behavioral acquisition with camera pulses explicitly disabled."""
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not 0 < timeout_s <= 30:
+            raise ValueError("behavior startup timeout must be between zero and 30 seconds")
+        if not self._behavior_start_lock.acquire(blocking=False):
+            raise RuntimeError("behavioral session startup is already pending")
+        try:
+            self._behavior_start_error = None
+            self._behavior_start_seen.clear()
+            self._behavior_start_pending = True
+            self._send_line("START_BEHAVIOR", marker_before="START_BEHAVIOR_SENT")
+            deadline = time.monotonic() + timeout_s
+            while not self._behavior_start_seen.wait(min(0.1, max(0, deadline - time.monotonic()))):
+                if self._stop.is_set() or self.fatal_error:
+                    raise ConnectionError("controller unavailable while starting behavior session")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("controller did not acknowledge START_BEHAVIOR; update controller firmware")
+            if self._behavior_start_error:
+                raise RuntimeError(f"behavior-only session rejected: {self._behavior_start_error}; update controller firmware if unsupported")
+            self.log_marker("START_BEHAVIOR_ACKED")
+        finally:
+            self._behavior_start_pending = False
+            self._behavior_start_lock.release()
 
     def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None:
         """Enter or rejoin v2, including when the controller is already active."""

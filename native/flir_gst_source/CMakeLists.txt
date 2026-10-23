@@ -50,3 +50,26 @@ set_target_properties(gstflirspinsrc PROPERTIES
   BUILD_RPATH "/opt/spinnaker/lib;/opt/nvidia/deepstream/deepstream/lib"
   INSTALL_RPATH "/opt/spinnaker/lib;/opt/nvidia/deepstream/deepstream/lib"
 )
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(flir_source_eos_test tests/test_graceful_eos.cpp)
+  target_include_directories(flir_source_eos_test SYSTEM PRIVATE
+    /opt/spinnaker/include
+    /opt/nvidia/deepstream/deepstream/sources/includes
+  )
+  target_link_directories(flir_source_eos_test PRIVATE
+    /opt/spinnaker/lib
+    /opt/nvidia/deepstream/deepstream/lib
+  )
+  target_link_libraries(flir_source_eos_test PRIVATE
+    PkgConfig::GST Spinnaker nvds_meta nvdsgst_meta
+  )
+  target_compile_definitions(flir_source_eos_test PRIVATE PACKAGE="squeakview")
+  target_compile_options(flir_source_eos_test PRIVATE -Wall -Wextra -Wpedantic)
+  set_target_properties(flir_source_eos_test PROPERTIES
+    BUILD_RPATH "/opt/spinnaker/lib;/opt/nvidia/deepstream/deepstream/lib"
+  )
+  add_test(NAME flir_source_graceful_eos COMMAND flir_source_eos_test)
+  set_tests_properties(flir_source_graceful_eos PROPERTIES TIMEOUT 20)
+endif()

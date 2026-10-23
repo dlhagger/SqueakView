@@ -76,6 +76,8 @@ config/                         Run-local configuration snapshots
 bottle_setup.json               Bottle setup, when used
 bottle_measurements.csv         Entered bottle weights, when used
 bottle_summary.json             Derived bottle intake, when used
+bottle_history.json             Current/closed bottles and shared lick observation gaps
+bottle_history_events.jsonl      Bottle swap and calibration audit events
 ```
 
 Some optional CSVs may contain only their header when no observations or errors
@@ -83,6 +85,30 @@ occurred. That is not by itself a failure. `run_status.json` and
 `diagnostics/controller_v2_summary.json` determine whether a v2 acquisition
 passed validation. `alignment_validated=false` is expected for v2 because the
 legacy `CAMERA_HIGH` aligner is intentionally skipped.
+
+For experiments with bottle replacements, use `bottle_history.json` (schema
+version 1) rather than interpreting the compatibility bottle CSV as the complete
+session. `current` holds the open bottle on each side and `history` holds closed
+bottles. Bottle IDs, fluids, initial/final weights, derived intake, controller
+installation/removal timestamps, and cumulative-counter boundaries associate
+licks with the actual bottle. Session counters continue globally; only replaced
+bottles receive a new baseline. The unchanged side retains its bottle and count.
+
+A serial-enabled run with `capture.trigger_on=false` is a behavior-only
+controller session: `START_BEHAVIOR` starts normal behavioral tasks and bottle
+controls, while cameras free-run without controller TTL pulses. There is no
+camera-TTL alignment in this mode. Use camera capture/admission/frame ledgers and
+video counts for recording integrity; a controller TTL count of zero is expected
+and must not be compared to the video's frame count. Behavioral timestamps and
+shared bottle observation gaps remain valid controller evidence.
+
+Each `gaps` entry marks a shared pause/calibration interval for both lick channels.
+Exclude those intervals from valid observation time and lick-rate denominators;
+absence of lick events during a gap does not mean zero drinking. Inspect
+`bottle_history_events.jsonl` for calibration retries and interruption history.
+Missing final weights produce incomplete intake measurements, and final weights
+above initial weights remain visible with a plausibility warning. Mouse weight is
+run-level metadata in the existing bottle setup/summary and manifest artifacts.
 
 ## DGX Directory Layout
 
@@ -168,3 +194,28 @@ under `analysis_results/<run_id>/reinference/`; they must never overwrite live
 A future release should add an optional `rsync`-based Jetson-to-DGX transfer
 workflow with resumable copying and automated verification. Until that release,
 the supported procedure is the complete manual directory copy described above.
+
+## Bottle History and Swap Gaps
+
+Runs with bottle swapping store every installed bottle in `bottle_history.json`.
+`bottle_history_events.jsonl` retains swap requests and historical weight
+corrections; the reliable controller journal contains the hardware transitions.
+Global lick counters continue across swaps. A replacement starts its own bottle
+counter, while the unchanged bottle keeps its identity and accumulated licks.
+
+To annotate events loaded through `v2_alignment`:
+
+```python
+from data_viz.bottle_history import load_bottle_history, annotate_bottle_events
+
+history = load_bottle_history(run_dir)
+if history is not None:
+    events = annotate_bottle_events(events, history)
+```
+
+The returned DataFrame includes `bottle_id`, `bottle_fluid`, and nullable
+`lick_observation_valid`. Use controller `rp2040Time` microseconds from the v2
+loader. Both sides are unavailable throughout each pause/calibration gap;
+exclude those intervals from observation duration instead of interpreting them
+as zero licking. The helper leaves unrelated sensor events unassigned and
+returns `None` when loading an older run without bottle history.

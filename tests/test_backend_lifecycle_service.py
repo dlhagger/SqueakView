@@ -209,6 +209,31 @@ class FinalizationServiceTests(unittest.TestCase):
         self.assertTrue(result.failed)
         self.assertIn("alignment validation", result.error or "")
 
+    def test_behavior_only_session_stops_with_ack_without_camera_reconciliation(self) -> None:
+        request = dataclasses.replace(
+            self._request(_Capture(self.events), _Serial(self.events)),
+            controller_started=True, trigger_on=False, alignment_required=False,
+        )
+        result = lifecycle.finalize_run(request, self._hooks())
+        self.assertFalse(result.failed)
+        self.assertIn("serial:STOP", self.events)
+        self.assertIn("serial:ack:2.0", self.events)
+        self.assertNotIn("serial:camera-stop:3.0", self.events)
+        self.assertFalse(any(event.startswith("capture:drain:") for event in self.events))
+        self.assertIn("capture:validate", self.events)
+
+    def test_behavior_only_session_missing_stop_ack_fails_closed(self) -> None:
+        serial = _Serial(self.events)
+        serial.wait_for_stop_ack = lambda timeout_s=2.0: False
+        request = dataclasses.replace(
+            self._request(_Capture(self.events), serial),
+            controller_started=True, trigger_on=False, alignment_required=False,
+        )
+        result = lifecycle.finalize_run(request, self._hooks())
+        self.assertTrue(result.failed)
+        self.assertIn("controller STOP was not acknowledged", result.error)
+        self.assertNotIn("serial:camera-stop:3.0", self.events)
+
     def test_free_running_serial_run_finalizes_without_trigger_alignment(self) -> None:
         request = dataclasses.replace(
             self._request(_Capture(self.events), _Serial(self.events)),

@@ -176,6 +176,49 @@ class StartupServiceTests(unittest.TestCase):
         self.assertEqual(result.prepared.config.run_dir, self.run_dir)
         self.assertEqual(result.prepared.config.preview_socket_paths, (Path("/tmp/preview.sock"),))
 
+    def test_behavior_session_starts_after_readiness_without_camera_ttl(self) -> None:
+        def start_behavior(handle, _fps):
+            handle.send_line("START_BEHAVIOR")
+            self.events.append("behavior-acknowledged")
+            return True
+
+        result = startup.start_run(
+            startup.StartupRequest(RunRequest(task_cfg=self.task, inference_enabled=False,
+                                             serial_enabled=True, trigger_on=False), False),
+            replace(self.hooks(), start_controller=start_behavior),
+        )
+        self.assertTrue(result.started)
+        ordered = ["capture-spawn", "ready-wait:30.0", "capture-running",
+                   "serial-send:START_BEHAVIOR", "behavior-acknowledged", "watch"]
+        positions = [self.events.index(event) for event in ordered]
+        self.assertEqual(positions, sorted(positions))
+        self.assertFalse(any(event.startswith("serial-ttl:") for event in self.events))
+
+    def test_behavior_missing_start_ack_fails_before_watcher(self) -> None:
+        def start_behavior(_handle, _fps):
+            raise TimeoutError("ACK_START_BEHAVIOR was not received")
+
+        result = startup.start_run(
+            startup.StartupRequest(RunRequest(task_cfg=self.task, inference_enabled=False,
+                                             serial_enabled=True, trigger_on=False), False),
+            replace(self.hooks(), start_controller=start_behavior),
+        )
+        self.assertFalse(result.started)
+        self.assertIn("ACK_START_BEHAVIOR", result.error)
+        self.assertNotIn("watch", self.events)
+        self.assertFalse(any(event.startswith("serial-ttl:") for event in self.events))
+        self.assertTrue(any(event.startswith("finalize:True:") for event in self.events))
+
+    def test_behavior_start_is_blocked_until_capture_ready(self) -> None:
+        result = startup.start_run(
+            startup.StartupRequest(RunRequest(task_cfg=self.task, inference_enabled=False,
+                                             serial_enabled=True, trigger_on=False), False),
+            replace(self.hooks(), wait_ready=lambda _timeout: False),
+        )
+        self.assertFalse(result.started)
+        self.assertNotIn("controller-started", self.events)
+        self.assertNotIn("watch", self.events)
+
     def test_experimental_watchdog_negotiates_before_capture_spawn(self) -> None:
         result = startup.start_run(
             startup.StartupRequest(

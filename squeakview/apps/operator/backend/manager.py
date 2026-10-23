@@ -23,6 +23,7 @@ from squeakview.apps.operator.backend import (
     startup,
 )
 from squeakview.apps.operator.backend.run_lock import AcquisitionLock
+from squeakview.apps.operator.backend.bottle_swap import BottleSwapService
 from squeakview.apps.operator.backend.events import (
     BackendEvent,
     EventSubscriber,
@@ -121,6 +122,11 @@ class OperatorBackend:
         self._manifest_service = manifest.RunManifestService(self._log)
         self._capture_drain_coordinator = capture_drain.CaptureDrainCoordinator()
         self._failure_plan: FailurePlan | None = None
+        self._bottle_swap: BottleSwapService | None = None
+        self._bottle_support_checked = False
+        self._bottle_last_controller: dict[str, object] | None = None
+        self._bottle_last_snapshot: dict[str, Any] = {}
+        self._bottle_operation_active = threading.Event()
         self._acquisition_lock = AcquisitionLock(
             runtime_context.user.acquisition_lock
         )
@@ -324,8 +330,10 @@ class OperatorBackend:
                     name="squeakview-metadata-fatal",
                 ).start()
                 return
-        if not bool(getattr(self.launch_cfg, "trigger_on", False)):
+        if not bool(getattr(self.launch_cfg, "serial_enabled", False)):
             self._confirm_recording()
+        elif not bool(getattr(self.launch_cfg, "trigger_on", False)):
+            self._log("[BACKEND] inference ready; waiting for behavioral controller START acknowledgement")
         else:
             self._log("[BACKEND] inference ready; waiting for controller START and first TTL")
         self._inference_ready.set()
@@ -489,6 +497,14 @@ class OperatorBackend:
 
     def _write_bottle_measurements(self, run_dir: Path, bottles: dict[str, Any] | None) -> dict[str, Any]:
         summary = run_context.write_bottle_artifacts(run_dir, bottles)
+        service = getattr(self, "_bottle_swap", None)
+        if service is not None and service.path.parent == run_dir:
+            history = service.snapshot()
+            summary["complete"] = bool(history["measurements_complete"])
+            summary["history"] = "bottle_history.json"
+            summary["history_events"] = "bottle_history_events.jsonl"
+            summary["closed_bottle_count"] = history["history_count"]
+            run_context.atomic_write_json(run_dir / run_context.BOTTLE_SUMMARY_FILENAME, summary)
         state = "complete" if summary.get("complete") else "incomplete"
         self._log(f"[BOTTLES] saved {state} bottle metadata → {run_dir / run_context.BOTTLE_MEASUREMENTS_FILENAME}")
         for warning in summary.get("warnings", []):
@@ -500,6 +516,12 @@ class OperatorBackend:
         bottles: dict[str, Any] | None,
         run_dir: Path | None = None,
     ) -> dict[str, Any]:
+        with self._finalize_lock:
+            return self._save_bottle_measurements(bottles, run_dir)
+
+    def _save_bottle_measurements(
+        self, bottles: dict[str, Any] | None, run_dir: Path | None = None,
+    ) -> dict[str, Any]:
         target = Path(run_dir) if run_dir is not None else self.state.run_dir
         if target is None:
             raise RuntimeError("no active run directory for bottle metadata")
@@ -508,6 +530,29 @@ class OperatorBackend:
             within=self.runtime_context.project.paths.runs,
             must_exist=True,
         )
+        service = getattr(self, "_bottle_swap", None)
+        if service is not None and service.path.parent == target:
+            current = service.snapshot()
+            if current.get("history_count", len(current["history"])):
+                # After a replacement, stale form fields cannot rename a bottle
+                # or attach an old bottle's final weight to its replacement.
+                supplied = bottles or {}
+                merged = dict(run_context.read_json(target / run_context.BOTTLE_SUMMARY_FILENAME) or {})
+                merged = {"mouse_weight_g": merged.get("mouse_weight_g"), **current["current"]}
+                if "mouse_weight_g" in supplied:
+                    merged["mouse_weight_g"] = supplied["mouse_weight_g"]
+                if self._state_machine.phase in {RunPhase.FINALIZED, RunPhase.FAILED}:
+                    ids = supplied.get("current_bottle_ids", {})
+                    for side in ("left", "right"):
+                        if side in supplied:
+                            if ids.get(side) != current["current"][side]["bottle_id"]:
+                                raise ValueError("Bottle changed; refresh Weigh-In before saving final weights")
+                            merged[side] = {**merged[side], "final_weight_g": supplied[side].get("final_weight_g")}
+                bottles = merged
+            else:
+                previous = run_context.read_json(target / run_context.BOTTLE_SETUP_FILENAME) or {}
+                bottles = {**previous.get("sides", {}), "mouse_weight_g": previous.get("mouse_weight_g"), **(bottles or {})}
+            service.sync_measurements(bottles or {})
         summary = self._write_bottle_measurements(target, bottles)
         self._write_run_manifest(target)
         try:
@@ -519,6 +564,120 @@ class OperatorBackend:
         except Exception as exc:
             self._log(f"[BOTTLES] status update failed: {exc}")
         return summary
+
+    def _observe_bottle_runtime(self) -> None:
+        service = self._bottle_swap
+        handle = self.state.serial
+        if service is None or handle is None:
+            return
+        observed = getattr(handle, "bottle_control_snapshot", {})
+        if not isinstance(observed, dict):
+            return
+        for side, count in observed.get("counts", {}).items():
+            service.observe_lick(side, count)
+        controller = observed.get("controller")
+        if controller and controller != self._bottle_last_controller:
+            service.observe_controller(controller)
+            self._bottle_last_controller = controller
+
+    def _exchange_bottle_control(self, action: str, swap_id: str) -> dict[str, object]:
+        if self._stop_requested.is_set() or self._state_machine.phase != RunPhase.RECORDING:
+            raise RuntimeError("Bottle swapping requires an active recording")
+        handle = self.state.serial
+        if handle is None:
+            raise ConnectionError("The lick controller is not connected")
+        if not self._controller_started:
+            raise RuntimeError("Bottle swapping requires a running lick-controller session")
+        self._bottle_operation_active.set()
+        try:
+            return handle.exchange_bottle_control(
+                action, swap_id or None, timeout_s=2.0 if action == "status" else 15.0,
+                cancelled=self._stop_requested.is_set,
+            )
+        finally:
+            self._bottle_operation_active.clear()
+
+    def interrupt_bottle_swap_for_stop(self) -> None:
+        """Receive-side cancellation lets Stop bypass a calibration wait."""
+        if self._bottle_operation_active.is_set():
+            self._stop_requested.set()
+
+    def bottle_swap_snapshot(self, force_probe: bool = False) -> dict[str, Any]:
+        service = self._bottle_swap
+        if service is None:
+            return {"available": False, "state": "STOPPED", "current": {}, "history": [], "global_counts": {"left": 0, "right": 0}}
+        if not self._finalize_lock.acquire(blocking=False):
+            return {**self._bottle_last_snapshot, "available": False}
+        try:
+            previous_count = service.snapshot()["history_count"]
+            unresolved = service.snapshot()["state"] in {"UNCONFIRMED", "CALIBRATING"}
+            if (force_probe or unresolved or not self._bottle_support_checked) and self._state_machine.phase == RunPhase.RECORDING:
+                self._bottle_support_checked = True
+                try:
+                    response = self._exchange_bottle_control("status", "")
+                    service.observe_controller(response)
+                    self._bottle_last_controller = response
+                except Exception as exc:
+                    self._log(f"[BOTTLES] live swapping unavailable: {exc}")
+            self._observe_bottle_runtime()
+            if service.snapshot()["history_count"] != previous_count:
+                self._persist_bottle_swap_summary()
+            self._bottle_last_snapshot = service.snapshot()
+            return self._bottle_last_snapshot
+        finally:
+            self._finalize_lock.release()
+
+    def bottle_history_page(self, offset: int, limit: int = 50) -> dict[str, Any]:
+        if type(offset) is not int or type(limit) is not int:
+            raise ValueError("History offset and limit must be integers")
+        with self._finalize_lock:
+            if self._bottle_swap is None:
+                return {"history": [], "history_count": 0, "offset": offset, "limit": limit}
+            return {
+                "history": self._bottle_swap.history_page(offset, limit),
+                "history_count": self._bottle_swap.snapshot()["history_count"],
+                "offset": offset, "limit": limit,
+            }
+
+    def _persist_bottle_swap_summary(self) -> None:
+        service = self._bottle_swap
+        if service is None:
+            return
+        snapshot = service.snapshot()
+        run_dir = service.path.parent
+        previous = run_context.read_json(run_dir / run_context.BOTTLE_SUMMARY_FILENAME) or {}
+        self._write_bottle_measurements(run_dir, {
+            **snapshot["current"], "mouse_weight_g": previous.get("mouse_weight_g"),
+        })
+        self._write_run_manifest(run_dir, required=True)
+        self._bottle_last_snapshot = snapshot
+
+    def begin_bottle_swap(self, sides: list[str]) -> dict[str, Any]:
+        with self._finalize_lock:
+            if self._bottle_swap is None or self._state_machine.phase != RunPhase.RECORDING:
+                raise RuntimeError("Bottle swapping requires an active recording")
+            self._observe_bottle_runtime()
+            self._bottle_swap.begin(sides, self._exchange_bottle_control)
+            self._persist_bottle_swap_summary()
+            return self._bottle_swap.snapshot()
+
+    def resume_bottle_swap(self, replacements: dict[str, object]) -> dict[str, Any]:
+        with self._finalize_lock:
+            if self._bottle_swap is None or self._state_machine.phase != RunPhase.RECORDING:
+                raise RuntimeError("Bottle swapping requires an active recording")
+            self._observe_bottle_runtime()
+            self._bottle_swap.resume(replacements, self._exchange_bottle_control)
+            self._observe_bottle_runtime()
+            self._persist_bottle_swap_summary()
+            return self._bottle_swap.snapshot()
+
+    def update_bottle_history_weight(self, bottle_id: str, weight: float) -> dict[str, Any]:
+        with self._finalize_lock:
+            if self._bottle_swap is None:
+                raise RuntimeError("No bottle history is available")
+            self._bottle_swap.update_final_weight(bottle_id, weight)
+            self._persist_bottle_swap_summary()
+            return self._bottle_swap.snapshot()
 
     def _ensure_metadata(self, run_dir: Path) -> None:
         if self._metadata_written:
@@ -562,6 +721,10 @@ class OperatorBackend:
         )
 
     def _run_capture_finalizer(self, run_dir: Path) -> int:
+        if getattr(self, "_bottle_swap", None) is not None:
+            self._observe_bottle_runtime()
+            self._bottle_swap.finalize()
+            self._persist_bottle_swap_summary()
         alignment_required = bool(
             getattr(self.launch_cfg, "serial_enabled", False)
             and getattr(self.launch_cfg, "trigger_on", False)
@@ -652,6 +815,20 @@ class OperatorBackend:
                     capture_returncode=None,
                     serial_closed=self.state.serial is not None,
                 )
+            # A failed capture exit can skip the recording validator entirely.
+            # Bottle history still needs a terminal state and final counters.
+            service = getattr(self, "_bottle_swap", None)
+            if service is not None and service.snapshot()["state"] != "STOPPED":
+                try:
+                    self._observe_bottle_runtime()
+                    service.finalize()
+                    self._persist_bottle_swap_summary()
+                except Exception as exc:
+                    detail = f"bottle history finalization failed: {exc}"
+                    self._log(f"[BOTTLES] {detail}")
+                    result = replace(result, final_state="failed", error="; ".join(
+                        item for item in (result.error, detail) if item
+                    ))
             # Make terminal persistence/phase atomic against GUI-lease loss.
             # If the lease disappeared while an existing finalizer held its
             # lock, successful artifact closure remains useful evidence but
@@ -755,6 +932,10 @@ class OperatorBackend:
             self._serial_runtime_armed = False
 
         def establish_run(prepared: startup.PreparedRun) -> None:
+            self._bottle_swap = None
+            self._bottle_support_checked = False
+            self._bottle_last_controller = None
+            self._bottle_last_snapshot = {}
             self.launch_cfg = prepared.config
             self.state.run_dir = prepared.run_dir
             self._run_finalized = False
@@ -829,6 +1010,9 @@ class OperatorBackend:
             )
             self._write_bottle_measurements(
                 prepared.run_dir, getattr(cfg, "bottles", None)
+            )
+            self._bottle_swap = BottleSwapService(
+                prepared.run_dir, run_context.normalize_bottle_measurements(cfg.bottles)
             )
             self._write_run_manifest(prepared.run_dir, required=True)
             run_context.write_status(prepared.run_dir, "starting")
@@ -958,7 +1142,10 @@ class OperatorBackend:
                     handle.arm_watchdog_v1(int(fps), timeout_s=2.0)
                     handle.log_marker("WATCHDOG_V1_ARM_ACKED")
                 else:
-                    handle.send_start(int(fps))
+                    if self.launch_cfg.trigger_on:
+                        handle.send_start(int(fps))
+                    else:
+                        handle.send_behavior_start(timeout_s=3.0)
                 self._controller_started = True
                 return True
 
@@ -1069,7 +1256,7 @@ class OperatorBackend:
         )
         if not result.started and result.error:
             self._last_error = result.error
-        if result.started and bool(getattr(cfg, "trigger_on", False)):
+        if result.started and bool(getattr(cfg, "serial_enabled", False)):
             return self._confirm_recording()
         return result.started
 

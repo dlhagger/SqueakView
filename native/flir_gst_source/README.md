@@ -17,7 +17,21 @@ pipeline.
 ```bash
 cmake -S native/flir_gst_source -B native/flir_gst_source/build
 cmake --build native/flir_gst_source/build -j
+ctest --test-dir native/flir_gst_source/build --output-on-failure
 ```
+
+The camera-free EOS regression tests exercise the production event handler with
+an in-flight frame, two sources, and an idle triggered source. They require the
+vendor libraries but do not open a camera.
+
+## Graceful shutdown
+
+External EOS requests are completed by the source streaming thread. A frame
+already being acquired is logged and delivered before the next source call
+returns EOS. An idle triggered camera completes EOS at its bounded image-read
+timeout. This prevents the default external-EOS handling from discarding the
+last frame after it has entered the capture ledger. Flushes and state changes
+retain the normal cancellation behavior; acquisition errors still fail the run.
 
 ## Inspect
 

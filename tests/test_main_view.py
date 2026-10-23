@@ -54,7 +54,7 @@ class MainViewTest(unittest.TestCase):
         self.assertTrue(self.view.event_log.isReadOnly())
         self.assertEqual(self.view.event_log.document().maximumBlockCount(), 500)
         self.assertIs(self.view.stop_overlay.parentWidget(), self.window)
-        self.assertEqual(self.view.bottle_panel.save_button.text(), "Save Bottle Info")
+        self.assertEqual(self.view.bottle_panel.save_button.text(), "Save Measurements")
         self.assertIs(self.view.workspace.parent(), self.window)
         self.assertEqual(
             set(self.view.workspace.cards),
@@ -104,7 +104,7 @@ class MainViewTest(unittest.TestCase):
                 "System Load",
                 "Clock Preflight",
                 "Live Task State",
-                "Bottles",
+                "Weigh-In",
                 "Behavior Dashboard",
                 "Operator Events",
             }.difference(actions),

@@ -426,6 +426,27 @@ class SupervisorBackendProxy:
             raise RuntimeError("supervisor returned invalid bottle metadata")
         return dict(result)
 
+    def _bottle_command(self, name: str, payload: dict[str, object]) -> dict[str, Any]:
+        result = self._command(name, payload, timeout=25.0)
+        if not isinstance(result, Mapping):
+            raise RuntimeError("supervisor returned invalid bottle-swap state")
+        return _plain(result)
+
+    def bottle_swap_snapshot(self, force_probe: bool = False) -> dict[str, Any]:
+        return self._bottle_command("bottle_swap_snapshot", {"force_probe": force_probe})
+
+    def bottle_history_page(self, offset: int, limit: int = 50) -> dict[str, Any]:
+        return self._bottle_command("bottle_history_page", {"offset": offset, "limit": limit})
+
+    def begin_bottle_swap(self, sides: list[str]) -> dict[str, Any]:
+        return self._bottle_command("begin_bottle_swap", {"sides": sides})
+
+    def resume_bottle_swap(self, replacements: dict[str, object]) -> dict[str, Any]:
+        return self._bottle_command("resume_bottle_swap", {"replacements": _plain(replacements)})
+
+    def update_bottle_history_weight(self, bottle_id: str, weight: float) -> dict[str, Any]:
+        return self._bottle_command("update_bottle_history_weight", {"bottle_id": bottle_id, "weight": weight})
+
     def clear_feeder_jam(self) -> str:
         result = self._command("clear_feeder_jam", {})
         if not isinstance(result, Mapping) or set(result) != {"response"}:

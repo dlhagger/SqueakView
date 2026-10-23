@@ -116,6 +116,11 @@ class FakeSerialHandle:
         self.log_marker("START_SENT")
         self.send_line(f"START,{fps}")
 
+    def send_behavior_start(self, *, timeout_s: float = 3.0) -> None:
+        del timeout_s
+        self.log_marker("START_BEHAVIOR_SENT")
+        self.send_line("START_BEHAVIOR")
+
     def wait_for_ttl(self, timeout_s: float = 3.0) -> bool:
         del timeout_s
         return True
@@ -269,6 +274,8 @@ class BackendLifecycleTests(unittest.TestCase):
             del emit
             self.exit_callback = on_exit
             self.spawn_kwargs = kwargs
+            if _cfg.serial_enabled and not _cfg.trigger_on:
+                self.backend._inference_ready.set()
             return self.handle
 
         def finalize(run_dir: Path) -> int:

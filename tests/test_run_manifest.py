@@ -61,6 +61,49 @@ class RunManifestServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_mouse_weight_survives_run_request_artifacts_and_manifest_updates(self) -> None:
+        request = RunRequest(bottles={
+            "mouse_weight_g": 25.375,
+            "left": {"fluid": "water", "initial_weight_g": 100},
+            "right": {"fluid": "water", "initial_weight_g": 110},
+        })
+        summary = run_context.write_bottle_artifacts(self.run_dir, request.bottles)
+        self.assertEqual(summary["mouse_weight_g"], 25.375)
+        self.assertFalse(summary["complete"])
+        setup = run_context.read_json(self.run_dir / run_context.BOTTLE_SETUP_FILENAME)
+        self.assertEqual(setup["mouse_weight_g"], 25.375)
+        self.assertEqual(self.service.bottle_snapshot(self.run_dir)["mouse_weight_g"], 25.375)
+
+        updated = dict(request.bottles)
+        updated["mouse_weight_g"] = 25.5
+        updated["left"] = {"fluid": "water", "initial_weight_g": 100, "final_weight_g": 98}
+        updated["right"] = {"fluid": "water", "initial_weight_g": 110, "final_weight_g": 107}
+        summary = run_context.write_bottle_artifacts(self.run_dir, updated)
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["sides"]["left"]["intake_g"], 2)
+        self.assertEqual(self.service.bottle_snapshot(self.run_dir)["mouse_weight_g"], 25.5)
+        run_context.write_manifest(self.run_dir, {
+            "schema_version": "3.0", "platform": {"jetson_model": "original"},
+        })
+        run_context.atomic_write_json(
+            self.run_dir / run_context.RUN_STATUS_FILENAME, {"state": "finalized"},
+        )
+        self.assertTrue(self.service.write(
+            self.run_dir, self.context, output_snapshot=lambda _path: {},
+        ))
+        saved = run_context.read_json(self.run_dir / run_context.RUN_MANIFEST_FILENAME)
+        self.assertEqual(saved["bottles"]["mouse_weight_g"], 25.5)
+        self.assertEqual(saved["platform"], {"jetson_model": "original"})
+
+    def test_old_bottle_artifacts_do_not_require_mouse_weight(self) -> None:
+        run_context.write_bottle_artifacts(self.run_dir, {
+            "left": {"fluid": "water", "initial_weight_g": 100, "final_weight_g": 98},
+            "right": {"fluid": "water", "initial_weight_g": 110, "final_weight_g": 107},
+        })
+        snapshot = self.service.bottle_snapshot(self.run_dir)
+        self.assertTrue(snapshot["complete"])
+        self.assertIsNone(snapshot["mouse_weight_g"])
+
     def test_output_snapshot_reports_files_and_validation_evidence(self) -> None:
         (self.run_dir / "frames.csv").write_text("frame\n1\n")
         (self.run_dir / "raw.mp4").write_bytes(b"video")

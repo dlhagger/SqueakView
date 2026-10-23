@@ -115,7 +115,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
             ds_cfg=Path("/tmp/config.txt"),
             camera_serials=("one", "two"),
             preview_socket_paths=(Path("/tmp/preview.sock"),),
-            bottles={"left": {"initial_g": 4.5}},
+            bottles={"left": {"initial_g": 4.5}, "mouse_weight_g": 25.375},
         )
 
         restored = launch_config_from_payload(launch_config_payload(source))

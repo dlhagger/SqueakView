@@ -629,8 +629,9 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
         )
     hooks.log("[DS] inference launched")
 
-    if serial_handle is not None and cfg.trigger_on:
-        hooks.log("[BACKEND] waiting for inference ready before START")
+    if serial_handle is not None:
+        start_action = "START" if cfg.trigger_on else "START_BEHAVIOR"
+        hooks.log(f"[BACKEND] waiting for inference ready before {start_action}")
         try:
             timeout = hooks.ready_timeout()
             ready = hooks.wait_ready(timeout)
@@ -652,13 +653,13 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
             hooks.finalize_failure(error, False)
             return StartupResult(False, prepared, serial_handle, capture, error)
         try:
-            hooks.log("[BACKEND] inference ready; sending START")
+            hooks.log(f"[BACKEND] inference ready; sending {start_action}")
             if not hooks.start_controller(serial_handle, int(cfg.arduino_fps)):
-                error = "startup cancelled before controller START"
+                error = f"startup cancelled before controller {start_action}"
                 hooks.log(f"[BACKEND] {error}")
                 hooks.finalize_failure(error, True)
                 return StartupResult(False, prepared, serial_handle, capture, error)
-            if not serial_handle.wait_for_ttl(timeout_s=3.0):
+            if cfg.trigger_on and not serial_handle.wait_for_ttl(timeout_s=3.0):
                 serial_handle.log_marker("START_TTL_TIMEOUT")
                 error = (
                     "controller START was sent, but no camera TTL was detected within "

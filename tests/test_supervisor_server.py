@@ -389,6 +389,34 @@ class SupervisorServerTests(unittest.TestCase):
             232.0,
         )
 
+    def test_swap_commands_preserve_selected_sides_and_replacement_metadata(self) -> None:
+        self.backend.begin_bottle_swap = mock.Mock(return_value={"state": "PAUSED"})
+        self.backend.resume_bottle_swap = mock.Mock(return_value={"state": "ACTIVE"})
+        result, stop = self.server._dispatch(CommandEnvelope(
+            "begin_bottle_swap", "pause-bottles", {"sides": ["right"]},
+        ))
+        self.assertEqual(result["state"], "PAUSED")
+        self.assertFalse(stop)
+        self.backend.begin_bottle_swap.assert_called_once_with(["right"])
+        self.server._dispatch(CommandEnvelope(
+            "resume_bottle_swap", "resume-bottles", {
+                "replacements": {"right": {"fluid": "sucrose", "initial_weight_g": 100, "final_weight_g": 90}},
+            },
+        ))
+        replacement = self.backend.resume_bottle_swap.call_args.args[0]["right"]
+        self.assertEqual(replacement["fluid"], "sucrose")
+        self.assertEqual(replacement["final_weight_g"], 90)
+
+    def test_swap_status_and_history_validate_control_arguments(self) -> None:
+        self.backend.bottle_swap_snapshot = mock.Mock(return_value={"available": True})
+        self.backend.bottle_history_page = mock.Mock(return_value={"history": []})
+        self.server._dispatch(CommandEnvelope("bottle_swap_snapshot", "check-bottles", {"force_probe": True}))
+        self.backend.bottle_swap_snapshot.assert_called_once_with(force_probe=True)
+        self.server._dispatch(CommandEnvelope("bottle_history_page", "older-bottles", {"offset": 50, "limit": 50}))
+        self.backend.bottle_history_page.assert_called_once_with(50, 50)
+        with self.assertRaises(ValueError):
+            self.server._dispatch(CommandEnvelope("bottle_swap_snapshot", "invalid-check", {"force_probe": "yes"}))
+
     def test_replay_window_evicts_oldest_and_never_blocks_shutdown(self) -> None:
         for index in range(MAX_MUTATION_REQUESTS):
             self.server._mutation_ledger[f"old-{index}"] = (

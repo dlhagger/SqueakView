@@ -268,6 +268,10 @@ def normalize_bottle_measurements(
 
 def build_bottle_summary(bottles: dict[str, Any] | None, *, updated_at: str | None = None) -> dict[str, Any]:
     normalized = normalize_bottle_measurements(bottles)
+    source = bottles if isinstance(bottles, Mapping) else {}
+    mouse_weight = _optional_float(source.get("mouse_weight_g"))
+    if mouse_weight == 0:
+        mouse_weight = None
     sides: dict[str, dict[str, Any]] = {}
     complete = True
     missing_fields: list[str] = []
@@ -302,6 +306,7 @@ def build_bottle_summary(bottles: dict[str, Any] | None, *, updated_at: str | No
     return {
         "schema_version": "1.0",
         "updated_at": updated_at or _now_iso(),
+        "mouse_weight_g": mouse_weight,
         "complete": complete,
         "missing_fields": missing_fields,
         "warnings": warnings,
@@ -343,6 +348,7 @@ def write_bottle_artifacts(run_dir: Path, bottles: dict[str, Any] | None) -> dic
     setup = {
         "schema_version": "1.0",
         "updated_at": updated_at,
+        "mouse_weight_g": summary["mouse_weight_g"],
         "measurements": BOTTLE_MEASUREMENTS_FILENAME,
         "summary": BOTTLE_SUMMARY_FILENAME,
         "sides": {

@@ -295,6 +295,8 @@ class RunManifestService:
                 "setup": self.file_info(artifacts.bottle_setup_json),
                 "measurements": self.file_info(artifacts.bottle_measurements_csv),
                 "summary": self.file_info(artifacts.bottle_summary_json),
+                "history": self.file_info(run_dir / "bottle_history.json"),
+                "history_events": self.file_info(run_dir / "bottle_history_events.jsonl"),
             },
         }
 
@@ -308,6 +310,9 @@ class RunManifestService:
             "summary": artifacts.bottle_summary_json.name,
             "complete": bool(summary.get("complete")) if summary else False,
             "sides": summary.get("sides", {}) if summary else {},
+            "mouse_weight_g": summary.get("mouse_weight_g") if summary else None,
+            "history": "bottle_history.json" if (run_dir / "bottle_history.json").exists() else None,
+            "history_events": "bottle_history_events.jsonl" if (run_dir / "bottle_history_events.jsonl").exists() else None,
         }
 
     def build(
@@ -518,6 +523,10 @@ class RunManifestService:
             ),
             "serial": {
                 "enabled": cfg.serial_enabled,
+                "session_mode": (
+                    "triggered" if cfg.serial_enabled and cfg.trigger_on
+                    else "behavior_only" if cfg.serial_enabled else "disabled"
+                ),
                 "port": cfg.serial_port if cfg.serial_enabled else None,
                 "baud": cfg.serial_baud if cfg.serial_enabled else None,
                 "alignment_required": bool(

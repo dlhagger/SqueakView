@@ -69,6 +69,7 @@ class BottlePayloadTests(unittest.TestCase):
         self.assertEqual(
             payload,
             {
+                "mouse_weight_g": None,
                 "left": {
                     "fluid": "water",
                     "initial_weight_g": None,
@@ -112,7 +113,7 @@ class BottlePayloadTests(unittest.TestCase):
 
         complete = present_saved_bottles({"complete": True, "warnings": []})
         self.assertFalse(complete.completion_pending)
-        self.assertEqual(complete.status_text, "Bottle info complete.")
+        self.assertEqual(complete.status_text, "Measurements saved; bottle weights complete.")
         self.assertIsNone(complete.warning_message)
 
 
@@ -159,6 +160,25 @@ class BottleMeasurementPanelTests(unittest.TestCase):
             },
         )
 
+    def test_mouse_weight_is_collected_at_start_and_on_explicit_save(self) -> None:
+        self.assertEqual(self.panel.title(), "Weigh-In")
+        self.panel.mouse_weight_edit.setText("25.375")
+        for include_final in (False, True):
+            payload = self.panel.collect_payload(include_final=include_final, strict=True)
+            self.assertEqual(payload["mouse_weight_g"], 25.375)
+        self.panel.mouse_weight_edit.clear()
+        self.assertIsNone(self.panel.collect_payload(include_final=True, strict=True)["mouse_weight_g"])
+
+    def test_invalid_mouse_weight_is_rejected_on_save(self) -> None:
+        for value in ("bad", "nan", "inf", "-1", "0"):
+            with self.subTest(value=value):
+                self.panel.mouse_weight_edit.setText(value)
+                with self.assertRaisesRegex(ValueError, "Mouse weight"):
+                    self.panel.collect_payload(include_final=True, strict=True)
+                self.assertIsNone(
+                    self.panel.collect_payload(include_final=False, strict=False)["mouse_weight_g"]
+                )
+
     def test_save_signal_and_completion_state_are_presented_by_panel(self) -> None:
         requested: list[bool] = []
         self.panel.save_requested.connect(lambda: requested.append(True))
@@ -169,7 +189,7 @@ class BottleMeasurementPanelTests(unittest.TestCase):
         self.assertEqual(self.panel.save_button.text(), "Save Final Weights")
         self.assertIn("#b98335", self.panel.styleSheet())
         self.panel.set_completion_pending(False)
-        self.assertEqual(self.panel.save_button.text(), "Save Bottle Info")
+        self.assertEqual(self.panel.save_button.text(), "Save Measurements")
         self.assertEqual(self.panel.styleSheet(), "")
 
     def test_clear_final_fields_does_not_clear_initial_measurements(self) -> None:

@@ -791,7 +791,10 @@ epoch/checkpoint/stop anchors for later pandas-based alignment on the analysis
 device without emitting per-frame controller edges.
 
 On stop, SqueakView asks the controller to stop before draining DeepStream and
-keeps the serial reader open for final acknowledgements. After the capture
+keeps the serial reader open for final acknowledgements. The FLIR source finishes
+delivering an in-flight frame before emitting EOS from its streaming thread;
+this also applies when the camera is running freely with triggering off. An idle
+triggered source finishes EOS at its bounded image-read timeout. After the capture
 process confirms EOS and closes `raw.mp4`, the shutdown validator reads the
 last monotonic indices from the capture and non-leaky recording-admission
 ledgers, reads the MP4 sample-size/timing/sample-to-chunk/chunk-offset tables,
@@ -808,6 +811,63 @@ every pixel frame to be decoded. Add `SQUEAKVIEW_VIDEO_VALIDATION_AB_VERIFY=1`
 to run both full decoders and reject any count disagreement.
 Bottle intake is calculated as initial minus final weight. A final weight above
 the initial weight is saved but shown as a plausibility warning.
+
+The **Weigh-In** panel groups the left/right bottle measurements and an optional
+mouse body weight in grams. Enter mouse weight before starting to save it with
+the initial measurements, or enter/correct it later with **Save Measurements**
+(**Save Final Weights** while bottle data is pending). Mouse weight must be a
+positive finite number; leaving it blank does not block recording or bottle
+completion. Check the retained initial measurements before each new run.
+For compatibility, the existing bottle artifact filenames remain in use:
+`bottle_setup.json` and `bottle_summary.json` store `mouse_weight_g` alongside
+the bottle data, and `run_manifest.json` includes it in the `bottles` snapshot.
+`bottle_measurements.csv` continues to contain only bottle measurements.
+
+During a running experiment, use **Swap Bottles…** in Weigh-In to replace the
+left, right, or both bottles. Select the sides, then click **Pause Both Lick
+Channels** and wait for confirmation before touching the bottles. Enter the
+selected bottles' final weights, install replacements, select or type each new
+fluid, and enter each replacement's initial weight. Clear hands from the spouts
+and click **Recalibrate & Resume**. Both lick channels resume only after the
+shared MPR121 finishes calibration and passes readiness checks. Camera recording,
+feeding, nose pokes, and the experiment clock continue throughout the swap.
+
+Session lick counters never reset. Each replaced bottle starts a fresh bottle
+counter; an unchanged bottle keeps its fluid, weight, history entry, and count.
+The pause/calibration interval is an observation gap for both channels. Expand
+**Bottle history** to view completed and current bottles, intake, lick counts,
+and installation/removal boundaries. **Older**, **Newer**, and **Latest** browse
+all completed entries in pages of 50. Select a completed entry and use
+**Edit Selected Final Weight…** to add or correct a weight later. A missing final
+weight does not prevent resuming. After stopping, save final weights for the
+current bottles using the normal Weigh-In fields.
+
+Transient stop/configuration register verification failures are retried
+automatically, up to three attempts within the same ten-second calibration
+deadline. Both channels stay paused throughout; readiness and released-spout
+checks must still pass before counting resumes. Persistent calibration failures
+leave both channels paused; retain the entered replacement values and retry.
+If acknowledgement is uncertain, use **Check Controller
+Status**; a pause request can be retried with **Check / Retry Pause**. An
+unconfirmed state is not permission to handle bottles. **Check Status** can also
+retry the capability check after a transient connection failure. Swapping requires
+compatible reliable-v2 controller firmware. Mouse-weight saves remain available
+without changing swapped bottle metadata.
+
+Bottle swaps and behavioral recording also work with **camera triggering off**.
+With serial enabled, SqueakView sends `START_BEHAVIOR` and waits for its reliable-v2
+acknowledgement before publishing the run as recording. The controller runs the
+normal behavioral tasks, lick detection, and bottle controls while the camera
+free-runs; it emits no camera TTL pulses. Triggered runs retain the existing
+`START,<fps>` activation. `STOP` ends either kind of controller session. A
+trigger-off run validates video against its capture/frame ledgers without
+requiring camera-TTL alignment or comparing the zero TTL count to video frames.
+
+`bottle_history.json` (schema version 1) holds current bottles, closed history,
+global counts, pending swap state, and shared observation gaps.
+`bottle_history_events.jsonl` preserves the swap audit trail. Existing bottle
+artifacts remain compatibility views; use the history to analyze experiments
+with replacements.
 
 To rerun the legacy bounded-memory recovery reconstruction explicitly:
 

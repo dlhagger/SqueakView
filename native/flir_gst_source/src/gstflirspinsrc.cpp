@@ -126,6 +126,7 @@ struct _GstFlirSpinSrc {
   gboolean have_camera_timestamp_base;
   gboolean have_last_frame_id;
   gint stopping;
+  gint graceful_eos_requested;
   gboolean acquisition_started;
   gboolean chunks_enabled;
   guint consecutive_timeouts;
@@ -931,6 +932,7 @@ static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
     (*self->camera)->BeginAcquisition();
     self->acquisition_started = TRUE;
     g_atomic_int_set(&self->stopping, FALSE);
+    g_atomic_int_set(&self->graceful_eos_requested, FALSE);
     self->frame_count = 0;
     self->fault_injected = FALSE;
     self->camera_timestamp_base = 0;
@@ -1188,6 +1190,21 @@ static gboolean gst_flir_spin_src_start(GstBaseSrc* base_src) {
     return FALSE;
   }
   return TRUE;
+}
+
+// GstBaseSrc's external EOS handling can flush a buffer returned by an
+// in-flight create(). Our capture/frame ledgers already describe that buffer.
+// Request EOS here, then let the streaming thread return GST_FLOW_EOS only
+// after it has delivered its current frame. FLUSH/state-change cancellation
+// still follows GstBaseSrc's normal unlock path.
+static gboolean gst_flir_spin_src_send_event(GstElement* element, GstEvent* event) {
+  if (GST_EVENT_TYPE(event) == GST_EVENT_EOS) {
+    GstFlirSpinSrc* self = GST_FLIR_SPIN_SRC(element);
+    g_atomic_int_set(&self->graceful_eos_requested, TRUE);
+    gst_event_unref(event);
+    return TRUE;
+  }
+  return GST_ELEMENT_CLASS(gst_flir_spin_src_parent_class)->send_event(element, event);
 }
 
 static gboolean gst_flir_spin_src_stop(GstBaseSrc* base_src) {
@@ -1685,6 +1702,9 @@ static GstFlowReturn copy_image_to_buffer(
 
 static GstFlowReturn gst_flir_spin_src_create(GstPushSrc* push_src, GstBuffer** out_buffer) {
   GstFlirSpinSrc* self = GST_FLIR_SPIN_SRC(push_src);
+  if (g_atomic_int_get(&self->graceful_eos_requested)) {
+    return GST_FLOW_EOS;
+  }
   if (!self->camera || !self->acquisition_started) {
     return GST_FLOW_FLUSHING;
   }
@@ -1735,12 +1755,20 @@ static GstFlowReturn gst_flir_spin_src_create(GstPushSrc* push_src, GstBuffer** 
   }
 
   while (!g_atomic_int_get(&self->stopping)) {
+    if (g_atomic_int_get(&self->graceful_eos_requested)) {
+      return GST_FLOW_EOS;
+    }
     ImagePtr image;
     try {
       image = (*self->camera)->GetNextImage(self->timeout_ms);
     } catch (const Spinnaker::Exception& exc) {
       const std::string message = spinnaker_exception_message(exc);
       if (exception_is_timeout(exc)) {
+        // An idle triggered source has no final image to deliver. Its bounded
+        // acquisition timeout is the safe point to complete requested EOS.
+        if (g_atomic_int_get(&self->graceful_eos_requested)) {
+          return GST_FLOW_EOS;
+        }
         ++self->total_timeouts;
         ++self->consecutive_timeouts;
         if (self->max_consecutive_timeouts == 0 ||
@@ -1825,6 +1853,8 @@ static GstFlowReturn gst_flir_spin_src_create(GstPushSrc* push_src, GstBuffer** 
       return GST_FLOW_ERROR;
     }
 
+    // Never test requested EOS after acquiring an image: this frame must be
+    // logged and returned downstream before the following create emits EOS.
     GstFlowReturn flow = copy_image_to_buffer(
         self,
         image,
@@ -1844,6 +1874,7 @@ static void gst_flir_spin_src_class_init(GstFlirSpinSrcClass* klass) {
   GstBaseSrcClass* base_src_class = GST_BASE_SRC_CLASS(klass);
   GstPushSrcClass* push_src_class = GST_PUSH_SRC_CLASS(klass);
 
+  element_class->send_event = GST_DEBUG_FUNCPTR(gst_flir_spin_src_send_event);
   object_class->set_property = gst_flir_spin_src_set_property;
   object_class->get_property = gst_flir_spin_src_get_property;
   object_class->finalize = gst_flir_spin_src_finalize;
@@ -2137,6 +2168,7 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   self->have_camera_timestamp_base = FALSE;
   self->have_last_frame_id = FALSE;
   g_atomic_int_set(&self->stopping, FALSE);
+  g_atomic_int_set(&self->graceful_eos_requested, FALSE);
   self->acquisition_started = FALSE;
   self->chunks_enabled = FALSE;
   self->consecutive_timeouts = 0;

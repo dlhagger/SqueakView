@@ -26,6 +26,7 @@ from squeakview.apps.operator.gui.config_dialog import (
 from squeakview.apps.operator.gui.bottle_measurements import (
     BOTTLE_FLUID_PRESETS,
     BottleMeasurementPanel,
+    BottleSwapController,
     parse_weight,
     present_saved_bottles,
 )
@@ -206,6 +207,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_controller.failed.connect(self._on_preview_failed)
         self._preview_controller.ended.connect(self._on_preview_ended)
         self._run_controller = RunLifecycleController(self)
+        self._bottle_swap_controller = BottleSwapController(
+            self.bottle_panel, self.backend, lambda: self._recording_active, self
+        )
         self._runtime_timer = QtCore.QTimer(self)
         self._runtime_timer.setInterval(500)
         self._runtime_timer.timeout.connect(self._refresh_runtime_status)
@@ -422,19 +426,19 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError as exc:
             message = str(exc)
             self._set_bottle_status(message)
-            QtWidgets.QMessageBox.warning(self, "Bottle Weight", message)
+            QtWidgets.QMessageBox.warning(self, "Weigh-In", message)
             return
 
         run_dir = self.backend.current_snapshot.run_dir
         if run_dir is None:
-            self._set_bottle_status("Bottle info pending for next run.")
-            self._emit_log("[BOTTLES] no active run; values will be saved when the next run starts")
+            self._set_bottle_status("Measurements pending for next run.")
+            self._emit_log("[BOTTLES] no active run; measurements will be saved when the next run starts")
             return
 
         try:
             summary = self.backend.save_bottle_measurements(payload, run_dir=run_dir)
         except Exception as exc:
-            self._set_bottle_status("Bottle save failed.")
+            self._set_bottle_status("Measurement save failed.")
             self._emit_log(f"[BOTTLES] save failed: {exc}")
             return
 
@@ -444,7 +448,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if presentation.warning_message is not None:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Bottle Weight",
+                "Weigh-In",
                 presentation.warning_message,
             )
 
@@ -804,6 +808,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._runtime_timer.stop()
+        self._bottle_swap_controller.timer.stop()
         self._heartbeat_timer.stop()
         super().closeEvent(event)
 
