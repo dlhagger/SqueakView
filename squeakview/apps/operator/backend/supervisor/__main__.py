@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Launch the durable backend supervisor and its mandatory GUI process."""
+"""Launch acquisition ownership independently of the recoverable GUI process."""
 
 import argparse
 import os
@@ -9,6 +9,7 @@ import stat
 import sys
 import tempfile
 import threading
+import traceback
 from pathlib import Path
 from typing import Sequence
 
@@ -114,6 +115,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from squeakview.common.diagnostics.crash import install_crash_diagnostics
+    install_crash_diagnostics("supervisor")
     args = _parser().parse_args(argv)
     try:
         mirror = _install_log_mirror(project_root=args.project)
@@ -191,6 +194,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except Exception as exc:
             print(f"SqueakView supervisor failed: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
             result = 1
         if server.last_error:
             print(f"SqueakView supervisor failed: {server.last_error}", file=sys.stderr)

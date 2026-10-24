@@ -102,6 +102,7 @@ class OperatorBackend:
         # cancel the lease while a terminal transition is being published.
         self._operator_lease_lock = threading.RLock()
         self._operator_lease_available = True
+        self._operator_lease_error = "supervisor shutdown requested"
         self._finalize_lock = threading.Lock()
         self._run_finalized = True
         self._recording_started = False
@@ -132,7 +133,16 @@ class OperatorBackend:
         )
 
     def _log(self, message: str) -> None:
-        self.emit(f"[{_now()}] {message}")
+        self._emit_presentation(f"[{_now()}] {message}")
+
+    def _emit_presentation(self, message: str) -> None:
+        # Capture readiness, protocol handling and CSV persistence must not
+        # depend on a GUI/log consumer surviving. Scientific writers report
+        # their own failures through separate fatal callbacks.
+        try:
+            self.emit(message)
+        except Exception:
+            pass
 
     def subscribe(self, callback: EventSubscriber) -> None:
         if callback not in self._subscribers:
@@ -209,15 +219,18 @@ class OperatorBackend:
         return self._finalize_lock.locked() and not self._run_finalized
 
     def _serial_emit(self, message: str) -> None:
-        self.emit(message)
+        self._emit_presentation(message)
         if self.ingest and "【SER】" in message:
             raw = message.split("【SER】", 1)[1].strip()
             event = dashboard_util.DashboardEvent.parse(raw)
             if event is not None:
-                self.ingest(event)
+                try:
+                    self.ingest(event)
+                except Exception:
+                    pass
 
     def _capture_emit(self, message: str) -> None:
-        self.emit(message)
+        self._emit_presentation(message)
 
     def _on_serial_fatal(
         self, source: serial_util.SerialHandle, message: str
@@ -245,7 +258,7 @@ class OperatorBackend:
         ).start()
 
     def _inference_emit(self, message: str) -> None:
-        self.emit(message)
+        self._emit_presentation(message)
         action = capture_events.interpret_capture_output(
             message,
             expected_run_dir=self.state.run_dir,
@@ -263,6 +276,13 @@ class OperatorBackend:
             return
 
     def _attach_run_dir(self, run_dir: Path) -> None:
+        # Structured readiness, fatal and capture_closed records all carry the
+        # same prepared directory. Reattaching it used to close/reopen serial
+        # CSV and journal handles while the persistence worker could be using
+        # them, including during shutdown. These messages confirm identity;
+        # only the initial legacy discovery may transfer writer ownership.
+        if self.state.run_dir is not None and self.state.run_dir.resolve() == run_dir.resolve():
+            return
         self.state.run_dir = run_dir
         if self.state.serial:
             self.state.serial.set_csv_path(run_dir)
@@ -829,13 +849,11 @@ class OperatorBackend:
                     result = replace(result, final_state="failed", error="; ".join(
                         item for item in (result.error, detail) if item
                     ))
-            # Make terminal persistence/phase atomic against GUI-lease loss.
-            # If the lease disappeared while an existing finalizer held its
-            # lock, successful artifact closure remains useful evidence but
-            # the run itself must be recorded as failed.
+            # Make terminal persistence atomic against explicit owner shutdown.
+            # Presentation detachment never revokes this acquisition token.
             with self._operator_lease_lock:
                 if not self._operator_lease_available and not result.failed:
-                    lease_error = "operator GUI lost"
+                    lease_error = getattr(self, "_operator_lease_error", "supervisor shutdown requested")
                     if self.state.run_dir is not None:
                         try:
                             run_context.write_status(
@@ -846,7 +864,7 @@ class OperatorBackend:
                             self._write_run_manifest(self.state.run_dir)
                         except Exception as exc:
                             self._log(
-                                "[SAVE] failed to persist operator-loss terminal state: "
+                                "[SAVE] failed to persist owner-shutdown terminal state: "
                                 f"{exc}"
                             )
                     result = lifecycle.FinalizationResult(
@@ -908,7 +926,7 @@ class OperatorBackend:
         ) -> None:
             with self._operator_lease_lock:
                 if not self._operator_lease_available:
-                    raise RuntimeError("operator GUI lost")
+                    raise RuntimeError(getattr(self, "_operator_lease_error", "supervisor shutdown requested"))
                 self.launch_cfg = cfg
                 self.state.run_dir = None
                 self._metadata_written = False
@@ -1273,10 +1291,11 @@ class OperatorBackend:
             )
         return handle.clear_feeder_jam(timeout_s=2.0)
 
-    def cancel_operator_lease(self) -> None:
-        """Persistently cancel startup and wake any readiness wait."""
+    def cancel_operator_lease(self, reason: str = "supervisor shutdown requested") -> None:
+        """Cancel startup for explicit owner shutdown, never GUI detachment."""
 
         with self._operator_lease_lock:
+            self._operator_lease_error = str(reason).strip() or "supervisor shutdown requested"
             self._operator_lease_available = False
             self._stop_requested.set()
             self._inference_ready.set()
@@ -1284,7 +1303,7 @@ class OperatorBackend:
     def abort_run(self, error: str) -> bool:
         """Interrupt an active run and execute ordered fail-closed finalization."""
 
-        self.cancel_operator_lease()
+        self.cancel_operator_lease(error)
         if self.snapshot().phase in {
             RunPhase.IDLE,
             RunPhase.FINALIZED,

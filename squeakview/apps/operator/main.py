@@ -59,7 +59,18 @@ def _launch_main_window(
 
 
 def main() -> int:
+    from squeakview.common.diagnostics.crash import install_crash_diagnostics
+    install_crash_diagnostics("gui")
     app = QtWidgets.QApplication([])
+    from .gui.gc_affinity import install_gui_gc
+    garbage_collector = install_gui_gc(app)
+    try:
+        return _run_gui(app)
+    finally:
+        garbage_collector.close()
+
+
+def _run_gui(app: QtWidgets.QApplication) -> int:
     app.setStyle("Fusion")
     app.setApplicationName("SqueakView")
     app.setOrganizationName("SqueakView")

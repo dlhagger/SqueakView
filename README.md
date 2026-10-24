@@ -105,7 +105,7 @@ cd "$HOME/Documents/SqueakView"
 git pull --ff-only
 uv sync
 bash scripts/build_native.sh
-.venv/bin/python -m pytest -q
+QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s tests
 bash squeakview.sh
 ```
 
@@ -374,9 +374,11 @@ start. For automation or development, pass an existing project explicitly:
 
 This detached launcher is the production path. It starts a Qt-free supervisor,
 which owns the controller, capture, run lock, and finalization while launching
-and monitoring the required GUI. If the GUI exits or loses its exclusive IPC
-lease during a run, the supervisor stops acquisition and completes fail-closed
-finalization; acquisition never continues headlessly. Terminal or VS Code loss
+and monitoring the GUI. If the GUI exits or its main-loop heartbeat expires
+during a run, acquisition continues under the same supervisor with the same
+controller, files, and counters. The supervisor replaces the failed GUI with
+bounded restart backoff and restores its configuration and current run state.
+Terminal or VS Code loss
 does not end the supervised session. Separate bounded GUI and supervisor logs
 are written under `${XDG_STATE_HOME:-$HOME/.local/state}/SqueakView/logs/`;
 each mirror is capped at 32 MiB and partial
@@ -391,8 +393,9 @@ nonzero with the supervisor log path. The bounded wait defaults to 35 seconds,
 slightly longer than the supervisor's 30-second GUI connection deadline,
 and can be adjusted with `SQUEAKVIEW_LAUNCH_TIMEOUT_S`.
 
-The lease is renewed only by a Qt-main-loop timer, so a frozen GUI is treated
-as lost even if its background IPC thread still exists. The DeepStream capture
+The presentation lease is renewed only by a Qt-main-loop timer, so a frozen GUI
+is replaced even if its background IPC thread still exists. This lease does not
+own acquisition or close scientific writers. The DeepStream capture
 child also uses Linux parent-death signaling, preventing a hard supervisor
 failure from leaving the sessionized capture process alive. A hard owner failure
 cannot perform ordered finalization, and that run must not pass qualification.
@@ -461,6 +464,14 @@ Camera timing uses `CAMERA_EPOCH`, periodic `CAMERA_CHECKPOINT`, and
 fault, conflicting replay, unrecoverable sequence gap, or controller reboot
 during a run fails the run closed. `serial.csv` remains a compatibility export
 of decoded payloads; the JSONL journal is the v2 source of truth.
+
+The host indexes v2 identities and sequence gaps in a disposable SQLite cache
+beside the journal (`diagnostics/.controller_v2.jsonl.index-*.sqlite3`), with a
+bounded 512 KiB page cache. This keeps long experiments from retaining every
+controller payload and sequence number in RAM. The index is rebuilt from the
+JSONL on every open and removed on normal close; stale index files after a crash
+are ignored and may be removed once the run is inactive. They are not scientific
+evidence. Only the canonical JSONL flush and `fsync` authorize acknowledgements.
 
 Run the physical-controller qualification before production use:
 
@@ -948,8 +959,53 @@ Diagnostic output is best-effort, limited to 2 MiB per run, and written only by
 a daemon thread; acquisition and scientific logging never wait for it. There
 are no per-frame diagnostic writes or video/ledger scans. Storage failure or
 exhausting the cap can leave evidence unavailable. This instrumentation does
-not change the shutdown policy. The GUI heartbeat timeout is 30 seconds;
+not stop acquisition. The GUI heartbeat timeout is 30 seconds;
 stall diagnostics begin after 3 seconds, before that timeout.
+
+GPU preview rendering runs in a separate disposable process. A renderer crash
+or blocked driver teardown disables preview without crashing Qt or stopping
+recording. Display events are buffered with fixed bounds before entering Qt;
+display backlog can be shed while canonical serial/video records remain intact.
+Console output also runs off the Qt thread. A missing log consumer, diagnostic
+file failure, or malformed child output cannot block draining capture stdout.
+In the GUI process, cyclic garbage collection runs on the Qt thread every five
+seconds. This prevents automatic collection on an IPC worker from destroying
+Qt objects and timers on the wrong thread; acquisition-process GC is unchanged.
+
+Repeated readiness/shutdown messages confirm the prepared run directory without
+closing and reopening its serial CSV/journal. Serial persistence owns its files
+until its producers and consumers have finished. Native pipeline shutdown and
+resource cleanup have bounded waits, with explicit errors when a real acquisition
+failure prevents a complete drain. GUI recovery does not invoke that shutdown.
+
+Controller duplicate/conflict detection uses a disposable SQLite index beside
+the canonical JSONL journal, with a 512 KiB page cache rather than retaining all
+events in Python memory. It still checks arbitrarily old duplicates and sequence
+gaps. Each record reaches canonical JSONL `fsync` before its acknowledgement
+watermark advances. The `.controller_v2.jsonl.index-*.sqlite3` cache is rebuilt
+from JSONL on every open and removed on normal close; a cache left by a killed
+process is disposable and is never used as scientific evidence.
+
+GUI, preview, capture and supervisor processes install independent crash logs
+under the user log directory (`*.crash.log`). Native fatal signals record Python
+stacks directly through a dedicated descriptor; unhandled Python/thread exceptions
+are recorded too. SIGKILL, including an OOM kill, cannot run a handler: compare
+supervisor exit/signal evidence with kernel messages. These diagnostics cannot
+guarantee recovery from power loss, a killed supervisor, GPU/driver failure in
+capture itself, or a disk that cannot accept data. Genuine scientific persistence
+and acquisition faults still fail visibly rather than reporting invented success.
+
+Collect bounded evidence on an affected rig without stopping any process:
+
+```bash
+.venv/bin/python -m squeakview.tools.collect_crash_report \
+  --project "/absolute/project/path" --output /tmp/squeakview-crash-report.json
+```
+
+The report contains recent log tails, up to three run-status snapshots, recovery
+and stall evidence, current memory information, and accessible kernel OOM/crash
+messages. Missing files or journal permissions are recorded in the report. Use
+a new output filename for each report.
 
 Show optional DeepStream plugin warnings that the GUI normally filters:
 

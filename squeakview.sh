@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Launch a detached, Qt-free supervisor which owns acquisition and launches the
-# mandatory GUI. GUI loss is observable and forces fail-closed run finalization;
-# the supervisor never continues acquisition headlessly.
+# recoverable GUI. GUI loss is observable but does not stop acquisition;
+# the supervisor replaces the presentation process and preserves live writers.
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"

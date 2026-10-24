@@ -63,6 +63,7 @@ class SupervisorEntrypointTests(unittest.TestCase):
             session.project = mock.Mock()
             user = mock.Mock()
             with (
+                mock.patch("squeakview.common.diagnostics.crash.install_crash_diagnostics"),
                 mock.patch.object(entrypoint, "_install_log_mirror", return_value=mirror),
                 mock.patch.object(entrypoint, "SupervisorServer", return_value=server),
                 mock.patch.object(entrypoint.ProjectSession, "open", return_value=session),
@@ -99,6 +100,7 @@ class SupervisorEntrypointTests(unittest.TestCase):
             session = mock.Mock()
             session.project = mock.Mock()
             with (
+                mock.patch("squeakview.common.diagnostics.crash.install_crash_diagnostics"),
                 mock.patch.object(entrypoint, "_install_log_mirror", return_value=mirror),
                 mock.patch.object(entrypoint.ProjectSession, "open", return_value=session),
                 mock.patch.object(entrypoint.AppPaths, "discover"),

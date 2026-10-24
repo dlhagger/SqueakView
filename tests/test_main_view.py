@@ -6,7 +6,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from squeakview.apps.operator.gui.main_window import MainWindow
 from squeakview.apps.operator.gui.main_view import MainViewCallbacks, build_main_view
@@ -41,6 +41,8 @@ class MainViewTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.view.dashboard.close()
         self.window.close()
+        self.window.deleteLater()
+        self.app.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
         self.app.processEvents()
         self.which_patcher.stop()
 

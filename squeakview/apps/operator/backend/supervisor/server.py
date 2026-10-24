@@ -12,6 +12,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -225,6 +226,11 @@ class SupervisorServer:
             str, tuple[str, Mapping[str, object], bool]
         ] = OrderedDict()
         self._socket_identity: tuple[int, int, int] | None = None
+        self._presentation_loss_count = 0
+        self._feeder_dashboard_event: DashboardEvent | None = None
+        self._diagnostic_events: queue.Queue[dict[str, object]] = queue.Queue(64)
+        self._diagnostic_lock = threading.Lock()
+        self._diagnostic_thread: threading.Thread | None = None
         self.gui_connect_timeout_s = max(1.0, float(gui_connect_timeout_s))
         self.gui_lease_timeout_s = max(1.0, float(gui_lease_timeout_s))
         self._monotonic = monotonic
@@ -252,6 +258,12 @@ class SupervisorServer:
         critical: bool,
         sent: threading.Event | None = None,
     ) -> bool:
+        if self._client_lost.is_set() or (
+            self._presentation_loss_count and self._client is None
+        ):
+            # Scientific writers and state live in the backend. A disconnected
+            # presentation channel must not accumulate or invalidate events.
+            return False
         target = self._critical_events if critical else self._presentation_events
         try:
             target.put_nowait(_Outbound(name, payload, request_id, sent))
@@ -274,6 +286,10 @@ class SupervisorServer:
     def _emit_dashboard(self, event: DashboardEvent) -> None:
         if not isinstance(event, DashboardEvent):
             raise TypeError("dashboard callback requires DashboardEvent")
+        if event.event_uc == "FEED_JAM" or event.event_uc.startswith("ACK_CLEAR_JAM"):
+            self._feeder_dashboard_event = event
+        elif event.event_uc == "SYSTEM_START" or event.event_uc.startswith("SYSTEM_START,"):
+            self._feeder_dashboard_event = None
         self._enqueue("dashboard", event.to_payload(), critical=False)
 
     def _emit_backend_event(self, event: BackendEvent) -> None:
@@ -299,10 +315,15 @@ class SupervisorServer:
             client,
             send_timeout_s=self.gui_lease_timeout_s,
         )
+        critical_events = self._critical_events
+        presentation_events = self._presentation_events
         while not self._stopping.is_set():
+            with self._client_lock:
+                if self._client is not client:
+                    return
             item: _Outbound | None = None
             try:
-                item = self._critical_events.get_nowait()
+                item = critical_events.get_nowait()
             except queue.Empty:
                 with self._dropped_lock:
                     dropped = self._dropped_presentation
@@ -313,25 +334,29 @@ class SupervisorServer:
                     )
                 else:
                     try:
-                        item = self._presentation_events.get(timeout=0.05)
+                        item = presentation_events.get(timeout=0.05)
                     except queue.Empty:
                         continue
             try:
+                with self._client_lock:
+                    if self._client is not client:
+                        return
+                    sequence = self._next_sequence()
                 writer.send(
                     EventEnvelope(
                         name=item.name,
-                        sequence=self._next_sequence(),
+                        sequence=sequence,
                         request_id=item.request_id,
                         payload=_json_value(item.payload),
                     )
                 )
                 if item.sent is not None:
                     item.sent.set()
-            except (OSError, ProtocolError) as exc:
+            except Exception as exc:
                 detail = str(exc).strip() or repr(exc)
                 self._signal_client_loss(
                     "supervisor IPC send failed: "
-                    f"{type(exc).__name__}: {detail}"
+                    f"{type(exc).__name__}: {detail}", client=client,
                 )
                 return
 
@@ -418,6 +443,11 @@ class SupervisorServer:
             return {"protocol": 1}, False
         if command.name == "snapshot":
             return self._snapshot(), False
+        if command.name == "runtime_state":
+            feeder_event = self._feeder_dashboard_event
+            return {"snapshot": self._snapshot(), "config": _json_value(self.backend.launch_cfg),
+                    "started_at": getattr(self.backend, "_run_started_at", None),
+                    "dashboard_events": [feeder_event.to_payload()] if feeder_event is not None else []}, False
         if command.name == "start_run":
             config_payload = payload.get("config", payload)
             if not isinstance(config_payload, Mapping):
@@ -482,7 +512,7 @@ class SupervisorServer:
                 command = self._commands.get(timeout=0.1)
             except queue.Empty:
                 continue
-            if command is None or self._client_lost.is_set():
+            if command is None:
                 return
             signature = json.dumps(
                 [command.name, _json_value(command.payload)],
@@ -555,54 +585,119 @@ class SupervisorServer:
                 self._close_client()
                 return
 
-    def _close_client(self) -> None:
-        with self._client_lock:
-            client, self._client = self._client, None
+    @staticmethod
+    def _close_detached_client(client: socket.socket | None) -> None:
         if client is not None:
             try:
                 client.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            client.close()
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    def _close_client(self) -> None:
+        with self._client_lock:
+            client, self._client = self._client, None
+        self._close_detached_client(client)
 
     def _finalize_client_loss(self) -> None:
+        # This path is reserved for actual supervisor/admin shutdown, never
+        # presentation disconnection or missed GUI heartbeats.
         with self._operation_lock:
-            self.backend.abort_run("operator GUI lost")
+            self.backend.abort_run("supervisor shutdown requested")
 
-    def _signal_client_loss(self, error: str | None = None) -> None:
-        stop_already_accepted = self._stop_accepted.is_set()
+    def _record_gui_event(self, event: str, **details: object) -> None:
+        """Never perform diagnostic file/console I/O on acquisition callbacks."""
+        record = {"event": event, "host_unix_ns": time.time_ns(),
+                  "supervisor_pid": os.getpid(), **details}
+        try:
+            self._diagnostic_events.put_nowait(record)
+        except queue.Full:
+            return
+        with self._diagnostic_lock:
+            if self._diagnostic_thread is None:
+                self._diagnostic_thread = threading.Thread(
+                    target=self._write_gui_diagnostics,
+                    name="squeakview-supervisor-recovery-log", daemon=True)
+                try:
+                    self._diagnostic_thread.start()
+                except RuntimeError:
+                    self._diagnostic_thread = None
+                    # Resource-starved diagnostics must not stop acquisition.
+
+    def _write_gui_diagnostics(self) -> None:
+        while not self._stopping.is_set() or not self._diagnostic_events.empty():
+            try:
+                record = self._diagnostic_events.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                snapshot = self.backend.snapshot()
+                run_dir = snapshot.run_dir
+                if run_dir is not None and not isinstance(run_dir, (str, Path)):
+                    run_dir = None
+                directory = (Path(run_dir) / "diagnostics" if run_dir is not None
+                             else self.runtime_context.user.state / "logs")
+                directory.mkdir(parents=True, exist_ok=True)
+                path = directory / "supervisor_recovery.jsonl"
+                record.update(run_dir=str(run_dir) if run_dir is not None else None,
+                              phase=snapshot.phase.value)
+                if not path.exists() or path.stat().st_size < 2 * 1024 * 1024:
+                    with path.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(record, ensure_ascii=True) + "\n")
+                if record["event"] in {"gui_connection_lost", "gui_relaunch_failed"}:
+                    print(f"[SUPERVISOR] {record.get('reason', record.get('error'))}; acquisition preserved",
+                          file=sys.stderr, flush=True)
+            except Exception:
+                pass  # Recovery evidence cannot interrupt acquisition.
+
+    def _signal_client_loss(
+        self, error: str | None = None, *, client: socket.socket | None = None,
+    ) -> None:
         with self._loss_lock:
-            if (
-                error
-                and not self._graceful_shutdown.is_set()
-            ):
-                if stop_already_accepted:
-                    if self.last_warning is None:
-                        self.last_warning = (
-                            f"{error}; operator connection was lost after Stop was "
-                            "accepted, so durable finalization continued"
-                        )
-                elif self.last_error is None:
-                    self.last_error = error
-            if self._client_lost.is_set():
-                return
-            self._client_lost.set()
+            with self._client_lock:
+                if client is not None and self._client is not client:
+                    return  # An old sender cannot detach a replacement GUI.
+                if self._client_lost.is_set():
+                    return
+                detached, self._client = self._client, None
+                self._client_lost.set()
+            self._presentation_loss_count += 1
+            detail = error or "operator GUI disconnected"
+            suffix = (
+                "operator connection was lost after Stop was accepted; durable finalization continued"
+                if self._stop_accepted.is_set() else
+                "acquisition remains owned by the supervisor; GUI recovery will reconnect"
+            )
+            self.last_warning = f"{detail}; {suffix}"
+        self._close_detached_client(detached)
+        self._record_gui_event("gui_connection_lost", reason=detail,
+                               acquisition_preserved=True)
+
+    def _acquisition_active(self) -> bool:
+        snapshot = self.backend.snapshot()
+        return bool(
+            snapshot.phase not in {RunPhase.IDLE, RunPhase.FINALIZED, RunPhase.FAILED}
+            or snapshot.capture_running or snapshot.finalization_in_progress
+            or self._operation_lock.locked() or not self._commands.empty()
+        )
+
+    def request_shutdown(self) -> None:
+        """An actual supervisor shutdown still stops acquisition safely."""
+        if self._stopping.is_set():
+            return
         self._stopping.set()
         self._close_client()
-        if stop_already_accepted:
+        if self._graceful_shutdown.is_set() or self._stop_accepted.is_set():
             return
         self.backend.cancel_operator_lease()
         self._loss_thread = threading.Thread(
             target=self._finalize_client_loss,
-            name="squeakview-operator-loss-finalizer",
-            daemon=False,
+            name="squeakview-supervisor-shutdown-finalizer", daemon=False,
         )
         self._loss_thread.start()
-
-    def request_shutdown(self) -> None:
-        """Stop accepting IPC and fail closed if acquisition is active."""
-
-        self._signal_client_loss("supervisor shutdown requested")
 
     def _prepare_listener(self) -> socket.socket:
         parent = self.socket_path.parent
@@ -638,9 +733,9 @@ class SupervisorServer:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             listener.bind(str(self.socket_path))
+            os.chmod(self.socket_path, 0o600)
             bound = self.socket_path.lstat()
             self._socket_identity = (bound.st_dev, bound.st_ino, bound.st_ctime_ns)
-            os.chmod(self.socket_path, 0o600)
             listener.listen(1)
             listener.settimeout(0.25)
             return listener
@@ -671,14 +766,27 @@ class SupervisorServer:
         except FileNotFoundError:
             pass
 
+    @staticmethod
+    def _retire_gui(gui: subprocess.Popen[bytes] | None) -> None:
+        if gui is None or gui.poll() is not None:
+            return
+        try:
+            gui.terminate()
+            gui.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                gui.kill()
+                gui.wait(timeout=2.0)
+            except (subprocess.TimeoutExpired, OSError, ChildProcessError):
+                pass
+        except (OSError, ChildProcessError):
+            pass
+
     def serve(
-        self,
-        gui_command: Sequence[str],
-        *,
+        self, gui_command: Sequence[str], *,
         on_gui_ready: Callable[[], None] | None = None,
     ) -> int:
-        """Launch the mandatory GUI and serve its sole IPC lease."""
-
+        """Keep acquisition owned while replacing failed presentation clients."""
         if not gui_command or any(not isinstance(item, str) or not item for item in gui_command):
             raise ValueError("gui_command must contain explicit non-empty argv")
         listener = self._prepare_listener()
@@ -688,83 +796,163 @@ class SupervisorServer:
         gui: subprocess.Popen[bytes] | None = None
         worker: threading.Thread | None = None
         client: socket.socket | None = None
+        reader: SocketEnvelopeReader | None = None
+        connected_once = False
+        gui_ready = False
+        restart_count = 0
+        next_launch = 0.0
+        next_retire = 0.0
+        connect_deadline = 0.0
         try:
-            gui = subprocess.Popen(list(gui_command), env=gui_env)
-            worker = threading.Thread(
-                target=self._command_worker,
-                name="squeakview-supervisor-commands",
-                daemon=False,
-            )
+            worker = threading.Thread(target=self._command_worker,
+                name="squeakview-supervisor-commands", daemon=False)
             worker.start()
-            connect_deadline = time.monotonic() + self.gui_connect_timeout_s
-            while client is None and not self._stopping.is_set():
-                if gui.poll() is not None:
-                    self._signal_client_loss("mandatory operator GUI exited")
-                    break
-                if time.monotonic() >= connect_deadline:
-                    self.last_error = (
-                        "mandatory GUI did not connect to the supervisor within "
-                        f"{self.gui_connect_timeout_s:.1f}s"
-                    )
-                    self._signal_client_loss(self.last_error)
-                    break
-                try:
-                    client, _ = listener.accept()
-                except socket.timeout:
-                    continue
-                peer_pid, peer_uid = self._peer_credentials(client)
-                if peer_pid != gui.pid or peer_uid != os.getuid():
-                    client.close()
-                    client = None
-                    continue
-            if client is None:
-                return int(gui.returncode or 1)
-            with self._client_lock:
-                self._client = client
-            self._renew_gui_lease()
-            client.settimeout(0.25)
-            sender = threading.Thread(
-                target=self._sender,
-                args=(client,),
-                name="squeakview-supervisor-events",
-                daemon=True,
-            )
-            sender.start()
-            reader = SocketEnvelopeReader()
-            gui_ready = False
             while not self._stopping.is_set():
+                if self._client_lost.is_set() and gui is not None:
+                    if time.monotonic() < next_retire:
+                        self._stopping.wait(0.1)
+                        continue
+                    previous_code = gui.poll()
+                    self._retire_gui(gui)
+                    exit_code = gui.poll()
+                    if exit_code is None and self._acquisition_active():
+                        # A kernel-blocked GUI may survive even SIGKILL until
+                        # its driver returns. Keep owning that child instead
+                        # of accumulating another renderer/GUI each restart.
+                        self._record_gui_event("gui_retirement_pending", gui_pid=gui.pid,
+                                               acquisition_preserved=True)
+                        next_retire = time.monotonic() + 5.0
+                        self._stopping.wait(0.1)
+                        continue
+                    next_retire = 0.0
+                    self._record_gui_event("gui_exit", gui_pid=gui.pid,
+                        returncode=exit_code,
+                        signal=(-exit_code if isinstance(exit_code, int) and exit_code < 0 else None),
+                        possible_oom=(previous_code == -9),
+                        supervisor_retired=(previous_code is None))
+                    gui = None
+                    client = None
+                    reader = None
+                    if not self._acquisition_active():
+                        return 0
+                    restart_count += 1
+                    # Bound a crash loop without imposing a recording deadline.
+                    next_launch = time.monotonic() + min(30.0, 2.0 ** min(restart_count - 1, 5))
+                if gui is None:
+                    if time.monotonic() < next_launch:
+                        self._stopping.wait(0.1)
+                        continue
+                    try:
+                        env = dict(gui_env)
+                        if connected_once or restart_count:
+                            env["SQUEAKVIEW_GUI_RECOVERY"] = "1"
+                        gui = subprocess.Popen(list(gui_command), env=env)
+                        self._record_gui_event("gui_launched", gui_pid=gui.pid,
+                                               restart_count=restart_count)
+                    except OSError as exc:
+                        if not self._acquisition_active():
+                            raise
+                        self._signal_client_loss(f"GUI recovery launch failed: {exc}")
+                        self._record_gui_event("gui_relaunch_failed", error=str(exc),
+                                               restart_count=restart_count)
+                        restart_count += 1
+                        next_launch = time.monotonic() + min(30.0, 2.0 ** min(restart_count, 5))
+                        self._stopping.wait(0.1)
+                        continue
+                    connect_deadline = time.monotonic() + self.gui_connect_timeout_s
+                    self._client_lost.clear()
+                    gui_ready = False
+                returncode = gui.poll()
+                if returncode is not None:
+                    detail = f"operator GUI exited with returncode={returncode}"
+                    if returncode < 0:
+                        import signal
+                        try:
+                            detail += f" ({signal.Signals(-returncode).name})"
+                        except ValueError:
+                            pass
+                    self._signal_client_loss(detail)
+                    if not self._acquisition_active():
+                        self._record_gui_event("gui_exit", gui_pid=gui.pid,
+                            returncode=returncode,
+                            signal=(-returncode if returncode < 0 else None),
+                            possible_oom=(returncode == -9), supervisor_retired=False)
+                        return int(returncode)
+                    continue
+                if client is None:
+                    if time.monotonic() >= connect_deadline:
+                        self._signal_client_loss(
+                            f"GUI did not connect within {self.gui_connect_timeout_s:.1f}s")
+                        if not self._acquisition_active():
+                            return 1
+                        continue
+                    try:
+                        candidate, _ = listener.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError as exc:
+                        self._signal_client_loss(f"GUI IPC accept failed: {exc}")
+                        if not self._acquisition_active():
+                            return 1
+                        continue
+                    try:
+                        peer_pid, peer_uid = self._peer_credentials(candidate)
+                    except (OSError, RuntimeError, struct.error) as exc:
+                        candidate.close()
+                        self._record_gui_event("gui_peer_rejected", error=str(exc))
+                        continue
+                    if peer_pid != gui.pid or peer_uid != os.getuid():
+                        candidate.close()
+                        continue
+                    client = candidate
+                    with self._client_lock:
+                        self._client = client
+                    # Old senders retain their old queues and cannot steal a
+                    # replacement GUI's responses. Backend state is rehydrated
+                    # through runtime_state, never stale presentation replay.
+                    self._critical_events = queue.Queue(MAX_PENDING_CRITICAL_EVENTS)
+                    self._presentation_events = queue.Queue(MAX_PENDING_PRESENTATION_EVENTS)
+                    self._renew_gui_lease()
+                    try:
+                        client.settimeout(0.25)
+                        threading.Thread(target=self._sender, args=(client,),
+                            name="squeakview-supervisor-events", daemon=True).start()
+                    except (OSError, RuntimeError) as exc:
+                        self._signal_client_loss(f"GUI IPC sender setup failed: {exc}", client=client)
+                        if not self._acquisition_active():
+                            return 1
+                        continue
+                    reader = SocketEnvelopeReader()
+                    self._record_gui_event("gui_connected", gui_pid=gui.pid,
+                                           recovered=bool(connected_once or restart_count))
+                    connected_once = True
                 if self._gui_lease_expired():
-                    self._signal_client_loss(
-                        "operator GUI main-loop heartbeat lease expired"
-                    )
-                    break
-                if gui.poll() is not None:
-                    self._signal_client_loss("mandatory operator GUI exited")
-                    break
+                    self._signal_client_loss("operator GUI main-loop heartbeat lease expired", client=client)
+                    continue
+                assert reader is not None
                 try:
                     envelope = reader.receive(client)
                 except socket.timeout:
                     continue
-                except (EOFError, OSError, ProtocolError):
-                    self._signal_client_loss("operator GUI IPC lease was lost")
-                    break
+                except (EOFError, OSError, ProtocolError) as exc:
+                    self._signal_client_loss(f"operator GUI IPC disconnected: {type(exc).__name__}: {exc}", client=client)
+                    continue
                 if not isinstance(envelope, CommandEnvelope):
-                    self._signal_client_loss(
-                        "operator GUI sent an invalid IPC envelope"
-                    )
-                    break
+                    self._signal_client_loss("operator GUI sent an invalid IPC envelope", client=client)
+                    continue
                 try:
                     if self._handle_heartbeat(envelope):
                         if not gui_ready:
-                            if on_gui_ready is not None:
-                                on_gui_ready()
+                            if on_gui_ready is not None and not restart_count:
+                                try:
+                                    on_gui_ready()
+                                except Exception as exc:
+                                    self._record_gui_event("gui_ready_ack_failed", error=str(exc))
                             gui_ready = True
                         continue
                 except ProtocolError:
-                    self._signal_client_loss(
-                        "operator GUI sent an invalid heartbeat"
-                    )
-                    break
+                    self._signal_client_loss("operator GUI sent an invalid heartbeat", client=client)
+                    continue
                 if envelope.name == "stop_run":
                     interrupt = getattr(self.backend, "interrupt_bottle_swap_for_stop", None)
                     if callable(interrupt):
@@ -772,40 +960,31 @@ class SupervisorServer:
                 try:
                     self._commands.put_nowait(envelope)
                 except queue.Full:
-                    self._enqueue(
-                        "command_result",
-                        {
-                            "ok": False,
-                            "result": None,
-                            "error": "supervisor command queue is full",
-                        },
-                        request_id=envelope.request_id,
-                        critical=True,
-                    )
-            if self.last_error is not None and not self._graceful_shutdown.is_set():
-                return 1
-            return int(gui.poll() or 0)
+                    self._enqueue("command_result", {
+                        "ok": False, "result": None,
+                        "error": "supervisor command queue is full",
+                    }, request_id=envelope.request_id, critical=True)
+            return 0
         finally:
-            self._signal_client_loss()
+            # This is actual supervisor termination, not GUI detachment.
+            if self._acquisition_active() and not self._graceful_shutdown.is_set():
+                self.request_shutdown()
+            self._stopping.set()
+            self._close_client()
             try:
                 self._commands.put_nowait(None)
             except queue.Full:
                 pass
-            self._close_client()
             listener.close()
-            if gui is not None and gui.poll() is None:
-                gui.terminate()
-                try:
-                    gui.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    gui.kill()
-                    gui.wait(timeout=5.0)
+            self._retire_gui(gui)
             if self._loss_thread is not None:
                 self._loss_thread.join()
             if self._async_stop_thread is not None:
                 self._async_stop_thread.join()
             if worker is not None and worker.ident is not None:
                 worker.join()
+            if self._diagnostic_thread is not None:
+                self._diagnostic_thread.join(timeout=1.0)
             self._unlink_owned_socket()
 
 

@@ -59,6 +59,14 @@ class ProcessHandle:
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
 
+    def _safe_emit(self, message: str) -> None:
+        # Presentation is disposable; draining the child's stdout is not. An
+        # unavailable GUI/log callback must never back up the capture pipe.
+        try:
+            self.emit(message)
+        except Exception:
+            pass
+
     def _pump(self) -> None:
         log_handle = None
         log_bytes = 0
@@ -76,7 +84,7 @@ class ProcessHandle:
                         "a", encoding="utf-8", buffering=1
                     )
                 except OSError as exc:
-                    self.emit(f"{self.name} diagnostic log unavailable: {exc}")
+                    self._safe_emit(f"{self.name} diagnostic log unavailable: {exc}")
             for line in iter(
                 lambda: self.p.stdout.readline(MAX_CHILD_OUTPUT_CHUNK), ""
             ):
@@ -89,8 +97,12 @@ class ProcessHandle:
                     encoded = (clean + "\n").encode("utf-8", errors="replace")
                     remaining = self.output_log_max_bytes - log_bytes
                     if remaining >= len(encoded):
-                        log_handle.write(encoded.decode("utf-8"))
-                        log_bytes += len(encoded)
+                        try:
+                            log_handle.write(encoded.decode("utf-8"))
+                            log_bytes += len(encoded)
+                        except Exception as exc:
+                            log_limit_reported = True
+                            self._safe_emit(f"{self.name} diagnostic log write failed: {exc}")
                     else:
                         marker = (
                             "[SQUEAKVIEW] diagnostic log size limit reached; "
@@ -98,27 +110,36 @@ class ProcessHandle:
                         )
                         marker_bytes = marker.encode("utf-8")
                         if remaining >= len(marker_bytes):
-                            log_handle.write(marker)
-                            log_bytes += len(marker_bytes)
+                            try:
+                                log_handle.write(marker)
+                                log_bytes += len(marker_bytes)
+                            except Exception as exc:
+                                self._safe_emit(f"{self.name} diagnostic log write failed: {exc}")
                         log_limit_reported = True
-                        self.emit(
+                        self._safe_emit(
                             f"{self.name} diagnostic log size limit reached at "
                             f"{self.output_log_max_bytes} bytes"
                         )
-                self.emit(f"[{_now()}] {self.name} {clean}")
+                self._safe_emit(f"[{_now()}] {self.name} {clean}")
         except Exception as exc:
-            self.emit(f"{self.name} output error: {exc}")
+            self._safe_emit(f"{self.name} output error: {exc}")
         finally:
             returncode = self.p.wait()
             if log_handle is not None:
-                log_handle.close()
+                try:
+                    log_handle.close()
+                except Exception as exc:
+                    self._safe_emit(f"{self.name} diagnostic log close failed: {exc}")
             if self.p.stdout is not None:
-                self.p.stdout.close()
+                try:
+                    self.p.stdout.close()
+                except Exception:
+                    pass
             if self.on_exit is not None:
                 try:
                     self.on_exit(int(returncode))
                 except Exception as exc:
-                    self.emit(f"{self.name} exit callback error: {exc}")
+                    self._safe_emit(f"{self.name} exit callback error: {exc}")
 
     def is_running(self) -> bool:
         return self.p is not None and self.p.poll() is None
@@ -212,6 +233,8 @@ def spawn(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         start_new_session=True,
         env=env,

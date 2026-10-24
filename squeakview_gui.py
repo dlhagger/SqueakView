@@ -68,6 +68,9 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    from squeakview.common.diagnostics.crash import install_crash_diagnostics
+
+    install_crash_diagnostics("gui", Path(os.environ[LOG_ENV]).with_suffix(".crash.log"))
     from squeakview.apps.operator import main as operator_main
 
     return operator_main.main()

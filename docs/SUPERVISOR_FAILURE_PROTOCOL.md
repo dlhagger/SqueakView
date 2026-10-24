@@ -1,8 +1,9 @@
 # Durable Supervisor Failure Qualification Protocol
 
-This protocol validates that loss of the mandatory GUI or termination of the
-durable supervisor cannot leave scientific acquisition running headlessly. It
-is destructive qualification, never a production-data procedure. Use a test
+This protocol validates that GUI crashes, disconnection, and missed GUI
+heartbeats preserve scientific acquisition, while actual durable-supervisor
+shutdown still stops acquisition safely. It is fault qualification, never a
+production-data procedure. Use a test
 subject/input, remain at the Jetson, and verify the controller has a physical
 safe state before beginning.
 
@@ -62,8 +63,8 @@ Supported barriers are `pre_capture`, `after_spawn_before_ready`, and
 holds after required run metadata exists but before serial/capture setup. The
 second holds after the capture child is supervisor-owned but before readiness
 can arm the controller. Finalizer barriers hold immediately after the named
-phase/stage is persisted. GUI loss cancels startup barriers; every barrier also
-self-releases at its deadline. The gate continues to mark every such run
+phase/stage is persisted. GUI loss does not cancel an accepted start; every
+barrier self-releases at its deadline. The gate continues to mark every such run
 non-production even when no signal reaches the barrier.
 
 Configure and start a short run through the mandatory GUI. Wait until the GUI
@@ -127,11 +128,12 @@ Repeat the same command with all three values copied exactly from the dry run:
 
 Run only one fault per application session and use a new run for each case:
 
-- `gui-terminate` sends `SIGTERM` to the verified GUI. IPC lease loss must make
-  the supervisor fail and finalize the run.
-- `gui-freeze` sends `SIGSTOP` to the verified GUI. The heartbeat lease must
-  expire, after which the supervisor fails/finalizes and forcibly cleans up the
-  stopped GUI if normal termination cannot complete.
+- `gui-terminate` sends `SIGTERM` to the verified GUI. If its guarded close
+  lifecycle disconnects, acquisition must continue while the supervisor replaces
+  the GUI. A close confirmation dialog is not itself a crash or disconnection.
+- `gui-freeze` sends `SIGSTOP` to the verified GUI. Heartbeat expiry replaces the
+  stalled GUI; it must never stop controller events, capture, or scientific
+  writers. The supervisor may kill a frozen GUI that cannot terminate normally.
 - `supervisor-terminate` sends `SIGTERM` to the verified supervisor. Its minimal
   signal handler requests fail-closed shutdown; this is not a `SIGKILL` test.
 
@@ -164,15 +166,20 @@ capture and include the same `--expected-stage` value. Stages can be brief;
 failure to catch one is not permission to weaken the checks. Use a sufficiently
 long qualification run and repeat from a new run.
 
-GUI lease loss after ordered capture closure is intentionally different from
-loss during acquisition. The supervisor closes the lease immediately and exits
-nonzero, but the command worker already owns the lifecycle operation lock. The
-client-loss finalizer waits for the in-progress bounded post-run worker rather
-than interrupting validation and then observes the terminal backend state. Thus
-post-capture analysis may continue without the GUI, but camera acquisition and
-controller pulses may not. This exact serialization is covered by the
-supervisor lifecycle tests; the on-device cells must verify it for every stage
-above.
+GUI presentation is optional throughout acquisition and post-capture work.
+The supervisor keeps its backend, controller connection, capture process, run
+identity, writers, and accepted operations across GUI loss. It replaces the GUI
+using the same authenticated private socket, with restart backoff capped at
+30 seconds. Repeated GUI-launch failures leave acquisition running headlessly;
+they do not impose a recording deadline. A replacement retrieves runtime
+configuration and the current run snapshot rather than starting another run.
+Only explicit Stop or genuine acquisition/supervisor failure ends acquisition.
+
+The bounded `diagnostics/supervisor_recovery.jsonl` log records GUI losses,
+launches, reconnections, return codes, and signals independently of the GUI.
+SIGKILL is compatible with OOM but does not establish OOM by itself; correlate
+kernel evidence. Recovery logging uses a bounded asynchronous queue so a disk
+or console diagnostic failure cannot block acquisition callbacks.
 
 Do not test `SIGKILL` on the supervisor while a controller can generate pulses.
 An uncatchable supervisor death cannot execute ordered controller shutdown; the
@@ -186,18 +193,25 @@ For each case retain the GUI and supervisor bounded logs, `run_status.json`,
 recording telemetry, and video validation output. Record the dry-run JSON and
 the helper's signal confirmation in the qualification worksheet.
 
-The case passes only when all applicable observations hold:
+For GUI-loss cases, the case passes only when:
 
-1. No recording continues without the required GUI lease.
-2. Trigger/controller stop occurs before capture drain when the controller was
-   started, including a required stop acknowledgement.
-3. Capture exits, files are closed, and fail-closed validation/finalization
-   reaches a terminal state.
-4. The run remains non-production and records an actionable failure reason.
-5. The supervisor exits nonzero for GUI lease loss and requested supervisor
-   failure; no supervisor, GUI, capture, or post-run worker remains afterward.
-6. Frame and recording ledgers explain the terminal boundary without silently
-   claiming a successful scientific run.
+1. The same run, supervisor, capture process, controller session, and scientific
+   writers remain active across the presentation gap. Frame/event counters
+   continue; no automatic controller STOP or backend abort is caused by GUI loss.
+2. A replacement GUI reconnects, restores the active run configuration and
+   status, and offers explicit Stop without creating a new run.
+3. Stop from the replacement GUI follows normal controller acknowledgement,
+   capture drain, file closure, and validation order.
+4. Accepted startup/finalization operations continue despite GUI loss. Repeated
+   GUI crashes or launch failures do not stop an otherwise healthy recording.
+5. Recovery logs identify presentation loss and reconnect boundaries without
+   converting a scientifically sound run into a failed run solely for GUI loss.
+   Qualification runs remain non-production because of their qualification gate.
+
+For actual supervisor termination, verify ordered controller STOP, capture
+drain/closure, terminal failure evidence, and no orphaned acquisition processes.
+The existing controller-watchdog limitations still apply to uncatchable
+supervisor death or complete host loss.
 
 If the helper refuses a check, preserve its error as evidence, stop manually
 through the GUI when possible, and investigate. Never weaken or bypass a guard

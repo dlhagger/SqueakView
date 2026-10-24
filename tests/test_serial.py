@@ -803,7 +803,7 @@ class SerialCsvTests(unittest.TestCase):
             self.handle._register_atexit()
 
         self.assertTrue(self.handle._atexit_registered)
-        register.assert_called_once_with(self.handle.close)
+        register.assert_called_once_with(self.handle._close_at_exit)
 
     def test_close_unblocks_port_before_joining_reader(self) -> None:
         order: list[str] = []
@@ -816,12 +816,15 @@ class SerialCsvTests(unittest.TestCase):
                 self.is_open = False
 
         class ReaderThread:
-            def is_alive(self) -> bool:
-                return True
+            alive = True
 
-            def join(self, timeout: float) -> None:
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def join(self, timeout: float | None = None) -> None:
                 self.timeout = timeout
                 order.append("thread_join")
+                self.alive = False
 
         self.handle.ser = Port()
         self.handle._thread = ReaderThread()
@@ -830,7 +833,7 @@ class SerialCsvTests(unittest.TestCase):
         self.handle.close()
 
         self.assertEqual(order, ["port_close", "thread_join"])
-        self.assertIn("reader did not stop", self.handle.fatal_error or "")
+        self.assertIsNone(self.handle.fatal_error)
 
     def test_port_close_error_is_a_fatal_integrity_failure(self) -> None:
         failures = self.use_fatal_callback()

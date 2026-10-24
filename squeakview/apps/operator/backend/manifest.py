@@ -377,6 +377,11 @@ class RunManifestService:
             },
             "process_topology": {
                 "acquisition_owner": context.acquisition_owner,
+                "gui_loss_policy": (
+                    "continue_acquisition_and_recover_gui"
+                    if context.acquisition_owner == DURABLE_SUPERVISOR_OWNER
+                    else "in_process_development"
+                ),
             },
             "platform": dict(context.device_context or device_context_snapshot()),
             "native_plugins": {

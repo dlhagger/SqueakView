@@ -8,7 +8,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from squeakview.apps.operator.backend import manifest, process
 from squeakview.apps.operator.backend.contracts import BackendProtocol
-from squeakview.apps.operator.backend.events import BackendEvent
+from squeakview.apps.operator.backend.events import BackendEvent, RunPhase
 from squeakview.apps.operator.backend.manager import OperatorBackend
 from squeakview.apps.operator.gui.backend_proxy import (
     ALLOW_INPROCESS_BACKEND_ENV,
@@ -23,6 +23,7 @@ from squeakview.apps.operator.gui.config_dialog import (
     apply_dark_combo_popups,
     center_window,
 )
+from squeakview.apps.operator.gui.presentation_buffer import GuiPresentationBuffer
 from squeakview.apps.operator.gui.bottle_measurements import (
     BOTTLE_FLUID_PRESETS,
     BottleMeasurementPanel,
@@ -147,6 +148,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, *, backend_factory=None) -> None:
         super().__init__()
         self.log_msg.connect(self._append_log)
+        self._presentation_buffer = GuiPresentationBuffer(self._append_log, self._on_dashboard_event, self)
         self.project = project_from_environment()
         self.setWindowTitle(f"SqueakView — {self.project.metadata.name}")
         self.resize(1280, 820)
@@ -218,11 +220,63 @@ class MainWindow(QtWidgets.QMainWindow):
         apply_dark_combo_popups(self)
         QtCore.QTimer.singleShot(0, self._capture_preview_window_id)
         self._config_data = self._default_config_data()
-        if not self._show_launch_dialog():
+        if os.environ.get("SQUEAKVIEW_GUI_RECOVERY") == "1":
+            self._recover_supervised_run()
+        elif not self._show_launch_dialog():
             QtCore.QTimer.singleShot(0, self.close)
+            self.preview.set_status("Idle")
         else:
             self._emit_log("[GUI] Ready to record.")
-        self.preview.set_status("Idle")
+            self.preview.set_status("Idle")
+
+    def _recover_supervised_run(self) -> None:
+        """Restore presentation only; the supervisor keeps owning the run."""
+        from squeakview.apps.operator.gui.backend_proxy import launch_config_payload
+        from datetime import datetime
+        import time
+        from squeakview.common import run_context
+
+        recovery = self.backend.recover_runtime_state()
+        config, snapshot = recovery["config"], recovery["snapshot"]
+        data = launch_config_payload(config)
+        for key in ("ds_cfg", "task_cfg"):
+            data[key] = str(data[key]) if data[key] else ""
+        self._config_data.update(data)
+        self.run_identity_label.setText(f"{config.experiment_name} / Subject {config.mouse_id}")
+        self.summary_label.setText("Restored the existing supervisor session.")
+        if config.task_cfg:
+            self.dashboard.apply_task_config(config.task_cfg)
+        if snapshot.run_dir is not None:
+            setup = run_context.read_json(snapshot.run_dir / "bottle_setup.json") or {}
+            self.bottle_panel.mouse_weight_edit.setText(str(setup.get("mouse_weight_g") or ""))
+            for side, bottle in setup.get("sides", {}).items():
+                if side not in ("left", "right"):
+                    continue
+                getattr(self.bottle_panel, f"{side}_fluid_combo").setCurrentText(bottle.get("fluid", ""))
+                for phase in ("initial", "final"):
+                    value = bottle.get(f"{phase}_weight_g")
+                    getattr(self.bottle_panel, f"{side}_{phase}_weight_edit").setText("" if value is None else str(value))
+            self.dashboard.follow_run_telemetry(snapshot.run_dir / "diagnostics" / "system.csv")
+        self._run_controller.handle_backend_event(BackendEvent("phase_changed", snapshot.phase, snapshot.run_dir))
+        if snapshot.phase == RunPhase.RECORDING:
+            self._run_controller.on_backend_run_started()
+            started = recovery.get("started_at")
+            if started:
+                try:
+                    age = max(0.0, time.time() - datetime.fromisoformat(started).timestamp())
+                    self._run_controller.recording_started_monotonic = time.monotonic() - age
+                    self.run_elapsed_label.setToolTip("Elapsed since run creation, restored after GUI recovery.")
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        for event in recovery.get("dashboard_events", ()):
+            self._on_dashboard_event(event)
+        self._bottle_swap_controller._terminal_refresh_pending = snapshot.run_dir is not None
+        if snapshot.capture_running and snapshot.phase in (RunPhase.STARTING, RunPhase.RECORDING):
+            def restore_preview():
+                self._capture_preview_window_id()
+                self._run_controller.start_ipc_preview(config)
+            QtCore.QTimer.singleShot(0, restore_preview)
+        self._emit_log("[GUI] Reconnected to the existing supervisor; recording and controller state were preserved.")
 
     # Compatibility aliases for callers/tests that inspected lifecycle state on
     # MainWindow before it was moved into RunLifecycleController.
@@ -590,7 +644,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if isinstance(event, str):
             event = DashboardEvent.parse(event)
         if event is not None:
-            self.dashboard_event.emit(event)
+            self._presentation_buffer.post_dashboard(event)
 
     @QtCore.Slot(object)
     def _on_dashboard_event(self, event: DashboardEvent) -> None:
@@ -781,7 +835,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- Logging --------------------------------------------------------
     def _emit_log(self, msg: str) -> None:
-        self.log_msg.emit(msg)
+        self._presentation_buffer.post_log(msg)
 
     @QtCore.Slot(str)
     def _append_log(self, msg: str) -> None:
@@ -789,12 +843,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.event_log.appendPlainText(msg)
             self.event_log.moveCursor(QtGui.QTextCursor.MoveOperation.End)
             self.event_log.ensureCursorVisible()
-        try:
-            print(msg, flush=True)
-        except (BrokenPipeError, OSError, ValueError):
-            # Losing the launching terminal must not interrupt scientific
-            # shutdown or prevent the GUI from closing a supervised child.
-            pass
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if not self._run_controller.request_window_close(event):
@@ -810,6 +858,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._runtime_timer.stop()
         self._bottle_swap_controller.timer.stop()
         self._heartbeat_timer.stop()
+        self._preview_controller.stop()
+        self._presentation_buffer.close()
         super().closeEvent(event)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802

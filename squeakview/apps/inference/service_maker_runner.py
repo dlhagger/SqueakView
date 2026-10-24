@@ -1,11 +1,12 @@
 """DeepStream 9.1 inference runner built on the PyServiceMaker Pipeline API."""
 from __future__ import annotations
 
-import signal
+import math
 import os
+import signal
+import sys
 import threading
 import time
-import sys
 from pathlib import Path
 from typing import Callable
 
@@ -19,6 +20,7 @@ from pyservicemaker import (
 
 from squeakview.common import run_context
 from squeakview.common.child_events import encode_child_event
+from squeakview.common.diagnostics.crash import install_crash_diagnostics
 from squeakview.common.diagnostics.system_telemetry import SystemTelemetryRecorder
 from .contracts import (
     InferenceConfig,
@@ -355,16 +357,11 @@ class ServiceMakerApp:
             )
         except ValueError:
             shutdown_timeout_s = 20.0
+        if not math.isfinite(shutdown_timeout_s) or shutdown_timeout_s > threading.TIMEOUT_MAX:
+            shutdown_timeout_s = 20.0
         shutdown_timeout_s = max(0.1, shutdown_timeout_s)
-
-        def close_resource(name: str, close_fn: Callable[[], object]) -> None:
-            try:
-                close_fn()
-            except Exception as exc:
-                self.exit_code = 1
-                detail = f"{name}: {type(exc).__name__}: {exc}"
-                close_errors.append(detail)
-                _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
+        stage_deadline = time.monotonic() + shutdown_timeout_s
+        stage_budget_s = shutdown_timeout_s
 
         def close_pipeline_with_timeout(
             name: str, close_fn: Callable[[], object]
@@ -385,12 +382,13 @@ class ServiceMakerApp:
                 daemon=True,
                 name=f"squeakview-{name.replace(' ', '-')}",
             ).start()
-            if not completed.wait(shutdown_timeout_s):
+            remaining_s = max(0.0, stage_deadline - time.monotonic())
+            if not completed.wait(remaining_s):
                 if self.exit_code == 0:
                     self.exit_code = 1
                 self._force_process_exit = True
                 detail = (
-                    f"{name}: timed out after {shutdown_timeout_s:.1f}s; "
+                    f"{name}: timed out within {stage_budget_s:.1f}s shutdown budget; "
                     "capture is not valid"
                 )
                 close_errors.append(detail)
@@ -411,7 +409,7 @@ class ServiceMakerApp:
             # run is already invalid at this point, so flush the Python-owned
             # scientific ledgers/status below and terminate without entering
             # an unsafe native drain.  ``run`` uses os._exit only after those
-            # resources have been closed.
+            # resources have been closed or their bounded cleanup has failed.
             self._force_process_exit = True
             detail = (
                 "capture pipeline native shutdown bypassed after a fatal "
@@ -422,7 +420,9 @@ class ServiceMakerApp:
         elif self.pipeline is not None:
             close_pipeline_with_timeout("capture pipeline stop", self.pipeline.stop)
             if self._pipeline_wait_thread is not None:
-                self._pipeline_wait_thread.join(timeout=shutdown_timeout_s)
+                self._pipeline_wait_thread.join(
+                    timeout=max(0.0, stage_deadline - time.monotonic())
+                )
                 if self._pipeline_wait_thread.is_alive():
                     if self.exit_code == 0:
                         self.exit_code = 1
@@ -440,6 +440,14 @@ class ServiceMakerApp:
                     )
             else:
                 close_pipeline_with_timeout("capture pipeline wait", self.pipeline.wait)
+        # A blocked monitor or callback can hold a writer lock even after a
+        # failed native drain. Bound cleanup as a whole, rather than hanging
+        # forever in join()/close() and preventing the supervisor from seeing
+        # the capture failure. Healthy pipelines still finish EOS/wait above
+        # before any scientific writer is closed.
+        stage_budget_s = min(5.0, shutdown_timeout_s)
+        stage_deadline = time.monotonic() + stage_budget_s
+        close_resource = close_pipeline_with_timeout
         if self._recording_liveness_thread is not None:
             close_resource(
                 "recording liveness monitor",
@@ -461,7 +469,8 @@ class ServiceMakerApp:
         if self.frames is not None:
             close_resource("frame ledger", self.frames.close)
         close_resource("system telemetry", self.system_telemetry.stop)
-        try:
+
+        def write_capture_status() -> None:
             run_context.write_status(
                 self.run_dir,
                 "capture_closed",
@@ -474,9 +483,12 @@ class ServiceMakerApp:
                     "error": self.system_telemetry.last_error,
                 },
             )
-        except Exception as exc:
-            self.exit_code = 1
-            _safe_print(f"[{ts()}] [RECORD] ERROR marking capture closed: {exc}")
+        # Keep failure reporting bounded even if the filesystem is stalled.
+        # The supervisor receives the terminal event and owns final run status
+        # when this best-effort local status write cannot complete.
+        stage_budget_s = min(1.0, shutdown_timeout_s)
+        stage_deadline = time.monotonic() + stage_budget_s
+        close_resource("capture status", write_capture_status)
 
         _safe_print(
             encode_child_event(
@@ -492,6 +504,12 @@ class ServiceMakerApp:
         _safe_print(f"[{ts()}] [INFO] done. Files in: {self.run_dir}")
 
 def run(config: InferenceConfig) -> int:
+    install_crash_diagnostics(
+        "capture",
+        log_path=(Path(config.run_dir) / "diagnostics" / "capture_crash.log")
+        if config.run_dir is not None
+        else None,
+    )
     app = ServiceMakerApp(config)
 
     def _handle_signal(sig_num, _frame) -> None:

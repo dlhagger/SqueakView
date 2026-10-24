@@ -225,7 +225,7 @@ class SupervisorBackendProxy:
         self._pending_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._failure_lock = threading.Lock()
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self._closed = threading.Event()
         self._stop_terminal = threading.Event()
         self._connection_error: RuntimeError | None = None
@@ -356,19 +356,29 @@ class SupervisorBackendProxy:
             raise RuntimeError("supervisor returned an invalid snapshot")
         return self._apply_snapshot(result)
 
+    def recover_runtime_state(self) -> dict[str, object]:
+        """Hydrate a replacement GUI without starting or changing acquisition."""
+        result = self._command("runtime_state", {}, timeout=10.0)
+        if not isinstance(result, Mapping) or not isinstance(result.get("config"), Mapping):
+            raise RuntimeError("supervisor returned invalid recovery state")
+        config = launch_config_from_payload(result["config"])
+        # The reader applied this response in stream order before waking us.
+        # A later phase event may already have advanced beyond its snapshot.
+        snapshot = self.current_snapshot
+        raw_events = result.get("dashboard_events", [])
+        if not isinstance(raw_events, (list, tuple)) or len(raw_events) > 1:
+            raise RuntimeError("supervisor returned invalid sticky dashboard state")
+        events = tuple(DashboardEvent.from_payload(payload) for payload in raw_events)
+        self.launch_cfg = config
+        return {"config": config, "snapshot": snapshot,
+                "started_at": result.get("started_at"), "dashboard_events": events}
+
     def start_run(self, cfg: LaunchConfig) -> bool:
         self.launch_cfg = cfg
         result = self._command(
             "start_run", {"config": launch_config_payload(cfg)}
         )
         try:
-            # Until every response field is validated, an accepted start is
-            # conservatively treated as remotely active.
-            with self._state_lock:
-                if self.state.inference is None:
-                    self.state.inference = _RemoteCaptureHandle()
-                self.state.inference.running = True
-                self._finalization_in_progress = True
             if not isinstance(result, Mapping) or set(result) != {
                 "started",
                 "config",
@@ -385,6 +395,11 @@ class SupervisorBackendProxy:
             self._apply_snapshot(snapshot)
             return result["started"]
         except Exception as exc:
+            with self._state_lock:
+                if self.state.inference is None:
+                    self.state.inference = _RemoteCaptureHandle()
+                self.state.inference.running = True
+                self._finalization_in_progress = True
             # A semantically invalid reply cannot prove whether the accepted
             # mutation started capture. Mark ownership unknown before closing
             # the lease so the GUI cannot present a safe idle state.
@@ -576,6 +591,11 @@ class SupervisorBackendProxy:
         if pending is None:
             # A timed-out command may finish later; it must not grow retained state.
             return
+        if pending.name == "runtime_state" and envelope.payload.get("ok") is True:
+            result = envelope.payload.get("result")
+            if not isinstance(result, Mapping):
+                raise RuntimeError("supervisor returned invalid recovery state")
+            self._apply_snapshot(result.get("snapshot"))
         pending.payload = envelope.payload
         if pending.name == "shutdown_server":
             # The server closes immediately after flushing this response.  Mark
@@ -650,8 +670,15 @@ class SupervisorBackendProxy:
         except Exception as exc:
             self._connection_failed(exc)
             raise
-        self._apply_phase(snapshot.phase, snapshot.run_dir)
         with self._state_lock:
+            # Async finalization can emit a newer phase before an older RPC
+            # snapshot is delivered. For the same run, snapshots never move
+            # backwards; a distinct run directory starts a fresh lifecycle.
+            order = {phase: index for index, phase in enumerate(RunPhase)}
+            if (self.state.run_dir == snapshot.run_dir
+                    and order[self.state.phase] > order[snapshot.phase]):
+                return self.current_snapshot
+            self._apply_phase(snapshot.phase, snapshot.run_dir)
             self._last_error = snapshot.error
             if self.state.inference is None:
                 self.state.inference = _RemoteCaptureHandle()

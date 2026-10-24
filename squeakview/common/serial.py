@@ -115,7 +115,16 @@ class SerialHandle:
         on_fatal: Callable[[str], None] | None = None,
         failure_plan: FailurePlan | None = None,
     ):
-        self.emit = emit_fn
+        # Log/display delivery is not part of durable serial persistence. In
+        # particular a destroyed GUI receiver must not turn into a false CSV
+        # failure or prevent acknowledgement of an already-journaled frame.
+        def emit_presentation(message: str) -> None:
+            try:
+                emit_fn(message)
+            except Exception:
+                pass
+
+        self.emit = emit_presentation
         self.on_fatal = on_fatal
         self.failure_plan = (
             failure_plan
@@ -212,6 +221,14 @@ class SerialHandle:
         self._read_count = 0
         self._write_count = 0
         self._closed = True
+        self._close_lock = threading.Lock()
+        self._close_thread: threading.Thread | None = None
+        self._close_done = threading.Event()
+        self._close_done.set()
+        self._close_pending = False
+        self._close_stage = "idle"
+        self._close_wait_timeout_s = 5.0
+        self._close_report_context = threading.local()
         # Allow silencing serial logs in the terminal; still record CSV.
         self._emit_serial_logs = os.environ.get("SQUEAKVIEW_SERIAL_LOG", "1") != "0"
         # Alert phrase and state for optional email notifications.
@@ -221,19 +238,27 @@ class SerialHandle:
         self._alert_inflight = False
         self._alert_suppressed = 0
         self._atexit_registered = False
+        self._atexit_closing = False
         self._register_atexit()
 
     def _register_atexit(self) -> None:
         if self._atexit_registered:
             return
-        atexit.register(self.close)
+        atexit.register(self._close_at_exit)
         self._atexit_registered = True
 
     def _unregister_atexit(self) -> None:
         if not self._atexit_registered:
             return
-        atexit.unregister(self.close)
+        atexit.unregister(self._close_at_exit)
         self._atexit_registered = False
+
+    def _close_at_exit(self) -> None:
+        # Python 3.12 forbids starting a new thread from an atexit callback.
+        # Use the same dependency order synchronously, with bounded joins, if
+        # no existing coordinator already owns shutdown.
+        self._atexit_closing = True
+        self.close()
 
     @property
     def fatal_error(self) -> str | None:
@@ -323,6 +348,16 @@ class SerialHandle:
             dst_path = run_dir / "serial.csv"
 
             with self._csv_lock:
+                if (
+                    self._csv_ready
+                    and self._csv_file is not None
+                    and not self._csv_file.closed
+                    and Path(self._csv_file.name).resolve() == dst_path.resolve()
+                    and self._v2_journal is not None
+                    and self._v2_journal.path.resolve()
+                    == (run_dir / "diagnostics" / "controller_v2.jsonl").resolve()
+                ):
+                    return True
                 if self._csv_file:
                     self._csv_file.flush()
                     self._csv_file.close()
@@ -357,6 +392,14 @@ class SerialHandle:
             return False
 
     def open(self, run_dir: Path | None = None) -> bool:
+        with self._close_lock:
+            if self._close_pending:
+                self.last_error = "serial shutdown is still pending; wait for its workers to finish before reopening"
+                self.emit(f"[{timestamp()}] [SER] {self.last_error}")
+                return False
+            self._close_thread = None
+            self._close_stage = "idle"
+            self._atexit_closing = False
         # A handle may be closed and deliberately reused.  Keep emergency
         # interpreter cleanup active only while the object owns resources;
         # otherwise every completed run remains strongly held by ``atexit``.
@@ -431,16 +474,14 @@ class SerialHandle:
             self._thread.start()
             return True
         except Exception as exc:
-            self.last_error = str(exc) or type(exc).__name__
+            opening_error = str(exc) or type(exc).__name__
+            self.last_error = opening_error
             self.emit(f"[{timestamp()}] [SER] ERROR opening serial: {exc}")
-            try:
-                if self.ser and getattr(self.ser, "is_open", False):
-                    self.ser.close()
-            except Exception:
-                pass
-            self.ser = None
-            self._closed = True
-            self._unregister_atexit()
+            # A later worker may fail to start after files and earlier workers
+            # already exist. Roll back through the normal owner, rather than
+            # orphaning those workers and declaring their writers closed.
+            self.close()
+            self.last_error = opening_error
             return False
 
     def _pump(self) -> None:
@@ -1581,86 +1622,189 @@ class SerialHandle:
             self.emit(f"[{timestamp()}] [SER] alert email failed: {exc}")
 
     def close(self) -> None:
-        if (
-            self._closed
-            and self.ser is None
-            and self._csv_file is None
-            and not (self._thread and self._thread.is_alive())
-        ):
-            self._unregister_atexit()
+        """Retire producers before closing their scientific writers.
+
+        A stuck driver or persistence operation must not make the caller hang,
+        and a timeout must not close files underneath that operation. One
+        coordinator retains ownership and completes cleanup if it unblocks.
+        Concurrent and callback-triggered close requests share that coordinator.
+        """
+
+        if getattr(self._close_report_context, "active", False):
             return
-        self.emit(f"[{timestamp()}] [SER] closing …")
-        self._interrupt_clear_jam("serial port closed")
-        self._interrupt_clock_exchange("serial port closed")
-        if self._watchdog_session is not None:
-            self._watchdog_session.stop_worker()
-        self._stop.set()
-        failure: str | None = None
-        # Closing first actively unblocks a driver read. Any v2 record already
-        # admitted to the host queue is still journaled below; shutdown ACKs
-        # are unnecessary because reconnect replay is sequence-based.
-        try:
-            if self.ser and getattr(self.ser, "is_open", False):
-                self.ser.close()
-        except Exception as exc:
-            failure = f"serial port close failed: {exc}"
-        if self._thread and self._thread.is_alive():
+
+        exit_deadline = time.monotonic() + self._close_wait_timeout_s
+        synchronous_cleanup = self._atexit_closing
+
+        def join_producer(worker: threading.Thread | None) -> None:
+            if worker is None or not worker.is_alive():
+                return
+            if worker is threading.current_thread():
+                raise RuntimeError("cannot join the current producer; scientific writers retained")
+            if synchronous_cleanup:
+                worker.join(timeout=max(0.0, exit_deadline - time.monotonic()))
+            else:
+                worker.join()
+            if worker.is_alive():
+                raise RuntimeError("producer did not stop; scientific writers retained")
+
+        def retire_resources() -> None:
+            failures: list[str] = []
+            resources_retired = False
             try:
-                self._thread.join(timeout=1.0)
-                if self._thread.is_alive() and failure is None:
-                    failure = "serial reader did not stop after the port was closed"
-            except Exception as exc:
-                if failure is None:
-                    failure = f"serial reader join failed: {exc}"
-        try:
-            self._v2_queue.join()
-        except Exception as exc:
-            failure = failure or f"protocol-v2 persistence drain failed: {exc}"
-        self._v2_worker_stop.set()
-        if self._v2_worker and self._v2_worker.is_alive():
-            self._v2_worker.join(timeout=2.0)
-            if self._v2_worker.is_alive() and failure is None:
-                failure = "protocol-v2 persistence worker did not stop"
-        try:
-            self._write_queue.join()
-        except Exception as exc:
-            failure = failure or f"serial writer drain failed: {exc}"
-        self._writer_stop.set()
-        if self._writer_thread and self._writer_thread.is_alive():
-            self._writer_thread.join(timeout=2.0)
-            if self._writer_thread.is_alive() and failure is None:
-                failure = "serial writer did not stop"
-        try:
-            self._write_v2_summary()
-            if self._v2_journal is not None:
-                self._v2_journal.close()
-        except Exception as exc:
-            failure = failure or f"protocol-v2 journal close failed: {exc}"
-        with self._csv_lock:
-            if self._csv_file:
+                self.emit(f"[{timestamp()}] [SER] closing …")
+                self._interrupt_clear_jam("serial port closed")
+                self._interrupt_clock_exchange("serial port closed")
+                self._stop.set()
+                if self._watchdog_session is not None:
+                    self._close_stage = "watchdog producer"
+                    self._watchdog_session.stop_worker()
+                    heartbeat = getattr(self._watchdog_session, "_heartbeat_thread", None)
+                    join_producer(heartbeat)
+
+                # Port close unblocks a normal pyserial read. The reader can
+                # still finish admitting its last chunk after this call, so do
+                # not stop the persistence worker until the reader has exited.
+                self._close_stage = "serial port close"
                 try:
-                    self._csv_file.flush()
-                    self._csv_file.close()
+                    if self.ser and getattr(self.ser, "is_open", False):
+                        self.ser.close()
                 except Exception as exc:
-                    csv_failure = f"serial CSV close/flush failed: {exc}"
-                    failure = f"{failure}; {csv_failure}" if failure else csv_failure
-            still_temp = self._tmp_opened and self._tmp_csv_path
-            tmp_path = self._tmp_csv_path
-            self._csv_file = None
-            self._csv_writer = None
-            self._csv_ready = False
-            self._tmp_opened = False
-            self._tmp_csv_path = None
-        if failure is not None:
-            self._report_fatal(failure)
-        if still_temp and tmp_path:
-            self.emit(
-                f"[{timestamp()}] [SER] Run dir unknown at stop. Temp CSV kept here:\n{tmp_path}"
-            )
-        self.ser = None
-        self._v2_journal = None
-        self._closed = True
-        self._unregister_atexit()
+                    failures.append(f"serial port close failed: {exc}")
+                self._close_stage = "serial reader"
+                join_producer(self._thread)
+                # A reconnect already inside the driver's open() call may
+                # publish a replacement after the first port close. Once the
+                # reader is gone no further replacements can appear.
+                self._close_stage = "serial replacement port close"
+                if self.ser is not None and getattr(self.ser, "is_open", False):
+                    self.ser.close()
+
+                # Their existing loops drain queued work after stop is set.
+                # Joining in producer order avoids queue.join() races with a
+                # late read or with acknowledgements queued by persistence.
+                self._close_stage = "protocol-v2 persistence worker"
+                self._v2_worker_stop.set()
+                join_producer(self._v2_worker)
+                if not self._v2_queue.empty():
+                    self._v2_persistence_pump()
+                if self._v2_queue.unfinished_tasks:
+                    failures.append("protocol-v2 persistence worker exited with unfinished records")
+
+                self._close_stage = "serial command writer"
+                self._writer_stop.set()
+                join_producer(self._writer_thread)
+                if not self._write_queue.empty():
+                    self._writer_pump()
+                if self._write_queue.unfinished_tasks:
+                    failures.append("serial writer exited with unfinished commands")
+
+                self._close_stage = "protocol-v2 journal close"
+                try:
+                    self._write_v2_summary()
+                except Exception as exc:
+                    failures.append(f"protocol-v2 summary write failed: {exc}")
+                if self._v2_journal is not None:
+                    self._v2_journal.close()
+                    self._v2_journal = None
+
+                self._close_stage = "serial CSV close"
+                with self._csv_lock:
+                    if self._csv_file is not None:
+                        try:
+                            self._csv_file.flush()
+                        except Exception as exc:
+                            failures.append(f"serial CSV close/flush failed: {exc}")
+                        self._csv_file.close()
+                    still_temp = self._tmp_opened and self._tmp_csv_path
+                    tmp_path = self._tmp_csv_path
+                    self._csv_file = None
+                    self._csv_writer = None
+                    self._csv_ready = False
+                    self._tmp_opened = False
+                    self._tmp_csv_path = None
+                if still_temp and tmp_path:
+                    self.emit(
+                        f"[{timestamp()}] [SER] Run dir unknown at stop. Temp CSV kept here:\n{tmp_path}"
+                    )
+                # Retain an actually-open port after a driver close error, so
+                # a later close can retry rather than losing its ownership.
+                if self.ser is not None and getattr(self.ser, "is_open", False):
+                    raise RuntimeError("serial port remains open after shutdown")
+                self.ser = None
+                self._closed = True
+                resources_retired = True
+                self._close_stage = "closed"
+                self._unregister_atexit()
+            except BaseException as exc:
+                failures.append(f"{self._close_stage} failed: {exc}")
+            finally:
+                if failures:
+                    self._report_fatal("; ".join(failures))
+                with self._close_lock:
+                    if resources_retired:
+                        self._close_pending = False
+                    if synchronous_cleanup and self._close_thread is threading.current_thread():
+                        self._close_thread = None
+                    self._close_done.set()
+
+        synchronous_exit_cleanup = False
+        with self._close_lock:
+            if (
+                self._closed
+                and self.ser is None
+                and self._csv_file is None
+                and self._v2_journal is None
+                and not any(worker and worker.is_alive() for worker in
+                            (self._thread, self._v2_worker, self._writer_thread))
+            ):
+                self._unregister_atexit()
+                return
+            if self._close_thread is None or not self._close_thread.is_alive():
+                self._closed = False
+                self._close_pending = True
+                self._close_done.clear()
+                self._close_stage = "starting"
+                if self._atexit_closing:
+                    self._close_thread = threading.current_thread()
+                    synchronous_exit_cleanup = True
+                else:
+                    self._close_thread = threading.Thread(
+                        target=retire_resources, daemon=True,
+                        name="squeakview-serial-close",
+                    )
+                    try:
+                        self._close_thread.start()
+                    except RuntimeError:
+                        # Thread exhaustion may itself be the opening failure.
+                        # Roll back synchronously with bounded producer joins
+                        # rather than replacing that error or orphaning files.
+                        self._close_thread = threading.current_thread()
+                        synchronous_cleanup = True
+                        synchronous_exit_cleanup = True
+            close_thread = self._close_thread
+
+        if synchronous_exit_cleanup:
+            retire_resources()
+            return
+
+        # A worker's fatal callback may synchronously ask its lifecycle owner
+        # to close this handle. Waiting here would join the producer from itself.
+        if threading.current_thread() in (
+            close_thread, self._thread, self._v2_worker, self._writer_thread,
+            getattr(self._watchdog_session, "_heartbeat_thread", None),
+        ):
+            return
+        if not self._close_done.wait(timeout=self._close_wait_timeout_s):
+            self._close_report_context.active = True
+            try:
+                self._report_fatal(
+                    f"{self._close_stage} did not stop within {self._close_wait_timeout_s:.1f}s; "
+                    "serial shutdown remains pending and scientific writers are retained "
+                    "until all producers finish"
+                )
+            finally:
+                self._close_report_context.active = False
 
 
 def iter_lines(buffer: Iterable[str]) -> Iterable[str]:

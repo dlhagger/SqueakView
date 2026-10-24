@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import sys
+import time
 from typing import Callable
 
 from PySide6 import QtCore
 
 
 class IpcPreviewController(QtCore.QObject):
-    """Render a DeepStream DMA-BUF IPC stream into an existing Qt window."""
+    """Own a disposable renderer process; native video failures stay outside Qt."""
 
     ready = QtCore.Signal()
     failed = QtCore.Signal(str)
@@ -16,157 +20,161 @@ class IpcPreviewController(QtCore.QObject):
     def __init__(self, emit: Callable[[str], None], parent=None) -> None:
         super().__init__(parent)
         self._emit = emit
-        self._pipeline = None
-        self._bus = None
-        self._sink = None
-        self._window_id = 0
+        self._process = None
+        self._retiring = set()
+        self._kill_deadlines = {}
+        self._retire_timer = QtCore.QTimer(self)
+        self._retire_timer.setInterval(100)
+        self._retire_timer.timeout.connect(self._reap_retiring)
+        self._output = bytearray()
+        self._stderr = bytearray()
         self._ready = False
-        self._Gst = None
-        self._GstVideo = None
-        self._poll_timer = QtCore.QTimer(self)
-        self._poll_timer.setInterval(100)
-        self._poll_timer.timeout.connect(self._poll_bus)
 
     @property
     def running(self) -> bool:
-        return self._pipeline is not None
+        return self._process is not None
 
     def start(self, socket_path: Path, window_id: int) -> bool:
         self.stop()
-        self._window_id = int(window_id)
-        if self._window_id <= 0:
+        if int(window_id) <= 0:
             self._fail("Qt preview window is not available")
             return False
-
-        try:
-            import gi
-
-            gi.require_version("Gst", "1.0")
-            gi.require_version("GstVideo", "1.0")
-            from gi.repository import Gst, GstVideo
-
-            Gst.init(None)
-            self._Gst = Gst
-            self._GstVideo = GstVideo
-            pipeline = Gst.Pipeline.new("squeakview-gui-preview")
-            source = Gst.ElementFactory.make("nvunixfdsrc", "preview_ipc_source")
-            queue = Gst.ElementFactory.make("queue", "preview_queue")
-            transform = Gst.ElementFactory.make("nvegltransform", "preview_transform")
-            sink = Gst.ElementFactory.make("nveglglessink", "preview_sink")
-            if not all((pipeline, source, queue, transform, sink)):
-                raise RuntimeError("required GStreamer preview elements could not be created")
-
-            source.set_property("socket-path", str(socket_path))
-            source.set_property("connection-attempts", -1)
-            source.set_property("connection-interval", 100_000)
-            source.set_property("buffer-timestamp-copy", True)
-            queue.set_property("leaky", 2)
-            queue.set_property("max-size-buffers", 2)
-            queue.set_property("max-size-bytes", 0)
-            queue.set_property("max-size-time", 0)
-            sink.set_property("sync", False)
-            sink.set_property("qos", False)
-            sink.set_property("create-window", False)
-            sink.set_property("force-aspect-ratio", True)
-            sink.set_property("winsys", "x11")
-
-            for element in (source, queue, transform, sink):
-                pipeline.add(element)
-            if not source.link(queue) or not queue.link(transform) or not transform.link(sink):
-                raise RuntimeError("GStreamer preview elements could not be linked")
-
-            self._pipeline = pipeline
-            self._sink = sink
-            self._set_window_handle(sink)
-            self._bus = pipeline.get_bus()
-            self._bus.set_sync_handler(self._on_sync_message, None)
-            self._poll_timer.start()
-            result = pipeline.set_state(Gst.State.PLAYING)
-            if result == Gst.StateChangeReturn.FAILURE:
-                raise RuntimeError("GStreamer preview pipeline failed to enter PLAYING")
-        except Exception as exc:
-            self.stop()
-            self._fail(str(exc))
+        if len(self._retiring) >= 2:
+            self._fail("previous preview renderers are still stopping; retry shortly")
             return False
-
+        process = QtCore.QProcess(self)
+        process.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.SeparateChannels)
+        self._process = process
+        self._output.clear()
+        self._stderr.clear()
+        self._ready = False
+        process.readyReadStandardOutput.connect(self._output_ready)
+        process.readyReadStandardError.connect(self._errors_ready)
+        process.finished.connect(self._worker_finished)
+        process.errorOccurred.connect(self._worker_error)
+        program, arguments = self._renderer_command(socket_path, window_id)
+        process.start(program, arguments)
         self._emit(f"[PREVIEW] waiting for IPC frames on {socket_path}")
         return True
 
+    @staticmethod
+    def _renderer_command(socket_path, window_id):
+        return sys.executable, ["-m", "squeakview.apps.operator.gui.preview_worker",
+                                "--socket", str(socket_path), "--window-id", str(int(window_id)),
+                                "--parent-pid", str(os.getpid())]
+
     def stop(self) -> None:
-        self._poll_timer.stop()
-        pipeline = self._pipeline
-        bus = self._bus
-        self._pipeline = None
-        self._bus = None
-        self._sink = None
+        process = self._process
+        self._process = None
         self._ready = False
-        if bus is not None:
-            try:
-                bus.set_sync_handler(None, None)
-            except Exception:
-                pass
-        if pipeline is not None and self._Gst is not None:
-            try:
-                pipeline.set_state(self._Gst.State.NULL)
-                pipeline.get_state(self._Gst.SECOND)
-            except Exception:
-                pass
-
-    def _set_window_handle(self, sink) -> None:
-        if sink is None or self._GstVideo is None or self._window_id <= 0:
+        if process is None:
             return
-        if hasattr(sink, "set_window_handle"):
-            sink.set_window_handle(self._window_id)
-        else:
-            self._GstVideo.VideoOverlay.set_window_handle(sink, self._window_id)
+        self._retiring.add(process)
+        # All waiting happens in the worker. Even a driver teardown that holds
+        # the GIL cannot block the GUI event loop or its heartbeat timer.
+        process.terminate()
+        self._kill_deadlines[process] = time.monotonic() + 1.5
+        self._retire_timer.start()
 
-    def _on_sync_message(self, _bus, message, _data):
-        Gst = self._Gst
-        if Gst is None:
-            return 0
-        if message.type == Gst.MessageType.ELEMENT:
-            structure = message.get_structure()
-            if structure is not None and structure.get_name() == "prepare-window-handle":
-                try:
-                    self._set_window_handle(message.src)
-                    return Gst.BusSyncReply.DROP
-                except Exception:
-                    pass
-        return Gst.BusSyncReply.PASS
+    @QtCore.Slot()
+    def _reap_retiring(self):
+        now = time.monotonic()
+        for process in tuple(self._retiring):
+            if now >= self._kill_deadlines.get(process, float("inf")):
+                self._kill_retiring(process)
+                self._kill_deadlines[process] = float("inf")
+        if not self._retiring:
+            self._retire_timer.stop()
 
-    def _poll_bus(self) -> None:
-        Gst = self._Gst
-        bus = self._bus
-        pipeline = self._pipeline
-        if Gst is None or bus is None or pipeline is None:
+    @QtCore.Slot()
+    def _output_ready(self):
+        self._read_output(self.sender())
+
+    @QtCore.Slot()
+    def _errors_ready(self):
+        self._read_errors(self.sender())
+
+    @QtCore.Slot(int, QtCore.QProcess.ExitStatus)
+    def _worker_finished(self, code, status):
+        self._finished(self.sender(), code, status)
+
+    @QtCore.Slot(QtCore.QProcess.ProcessError)
+    def _worker_error(self, error):
+        self._process_error(self.sender(), error)
+
+    def _kill_retiring(self, process) -> None:
+        if process in self._retiring:
+            process.kill()
+
+    def _read_errors(self, process) -> None:
+        data = bytes(process.readAllStandardError())
+        if process is self._process:
+            self._stderr.extend(data)
+            del self._stderr[:-8192]
+
+    def _read_output(self, process) -> None:
+        data = bytes(process.readAllStandardOutput())
+        if process is not self._process:
             return
-        message_types = (
-            Gst.MessageType.ERROR
-            | Gst.MessageType.EOS
-            | Gst.MessageType.STATE_CHANGED
-        )
-        while True:
-            message = bus.timed_pop_filtered(0, message_types)
-            if message is None:
-                break
-            if message.type == Gst.MessageType.ERROR:
-                error, debug = message.parse_error()
-                detail = str(error)
-                if debug:
-                    detail = f"{detail} ({debug})"
+        self._output.extend(data)
+        if len(self._output) > 65536:
+            self.stop()
+            self._fail("renderer produced an oversized status message")
+            return
+        while b"\n" in self._output:
+            line, _, remaining = self._output.partition(b"\n")
+            self._output[:] = remaining
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue  # Native libraries may write their own diagnostics.
+            if not isinstance(event, dict):
+                continue
+            if event.get("event") == "ready" and not self._ready:
+                self._ready = True
+                self._emit("[PREVIEW] embedded IPC preview is playing")
+                self.ready.emit()
+            elif event.get("event") == "error":
+                detail = str(event.get("detail", "renderer failed"))[:4096]
                 self.stop()
                 self._fail(detail)
                 return
-            if message.type == Gst.MessageType.EOS:
+            elif event.get("event") == "ended":
                 self.stop()
                 self.ended.emit()
                 return
-            if message.type == Gst.MessageType.STATE_CHANGED and message.src == pipeline:
-                _old, new, _pending = message.parse_state_changed()
-                if new == Gst.State.PLAYING and not self._ready:
-                    self._ready = True
-                    self._emit("[PREVIEW] embedded IPC preview is playing")
-                    self.ready.emit()
+
+    def _release_process(self, process):
+        self._retiring.discard(process)
+        self._kill_deadlines.pop(process, None)
+        if not self._retiring:
+            self._retire_timer.stop()
+        for signal in (process.readyReadStandardOutput, process.readyReadStandardError,
+                       process.finished, process.errorOccurred):
+            signal.disconnect()
+        process.deleteLater()
+
+    def _process_error(self, process, error) -> None:
+        if error == QtCore.QProcess.ProcessError.FailedToStart:
+            current = process is self._process
+            detail = process.errorString()
+            if current:
+                self._process = None
+            self._release_process(process)
+            if current:
+                self._fail(detail)
+
+    def _finished(self, process, code, status) -> None:
+        self._read_errors(process)
+        current = process is self._process
+        self._retiring.discard(process)
+        if current:
+            self._process = None
+            self._ready = False
+            detail = self._stderr.decode("utf-8", errors="replace").strip()[-2048:]
+            suffix = f": {detail}" if detail else ""
+            self._fail(f"renderer exited (code {code}, status {status.name}){suffix}")
+        self._release_process(process)
 
     def _fail(self, detail: str) -> None:
         message = f"Preview unavailable: {detail}"

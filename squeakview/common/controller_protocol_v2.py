@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import struct
+import tempfile
 import threading
 import zlib
 from dataclasses import dataclass
@@ -338,59 +340,190 @@ class StoreResult(IntEnum):
 
 
 class DurableJournal:
-    """Append-only fsync journal indexed by the reliable record identity."""
+    """Canonical fsync JSONL with a bounded-memory, disposable disk index.
+
+    The SQLite database is temporary and never evidence: every open rebuilds
+    it from the journal. Its writes deliberately have no durability cost; only
+    the canonical JSONL fsync authorizes returning a durable watermark.
+    """
+
+    INDEX_CACHE_KIB = 512
+    MAX_JOURNAL_LINE_CHARS = 4096
+    _UINT64_MAX = (1 << 64) - 1
+    _KEY = struct.Struct(">Q")
 
     def __init__(self, path: Path, *, allow_midstream_start: bool = False):
         self.path = Path(path)
         self.allow_midstream_start = bool(allow_midstream_start)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._identities: dict[tuple[int, int], tuple[object, ...]] = {}
-        self._sequences: dict[int, set[int]] = {}
-        self._contiguous: dict[int, int] = {}
-        self._load()
-        self._file = open(self.path, "a", encoding="utf-8", buffering=1)
+        self._index_failed = False
+        # Put the disposable cache beside canonical evidence: the system temp
+        # directory may be tmpfs and consume the RAM this index must conserve.
+        descriptor, index_path = tempfile.mkstemp(
+            prefix=f".{self.path.name}.index-", suffix=".sqlite3", dir=self.path.parent
+        )
+        os.close(descriptor)
+        self._index_path = Path(index_path)
+        try:
+            self._index = sqlite3.connect(
+                str(self._index_path), isolation_level=None, check_same_thread=False
+            )
+        except BaseException:
+            self._index_path.unlink(missing_ok=True)
+            raise
+        try:
+            self._execute("PRAGMA temp_store=FILE")
+            self._execute(f"PRAGMA cache_size=-{self.INDEX_CACHE_KIB}")
+            self._execute("PRAGMA synchronous=OFF")
+            self._execute("PRAGMA journal_mode=OFF")
+            self._index.executescript(
+                "CREATE TABLE records (boot BLOB NOT NULL, sequence BLOB NOT NULL, "
+                "identity BLOB NOT NULL, PRIMARY KEY (boot, sequence)) WITHOUT ROWID;"
+                "CREATE TABLE boots (boot BLOB PRIMARY KEY, first_sequence BLOB NOT NULL, "
+                "contiguous BLOB NOT NULL) WITHOUT ROWID;"
+            )
+            self._load()
+            self._file = open(self.path, "a", encoding="utf-8", buffering=1)
+        except BaseException:
+            self._index.close()
+            self._index_path.unlink(missing_ok=True)
+            raise
+
+    def _execute(self, statement: str, parameters=()):
+        try:
+            return self._index.execute(statement, parameters)
+        except sqlite3.DatabaseError:
+            self._index_failed = True
+            raise
+
+    def _fetchone(self, statement: str, parameters=()):
+        try:
+            return self._execute(statement, parameters).fetchone()
+        except sqlite3.DatabaseError:
+            self._index_failed = True
+            raise
+
+    def _check_index(self) -> None:
+        if self._index_failed:
+            raise RuntimeError("journal disk index failed; reopen the canonical journal before storing")
+
+    @classmethod
+    def _key(cls, value: int) -> bytes:
+        return cls._KEY.pack(value)
+
+    @classmethod
+    def _number(cls, value: bytes) -> int:
+        return cls._KEY.unpack(value)[0]
+
+    @staticmethod
+    def _identity(frame: Frame) -> bytes:
+        # Exact bytes, rather than a hash: even an arbitrarily old conflicting
+        # duplicate must remain distinguishable. Retransmission is transport
+        # metadata and must not change the record's scientific identity.
+        return HEADER.pack(
+            VERSION, frame.message_type, frame.flags & ~FLAG_RETRANSMISSION,
+            frame.boot_id, frame.session_id, frame.sequence, frame.monotonic_us,
+            len(frame.payload),
+        ) + frame.payload
 
     def _load(self) -> None:
         if not self.path.exists():
             return
-        with self.path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, 1):
-                try:
-                    record = json.loads(line)
-                    decoded = bytes.fromhex(record["decoded_hex"])
-                    payload_length = int.from_bytes(decoded[32:34], "little")
-                    frame = Frame(
-                        message_type=int(record["message_type"]),
-                        flags=int(record["flags"]),
-                        boot_id=int(record["boot_id"]),
-                        session_id=int(record["session_id"]),
-                        sequence=int(record["sequence"]),
-                        monotonic_us=int(record["monotonic_us"]),
-                        payload=decoded[34 : 34 + payload_length],
-                        decoded=decoded,
-                    )
-                except Exception as exc:
-                    raise ProtocolV2Error(
-                        f"invalid durable journal line {line_number}: {exc}"
-                    ) from exc
-                self._remember(frame)
-        for boot_id in self._sequences:
-            if self.allow_midstream_start and self._sequences[boot_id]:
-                self._contiguous[boot_id] = min(self._sequences[boot_id]) - 1
-            self._advance_contiguous(boot_id)
+        self._execute("BEGIN")
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                line_number = 0
+                while True:
+                    line = handle.readline(self.MAX_JOURNAL_LINE_CHARS + 1)
+                    if not line:
+                        break
+                    line_number += 1
+                    try:
+                        if len(line) > self.MAX_JOURNAL_LINE_CHARS:
+                            raise ValueError("record exceeds the bounded journal line size")
+                        record = json.loads(line)
+                        decoded = bytes.fromhex(record["decoded_hex"])
+                        payload_length = int.from_bytes(decoded[32:34], "little")
+                        frame = Frame(
+                            message_type=int(record["message_type"]),
+                            flags=int(record["flags"]),
+                            boot_id=int(record["boot_id"]),
+                            session_id=int(record["session_id"]),
+                            sequence=int(record["sequence"]),
+                            monotonic_us=int(record["monotonic_us"]),
+                            payload=decoded[34 : 34 + payload_length],
+                            decoded=decoded,
+                        )
+                        if frame.reliable and frame.sequence == 0:
+                            raise ValueError("reliable record has sequence zero")
+                        previous = self._previous_identity(frame)
+                        if previous is not None and previous != self._identity(frame):
+                            raise ValueError("conflicting duplicate in canonical journal")
+                        if previous is None:
+                            self._remember(frame)
+                    except Exception as exc:
+                        raise ProtocolV2Error(
+                            f"invalid durable journal line {line_number}: {exc}"
+                        ) from exc
+            self._index.commit()
+        except BaseException:
+            self._index.rollback()
+            raise
 
-    def _remember(self, frame: Frame) -> None:
-        key = (frame.boot_id, frame.sequence)
-        self._identities[key] = frame.identity()
-        self._sequences.setdefault(frame.boot_id, set()).add(frame.sequence)
+    def _previous_identity(self, frame: Frame) -> bytes | None:
+        row = self._fetchone(
+            "SELECT identity FROM records WHERE boot=? AND sequence=?",
+            (self._key(frame.boot_id), self._key(frame.sequence)),
+        )
+        return row[0] if row is not None else None
 
-    def _advance_contiguous(self, boot_id: int) -> int:
-        sequences = self._sequences.setdefault(boot_id, set())
-        value = self._contiguous.get(boot_id, 0)
-        while value + 1 in sequences:
-            value += 1
-        self._contiguous[boot_id] = value
+    def _watermark(self, boot_id: int) -> int:
+        self._check_index()
+        row = self._fetchone(
+            "SELECT contiguous FROM boots WHERE boot=?", (self._key(boot_id),)
+        )
+        return self._number(row[0]) if row is not None else 0
+
+    def _remember(self, frame: Frame) -> int:
+        boot = self._key(frame.boot_id)
+        sequence = self._key(frame.sequence)
+        state = self._fetchone(
+            "SELECT first_sequence, contiguous FROM boots WHERE boot=?", (boot,)
+        )
+        if state is None:
+            baseline = frame.sequence - 1 if self.allow_midstream_start and frame.reliable else 0
+            self._execute(
+                "INSERT INTO boots VALUES (?, ?, ?)",
+                (boot, sequence, self._key(baseline)),
+            )
+            value = baseline
+        else:
+            value = self._number(state[1])
+            if sequence < state[0]:
+                self._execute(
+                    "UPDATE boots SET first_sequence=? WHERE boot=?", (sequence, boot)
+                )
+        self._execute(
+            "INSERT INTO records VALUES (?, ?, ?)", (boot, sequence, self._identity(frame))
+        )
+        # Stream an ordered range from the disk B-tree. A large replay filling
+        # an old gap must not materialize all accumulated sequence numbers.
+        cursor = self._execute(
+            "SELECT sequence FROM records WHERE boot=? AND sequence>? ORDER BY sequence",
+            (boot, self._key(value)),
+        )
+        try:
+            for (encoded_sequence,) in cursor:
+                number = self._number(encoded_sequence)
+                if value == self._UINT64_MAX or number != value + 1:
+                    break
+                value = number
+        finally:
+            cursor.close()
+        self._execute(
+            "UPDATE boots SET contiguous=? WHERE boot=?", (self._key(value), boot)
+        )
         return value
 
     def store(
@@ -398,26 +531,12 @@ class DurableJournal:
     ) -> tuple[StoreResult, int]:
         if frame.reliable and frame.sequence == 0:
             raise ProtocolV2Error("reliable record has sequence zero")
-        key = (frame.boot_id, frame.sequence)
         with self._lock:
-            previous = self._identities.get(key)
+            self._check_index()
+            previous = self._previous_identity(frame)
             if previous is not None:
-                result = (
-                    StoreResult.DUPLICATE
-                    if previous == frame.identity()
-                    else StoreResult.CONFLICT
-                )
-                return result, self._contiguous.get(frame.boot_id, 0)
-            if (
-                self.allow_midstream_start
-                and frame.boot_id not in self._sequences
-                and frame.reliable
-            ):
-                # Sequence numbers are boot-global while this journal is
-                # run-local. The first complete record received by a new run is
-                # therefore an explicit continuity baseline, not evidence that
-                # earlier, already-acknowledged runs are missing locally.
-                self._contiguous[frame.boot_id] = frame.sequence - 1
+                result = StoreResult.DUPLICATE if previous == self._identity(frame) else StoreResult.CONFLICT
+                return result, self._watermark(frame.boot_id)
             record: dict[str, Any] = {
                 "schema_version": 1,
                 "host_unix_ns": host_unix_ns,
@@ -434,19 +553,33 @@ class DurableJournal:
             self._file.write(json.dumps(record, separators=(",", ":")) + "\n")
             self._file.flush()
             os.fsync(self._file.fileno())
-            self._remember(frame)
-            return StoreResult.NEW, self._advance_contiguous(frame.boot_id)
+            # The cache may be discarded at any time. Never acknowledge an
+            # index update before the canonical bytes have reached fsync.
+            try:
+                self._execute("BEGIN")
+                watermark = self._remember(frame)
+                self._index.commit()
+            except BaseException:
+                self._index_failed = True
+                try:
+                    self._index.rollback()
+                except sqlite3.DatabaseError:
+                    pass
+                raise
+            return StoreResult.NEW, watermark
 
     def contiguous(self, boot_id: int) -> int:
         with self._lock:
-            return self._contiguous.get(boot_id, 0)
+            return self._watermark(boot_id)
 
     def start_sequence(self, boot_id: int) -> int | None:
         """Return the first sequence represented by this run-local journal."""
-
         with self._lock:
-            sequences = self._sequences.get(boot_id)
-            return min(sequences) if sequences else None
+            self._check_index()
+            row = self._fetchone(
+                "SELECT first_sequence FROM boots WHERE boot=?", (self._key(boot_id),)
+            )
+            return self._number(row[0]) if row is not None else None
 
     def close(self) -> None:
         with self._lock:
@@ -454,6 +587,8 @@ class DurableJournal:
                 self._file.flush()
                 os.fsync(self._file.fileno())
                 self._file.close()
+            self._index.close()
+            self._index_path.unlink(missing_ok=True)
 
 
 __all__ = [

@@ -206,6 +206,69 @@ class SupervisorBackendProxyTest(unittest.TestCase):
         self.assertTrue(proxy.state.inference.is_running())
         self.assertTrue(proxy.finalization_in_progress)
 
+    def test_recovery_hydrates_runtime_config_without_starting_a_run(self) -> None:
+        proxy = self.proxy()
+        config = LaunchConfig(experiment_name="existing", mouse_id="mouse-1",
+                              bottles={"mouse_weight_g": 23.4}, run_dir=Path("/tmp/existing"))
+        def serve():
+            command = self.fake.receive()
+            self.assertEqual(command.name, "runtime_state")
+            self.fake.respond(command, {
+                "config": launch_config_payload(config),
+                "snapshot": {"schema_version": "1.0", "phase": "recording",
+                             "run_dir": "/tmp/existing", "error": None,
+                             "capture_running": True, "finalization_in_progress": False},
+                "started_at": "2026-10-23T14:54:36",
+                "dashboard_events": [DashboardEvent.parse("FEED_JAM,100,200,nan,3,69420,69420,69420,Feeding,Jam").to_payload()],
+            })
+        thread = threading.Thread(target=serve)
+        thread.start()
+        restored = proxy.recover_runtime_state()
+        thread.join()
+        self.assertEqual(proxy.runtime_config.mouse_id, "mouse-1")
+        self.assertEqual(proxy.current_snapshot.phase, RunPhase.RECORDING)
+        self.assertEqual(proxy.current_snapshot.run_dir, Path("/tmp/existing"))
+        self.assertEqual(restored["config"].bottles["mouse_weight_g"], 23.4)
+        self.assertEqual(restored["dashboard_events"][0].event_uc, "FEED_JAM")
+        self.assertTrue(self.fake.commands.empty())
+
+    def test_recovery_caller_cannot_regress_a_newer_terminal_phase(self) -> None:
+        proxy = self.proxy()
+        finalized = threading.Event()
+        proxy.subscribe(lambda event: finalized.set() if event.phase == RunPhase.FINALIZED else None)
+        original_command = proxy._command
+        def delayed_command(*args, **kwargs):
+            result = original_command(*args, **kwargs)
+            self.assertTrue(finalized.wait(1))
+            return result
+        def serve():
+            command = self.fake.receive()
+            self.fake.respond(command, {
+                "config": launch_config_payload(LaunchConfig(run_dir=Path('/tmp/run'))),
+                "snapshot": {"schema_version":"1.0", "phase":"recording", "run_dir":"/tmp/run",
+                    "error":None, "capture_running":True, "finalization_in_progress":False}})
+            self.fake.event('backend_event', {"schema_version":"1.0", "type":"phase_changed",
+                "phase":"finalized", "run_dir":"/tmp/run", "message":None, "payload":{}, "host_unix_ns":123})
+        thread=threading.Thread(target=serve)
+        thread.start()
+        with mock.patch.object(proxy,'_command',side_effect=delayed_command):
+            restored=proxy.recover_runtime_state()
+        thread.join()
+        self.assertEqual(restored['snapshot'].phase,RunPhase.FINALIZED)
+        self.assertEqual(proxy.current_snapshot.phase,RunPhase.FINALIZED)
+        self.assertFalse(proxy.current_snapshot.capture_running)
+
+    def test_old_snapshot_cannot_regress_same_run_but_new_run_is_allowed(self) -> None:
+        proxy = self.proxy()
+        proxy._apply_phase(RunPhase.FINALIZED, Path('/tmp/old-run'))
+        payload = {"schema_version":"1.0", "phase":"recording", "run_dir":"/tmp/old-run",
+                   "error":None, "capture_running":True, "finalization_in_progress":False}
+        self.assertEqual(proxy._apply_snapshot(payload).phase,RunPhase.FINALIZED)
+        self.assertFalse(proxy.current_snapshot.capture_running)
+        payload['run_dir']='/tmp/new-run'
+        self.assertEqual(proxy._apply_snapshot(payload).phase,RunPhase.RECORDING)
+        self.assertTrue(proxy.current_snapshot.capture_running)
+
     def test_backend_events_reach_compatible_callbacks(self) -> None:
         started = threading.Event()
         subscribed = threading.Event()

@@ -162,6 +162,8 @@ class SupervisorServerTests(unittest.TestCase):
             self.server._loss_thread.join(timeout=2)
         if self.server._async_stop_thread is not None:
             self.server._async_stop_thread.join(timeout=2)
+        if self.server._diagnostic_thread is not None:
+            self.server._diagnostic_thread.join(timeout=2)
         self.temp_dir.cleanup()
 
     def _worker(self) -> threading.Thread:
@@ -209,23 +211,22 @@ class SupervisorServerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "trigger_on must be boolean"):
             self.server._dispatch(CommandEnvelope("start_run", "b", wrong_bool))
 
-    def test_gui_loss_cancels_blocked_pre_created_start_and_joins_worker(self) -> None:
+    def test_gui_loss_preserves_accepted_blocked_start(self) -> None:
         self.backend.block_start = True
         worker = self._worker()
-        self.server._commands.put(
-            CommandEnvelope("start_run", "start-1", self._config())
-        )
+        self.server._commands.put(CommandEnvelope("start_run", "start-disconnected", self._config()))
         self.assertTrue(self.backend.start_entered.wait(1))
-        self.assertEqual(self.backend.phase, RunPhase.IDLE)
-
-        self.server._signal_client_loss()
-        self.server._loss_thread.join(2)
+        self.server._signal_client_loss("GUI disappeared")
+        self.assertFalse(self.backend.cancelled.is_set())
+        self.assertEqual(self.backend.abort_calls, [])
+        self.backend.start_release.set()
+        deadline = time.monotonic() + 1
+        while self.backend.phase != RunPhase.RECORDING and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.backend.phase, RunPhase.RECORDING)
+        self.server._commands.put(None)
         worker.join(2)
-
         self.assertFalse(worker.is_alive())
-        self.assertTrue(self.backend.cancelled.is_set())
-        self.assertEqual(self.backend.abort_calls, ["operator GUI lost"])
-        self.assertNotEqual(self.backend.phase, RunPhase.RECORDING)
 
     def test_gui_loss_after_stop_acceptance_preserves_finalization(self) -> None:
         self.backend.phase = RunPhase.RECORDING
@@ -240,6 +241,7 @@ class SupervisorServerTests(unittest.TestCase):
         self.assertFalse(self.backend.cancelled.is_set())
         self.backend.stop_release.set()
         self.server._async_stop_thread.join(2)
+        self.server._commands.put(None)
         worker.join(2)
 
         self.assertFalse(worker.is_alive())
@@ -267,19 +269,15 @@ class SupervisorServerTests(unittest.TestCase):
         self.server._async_stop_thread.join(2)
         self.assertEqual(self.backend.phase, RunPhase.FINALIZED)
 
-    def test_ipc_failure_during_recording_remains_fail_closed_with_detail(self) -> None:
+    def test_ipc_failure_during_recording_preserves_acquisition(self) -> None:
         self.backend.phase = RunPhase.RECORDING
-
-        self.server._signal_client_loss(
-            "supervisor IPC send failed: BrokenPipeError: peer closed"
-        )
-        self.server._loss_thread.join(2)
-
-        self.assertIn("BrokenPipeError", self.server.last_error or "")
-        self.assertIsNone(self.server.last_warning)
-        self.assertTrue(self.backend.cancelled.is_set())
-        self.assertEqual(self.backend.abort_calls, ["operator GUI lost"])
-        self.assertEqual(self.backend.phase, RunPhase.FAILED)
+        self.server._signal_client_loss("supervisor IPC send failed: BrokenPipeError: peer closed")
+        self.assertIn("BrokenPipeError", self.server.last_warning or "")
+        self.assertIsNone(self.server.last_error)
+        self.assertFalse(self.backend.cancelled.is_set())
+        self.assertEqual(self.backend.abort_calls, [])
+        self.assertEqual(self.backend.phase, RunPhase.RECORDING)
+        self.assertFalse(self.server._stopping.is_set())
 
     def test_stop_command_acknowledges_while_long_finalizer_is_still_running(self) -> None:
         self.backend.phase = RunPhase.RECORDING
@@ -490,6 +488,22 @@ class SupervisorServerTests(unittest.TestCase):
         self.assertLessEqual(len(frame), MAX_FRAME_BYTES)
         self.assertIn("presentation truncated", queued.payload["message"])
 
+    def test_runtime_recovery_retains_feeder_jam_until_authoritative_clear_ack(self) -> None:
+        jam = DashboardEvent.parse("FEED_JAM,100,200,nan,3,69420,69420,69420,Feeding,Jam")
+        self.server._emit_dashboard(jam)
+        self.server._signal_client_loss("GUI disappeared")
+        result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "restore-jam"))
+        self.assertEqual(result["dashboard_events"][0]["event_uc"], "FEED_JAM")
+        self.server._emit_dashboard(DashboardEvent.parse("NACK,CLEAR_JAM,FEED_ACTIVE"))
+        result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "still-jammed"))
+        self.assertEqual(result["dashboard_events"][0]["event_uc"], "FEED_JAM")
+        self.server._emit_dashboard(DashboardEvent.parse("ACK_CLEAR_JAM"))
+        result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "restore-clear"))
+        self.assertEqual(result["dashboard_events"][0]["event_uc"], "ACK_CLEAR_JAM")
+        self.server._emit_dashboard(DashboardEvent.parse("SYSTEM_START,100,200"))
+        result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "new-controller"))
+        self.assertEqual(result["dashboard_events"], [])
+
     def test_default_heartbeat_lease_allows_thirty_seconds(self) -> None:
         clock = [0.0]
         server = SupervisorServer(
@@ -602,7 +616,7 @@ class SupervisorServerTests(unittest.TestCase):
 
         listener.close.assert_called_once_with()
         unlink.assert_called_once_with()
-        self.assertTrue(self.backend.cancelled.is_set())
+        self.assertFalse(self.backend.cancelled.is_set())
 
     def test_unexpected_ipc_eof_returns_nonzero_while_gui_is_alive(self) -> None:
         listener = mock.Mock()
@@ -628,8 +642,9 @@ class SupervisorServerTests(unittest.TestCase):
         ):
             result = self.server.serve(["gui"])
 
-        self.assertEqual(result, 1)
-        self.assertIn("lease was lost", self.server.last_error)
+        self.assertEqual(result, 0)
+        self.assertIn("IPC disconnected", self.server.last_warning)
+        self.assertFalse(self.backend.cancelled.is_set())
 
     def test_launcher_acknowledgement_occurs_only_after_owned_gui_connects(self) -> None:
         listener = mock.Mock()
@@ -656,7 +671,7 @@ class SupervisorServerTests(unittest.TestCase):
         ):
             result = self.server.serve(["gui"], on_gui_ready=connected)
 
-        self.assertEqual(result, 1)
+        self.assertEqual(result, 0)
         connected.assert_called_once_with()
 
     def test_expired_gui_heartbeat_fails_closed_and_returns_nonzero(self) -> None:
@@ -693,20 +708,16 @@ class SupervisorServerTests(unittest.TestCase):
         ):
             result = server.serve(["gui"])
 
-        self.assertEqual(result, 1)
-        self.assertEqual(
-            server.last_error,
-            "operator GUI main-loop heartbeat lease expired",
-        )
-        self.assertTrue(server.backend.cancelled.is_set())
-        self.assertEqual(server.backend.abort_calls, ["operator GUI lost"])
+        self.assertEqual(result, 0)
+        self.assertIn("main-loop heartbeat lease expired", server.last_warning)
+        self.assertFalse(server.backend.cancelled.is_set())
+        self.assertEqual(server.backend.abort_calls, [])
 
     def test_later_error_populates_loss_reason_after_concurrent_loss_signal(self) -> None:
         self.server._signal_client_loss()
         self.server._signal_client_loss("supervisor IPC send failed")
-        self.server._loss_thread.join(2)
-
-        self.assertEqual(self.server.last_error, "supervisor IPC send failed")
+        self.assertIsNone(self.server._loss_thread)
+        self.assertFalse(self.backend.cancelled.is_set())
 
     def test_backend_abort_seam_wakes_startup_and_fails_active_run(self) -> None:
         backend = OperatorBackend(
@@ -741,7 +752,7 @@ class SupervisorServerTests(unittest.TestCase):
             final_state="failed", error="operator GUI lost"
         )
 
-    def test_lease_loss_during_successful_finalizer_forces_failed_terminal_state(self) -> None:
+    def test_admin_cancellation_during_finalizer_forces_failed_terminal_state(self) -> None:
         backend = OperatorBackend(
             lambda _line: None,
             runtime_context=self.runtime_context,
@@ -770,7 +781,7 @@ class SupervisorServerTests(unittest.TestCase):
             backend._finalize_run(final_state="finalized")
 
         self.assertEqual(backend.snapshot().phase, RunPhase.FAILED)
-        self.assertEqual(backend.snapshot().error, "operator GUI lost")
+        self.assertEqual(backend.snapshot().error, "supervisor shutdown requested")
         self.assertTrue(
             any(call.args[1] == "failed" for call in write_status.call_args_list)
         )
