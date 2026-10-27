@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+
 import argparse
 import json
 import os
@@ -13,10 +14,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from squeakview.common.run_layout import artifact_path
 from squeakview.common.bounded_input import read_stable_regular_file  # noqa: E402
 
 
@@ -190,7 +192,7 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _status(run_dir: Path) -> dict[str, object]:
     raw = read_stable_regular_file(
-        run_dir / "run_status.json", max_bytes=MAX_STATUS_BYTES, label="run status"
+        artifact_path(run_dir, "run_status.json"), max_bytes=MAX_STATUS_BYTES, label="run status"
     )
     value = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=_unique_json_object)
     if not isinstance(value, dict):

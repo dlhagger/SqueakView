@@ -20,12 +20,6 @@ BOTTLE_FLUID_PRESETS = [
     "custom",
 ]
 
-_PENDING_STYLE = (
-    "QGroupBox { border: 2px solid #b98335; } "
-    "QGroupBox::title { color: #ffd28b; }"
-)
-
-
 def describe_bottle_error(reason: str) -> str:
     messages = {
         "CALIBRATION_FAILED": "Calibration failed. Both lick channels remain paused; you can retry.",
@@ -55,9 +49,8 @@ class BottleSavePresentation:
 def parse_weight(text: str, label: str, *, strict: bool) -> float | None:
     """Normalize an operator-entered bottle weight.
 
-    Non-strict collection is used to snapshot the initial form at launch, where
-    an unfinished field should remain absent rather than prevent recording.
-    Explicit saves use strict validation and surface actionable field errors.
+    Strict collection at Start and Save surfaces invalid entries rather than
+    silently omitting an operator's measurement. Empty fields remain optional.
     """
 
     cleaned = text.strip()
@@ -144,9 +137,8 @@ def present_saved_bottles(summary: Mapping[str, object]) -> BottleSavePresentati
                 + "\n".join(warnings)
             ),
         )
-    state = "saved; bottle weights complete" if complete else "saved; bottle weights incomplete"
     return BottleSavePresentation(
-        status_text=f"Measurements {state}.",
+        status_text="Measurements saved." if complete else "Measurements saved. Complete the remaining bottle fields, then save again.",
         completion_pending=not complete,
     )
 
@@ -155,16 +147,25 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
     """Bottle entry form with validation and presentation kept out of the shell."""
 
     save_requested = QtCore.Signal()
+    details_expansion_changed = QtCore.Signal(bool)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__("Weigh-In", parent)
         layout = QtWidgets.QGridLayout(self)
         layout.setHorizontalSpacing(8)
-        layout.setVerticalSpacing(8)
-        layout.addWidget(QtWidgets.QLabel("Side", self), 0, 0)
-        layout.addWidget(QtWidgets.QLabel("Fluid", self), 0, 1)
-        layout.addWidget(QtWidgets.QLabel("Initial g", self), 0, 2)
-        layout.addWidget(QtWidgets.QLabel("Final g", self), 0, 3)
+        layout.setVerticalSpacing(10)
+        self.phase_label = QtWidgets.QLabel("Before recording", self)
+        self.phase_label.setObjectName("bottlePhase")
+        layout.addWidget(self.phase_label, 0, 0, 1, 4)
+        self.status_label = QtWidgets.QLabel("Enter starting weights. Start Recording saves them automatically.", self)
+        self.status_label.setObjectName("bottleStatus")
+        self.status_label.setWordWrap(True)
+        self.status_label.setMinimumHeight(44)
+        layout.addWidget(self.status_label, 1, 0, 1, 4)
+        layout.addWidget(QtWidgets.QLabel("Bottle", self), 2, 0)
+        layout.addWidget(QtWidgets.QLabel("Fluid", self), 2, 1)
+        layout.addWidget(QtWidgets.QLabel("Initial (g)", self), 2, 2)
+        layout.addWidget(QtWidgets.QLabel("Final (g)", self), 2, 3)
 
         self.left_fluid_combo = self._make_fluid_combo()
         self.left_initial_weight_edit = self._make_weight_edit("initial")
@@ -173,34 +174,28 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         self.right_initial_weight_edit = self._make_weight_edit("initial")
         self.right_final_weight_edit = self._make_weight_edit("final")
 
-        layout.addWidget(QtWidgets.QLabel("Left", self), 1, 0)
-        layout.addWidget(self.left_fluid_combo, 1, 1)
-        layout.addWidget(self.left_initial_weight_edit, 1, 2)
-        layout.addWidget(self.left_final_weight_edit, 1, 3)
-        layout.addWidget(QtWidgets.QLabel("Right", self), 2, 0)
-        layout.addWidget(self.right_fluid_combo, 2, 1)
-        layout.addWidget(self.right_initial_weight_edit, 2, 2)
-        layout.addWidget(self.right_final_weight_edit, 2, 3)
+        layout.addWidget(QtWidgets.QLabel("Left", self), 3, 0)
+        layout.addWidget(self.left_fluid_combo, 3, 1)
+        layout.addWidget(self.left_initial_weight_edit, 3, 2)
+        layout.addWidget(self.left_final_weight_edit, 3, 3)
+        layout.addWidget(QtWidgets.QLabel("Right", self), 4, 0)
+        layout.addWidget(self.right_fluid_combo, 4, 1)
+        layout.addWidget(self.right_initial_weight_edit, 4, 2)
+        layout.addWidget(self.right_final_weight_edit, 4, 3)
 
         self.mouse_weight_edit = self._make_weight_edit("optional")
         self.mouse_weight_edit.setToolTip("Mouse body weight in grams for this run (optional).")
-        layout.addWidget(QtWidgets.QLabel("Mouse weight (g)", self), 3, 0, 1, 2)
-        layout.addWidget(self.mouse_weight_edit, 3, 2)
+        layout.addWidget(QtWidgets.QLabel("Mouse weight (g)", self), 5, 0, 1, 2)
+        layout.addWidget(self.mouse_weight_edit, 5, 2)
 
-        self.status_label = QtWidgets.QLabel("Measurements pending for next run.", self)
-        self.status_label.setObjectName("bottleStatus")
-        self.status_label.setWordWrap(True)
-        self.save_button = QtWidgets.QPushButton("Save Measurements", self)
-        self.save_button.setObjectName("secondaryButton")
+        self.save_button = QtWidgets.QPushButton("Save weights", self)
+        self.save_button.setObjectName("primaryButton")
         self.save_button.clicked.connect(self.save_requested.emit)
-        action_row = QtWidgets.QHBoxLayout()
-        action_row.addWidget(self.status_label, 1)
-        action_row.addWidget(self.save_button, 0)
-        layout.addLayout(action_row, 4, 0, 1, 4)
+        layout.addWidget(self.save_button, 6, 0, 1, 4)
         self.lick_status_label = QtWidgets.QLabel("Lickometer: unavailable until recording", self)
         self.lick_status_label.setObjectName("bottleLickStatus")
         self.lick_status_label.setWordWrap(True)
-        layout.addWidget(self.lick_status_label, 5, 0, 1, 4)
+        layout.addWidget(self.lick_status_label, 8, 0, 1, 4)
         self.swap_button = QtWidgets.QPushButton("Swap Bottles…", self)
         self.swap_button.setEnabled(False)
         swap_row = QtWidgets.QHBoxLayout()
@@ -209,10 +204,10 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         self.check_status_button.setEnabled(False)
         swap_row.addWidget(self.check_status_button)
         swap_row.addStretch()
-        layout.addLayout(swap_row, 6, 0, 1, 4)
+        layout.addLayout(swap_row, 9, 0, 1, 4)
         self.history_toggle = QtWidgets.QToolButton(self)
         self.history_toggle.setObjectName("bottleHistoryToggle")
-        self.history_toggle.setText("Bottle history")
+        self.history_toggle.setText("Bottle tools and history")
         self.history_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.history_toggle.setCheckable(True)
         self.history_toggle.setArrowType(QtCore.Qt.ArrowType.RightArrow)
@@ -242,9 +237,9 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         self.edit_history_button.setProperty("compact", True)
         self.history_toggle.toggled.connect(self._toggle_history)
         layout.addWidget(self.history_toggle, 7, 0, 1, 4)
-        layout.addWidget(self.history_table, 8, 0, 1, 4)
-        layout.addWidget(self.history_empty, 8, 0, 1, 4)
-        layout.addWidget(self.edit_history_button, 9, 0, 1, 4)
+        layout.addWidget(self.history_table, 10, 0, 1, 4)
+        layout.addWidget(self.history_empty, 10, 0, 1, 4)
+        layout.addWidget(self.edit_history_button, 11, 0, 1, 4)
         self.history_navigation = QtWidgets.QWidget(self)
         navigation = QtWidgets.QHBoxLayout(self.history_navigation)
         navigation.setContentsMargins(0, 0, 0, 0)
@@ -259,26 +254,47 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
                 widget.setProperty("compact", True)
                 navigation.addWidget(widget)
         self.history_navigation.hide()
-        layout.addWidget(self.history_navigation, 10, 0, 1, 4)
+        layout.addWidget(self.history_navigation, 12, 0, 1, 4)
         self._history_count = 0
         self._history_page = None
         self._history_offset = 0
         self._bottle_history_locked = False
         self._current_bottle_ids = {}
         self._swap_recording = False
+        self._run_state = None
+        self._completion_pending = True
+        self._save_acknowledged = False
+        self._saved_final_weights = {"left": "", "right": ""}
+        self._form_edits = set()
+        for side in ("left", "right"):
+            combo = getattr(self, f"{side}_fluid_combo")
+            combo.currentTextChanged.connect(lambda _text, side=side: self._measurement_edited(side, "fluid"))
+            for phase in ("initial", "final"):
+                edit = getattr(self, f"{side}_{phase}_weight_edit")
+                edit.textChanged.connect(lambda _text, side=side, phase=phase: self._measurement_edited(side, phase))
+        self.mouse_weight_edit.textChanged.connect(lambda _text: self._measurement_edited("mouse", "weight"))
         layout.setColumnStretch(1, 1)
         layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Preferred,
         )
+        self._update_history_visibility()
 
     def _toggle_history(self, expanded: bool) -> None:
+        # Let the workspace remember dock proportions before extra widgets
+        # increase this card's minimum size.
+        self.details_expansion_changed.emit(expanded)
         self._update_history_visibility()
+        self.layout().invalidate()
+        self.updateGeometry()
         self.history_toggle.setArrowType(QtCore.Qt.ArrowType.DownArrow if expanded else QtCore.Qt.ArrowType.RightArrow)
 
     def _update_history_visibility(self) -> None:
         expanded = self.history_toggle.isChecked()
+        self.lick_status_label.setVisible(expanded)
+        self.swap_button.setVisible(expanded and self._swap_recording)
+        self.check_status_button.setVisible(expanded and self._swap_recording)
         has_rows = self.history_table.rowCount() > 0
         self.history_table.setVisible(expanded and has_rows)
         self.history_empty.setVisible(expanded and not has_rows)
@@ -286,10 +302,6 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         self.history_navigation.setVisible(expanded and self._history_count > 50)
 
     def apply_swap_snapshot(self, snapshot: dict, *, recording: bool, busy: bool) -> None:
-        terminal_transition = (self._swap_recording and not recording) or (
-            snapshot.get("state") == "STOPPED" and getattr(self, "_last_swap_state", None) != "STOPPED"
-        )
-        self._last_swap_state = snapshot.get("state")
         self._swap_recording = recording
         state = str(snapshot.get("state", "UNKNOWN")).upper()
         available = bool(snapshot.get("available"))
@@ -298,20 +310,16 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         self.swap_button.setText("Manage Bottle Swap…" if state != "ACTIVE" and recording else "Swap Bottles…")
         totals = snapshot.get("global_counts", {})
         current = snapshot.get("current", {})
-        text = f"Lickometer: {state.lower()}" if recording else "Lickometer: recording stopped"
+        text = f"Lick channels: {state.lower()}" if recording else "Recording stopped"
         if recording and not available:
-            text += " · Bottle swaps require compatible controller firmware"
+            text += "\nBottle swapping is unavailable."
         if totals:
-            text += f" · Session licks L {totals.get('left', 0)} / R {totals.get('right', 0)}"
-        for side in ("left", "right"):
-            bottle = current.get(side) or {}
-            if bottle:
-                text += f" · {side.title()} bottle {bottle.get('fluid') or 'unspecified'}: {bottle.get('licks', bottle.get('lick_count', 0))} licks"
+            text += f"\nSession licks · Left {totals.get('left', 0)} · Right {totals.get('right', 0)}"
         gaps = snapshot.get("gaps", [])
         if gaps:
-            text += f" · Observation gaps: {snapshot.get('gap_count', len(gaps))}"
+            text += f"\nObservation gaps: {snapshot.get('gap_count', len(gaps))}"
         if snapshot.get("error"):
-            text += f" · {describe_bottle_error(str(snapshot['error']))}"
+            text += f"\n{describe_bottle_error(str(snapshot['error']))}"
         self.lick_status_label.setText(text)
         history_count = int(snapshot.get("history_count", len(snapshot.get("history", []))))
         if self._history_page is None:
@@ -330,20 +338,32 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         for side in ("left", "right"):
             bottle = current.get(side) or {}
             bottle_id = bottle.get("bottle_id", bottle.get("id"))
-            if bottle_id and (self._current_bottle_ids.get(side) != bottle_id or terminal_transition):
+            # Only a changed bottle identity owns new form values. A stop or
+            # status refresh must never replace the operator's unsaved edits.
+            if bottle_id and self._current_bottle_ids.get(side) != bottle_id:
+                first_snapshot = side not in self._current_bottle_ids
                 self._current_bottle_ids[side] = bottle_id
-                getattr(self, f"{side}_fluid_combo").setCurrentText(str(bottle.get("fluid") or ""))
-                for field in ("initial", "final"):
-                    value = bottle.get(f"{field}_weight_g")
-                    getattr(self, f"{side}_{field}_weight_edit").setText("" if value is None else str(value))
-        for side in ("left", "right"):
-            for suffix in ("fluid_combo", "initial_weight_edit", "final_weight_edit"):
-                widget = getattr(self, f"{side}_{suffix}")
-                widget.setEnabled(not self._bottle_history_locked)
-                widget.setToolTip("Use Swap Bottles to preserve bottle history." if self._bottle_history_locked else "")
+                for field in ("fluid", "initial", "final"):
+                    # A first recovery poll can finish after the user has
+                    # started typing. Final weights also belong to the user
+                    # while the terminal controller snapshot is still pending.
+                    if not recording and (first_snapshot or field == "final") and (side, field) in self._form_edits:
+                        continue
+                    widget = getattr(self, f"{side}_fluid_combo" if field == "fluid" else f"{side}_{field}_weight_edit")
+                    value = bottle.get("fluid") if field == "fluid" else bottle.get(f"{field}_weight_g")
+                    with QtCore.QSignalBlocker(widget):
+                        if field == "fluid":
+                            widget.setCurrentText(str(value or ""))
+                        else:
+                            widget.setText("" if value is None else str(value))
+                    self._form_edits.discard((side, field))
+                saved_final = bottle.get("final_weight_g")
+                self._saved_final_weights[side] = "" if saved_final is None else str(saved_final)
+        self._update_form_controls()
         rows = [(bottle, "Closed" if bottle.get("final_weight_g") is not None else "Final weight pending") for bottle in history]
         rows += [(bottle, "Current") for bottle in current.values() if bottle]
-        self.history_table.setRowCount(len(rows))
+        if self.history_table.rowCount() != len(rows):
+            self.history_table.setRowCount(len(rows))
         self._update_history_visibility()
         self.edit_history_button.setEnabled(bool(history) and not busy)
         for row, (bottle, status) in enumerate(rows):
@@ -356,9 +376,16 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
             values = [bottle.get("side", ""), bottle.get("fluid", ""), bottle.get("initial_weight_g"),
                       bottle.get("final_weight_g"), bottle.get("intake_g"), bottle.get("licks", bottle.get("lick_count", 0)), status, timestamp("started_monotonic_us"), timestamp("ended_monotonic_us")]
             for column, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem("—" if value is None else str(value))
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, bottle.get("bottle_id") if status != "Current" else None)
-                self.history_table.setItem(row, column, item)
+                text = "—" if value is None else str(value)
+                item = self.history_table.item(row, column)
+                if item is None:
+                    item = QtWidgets.QTableWidgetItem(text)
+                    self.history_table.setItem(row, column, item)
+                elif item.text() != text:
+                    item.setText(text)
+                bottle_id = bottle.get("bottle_id") if status != "Current" else None
+                if item.data(QtCore.Qt.ItemDataRole.UserRole) != bottle_id:
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, bottle_id)
 
     def _make_fluid_combo(self) -> QtWidgets.QComboBox:
         combo = _SwapComboBox(self)
@@ -380,7 +407,7 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
     def collect_payload(
         self, *, include_final: bool, strict: bool
     ) -> dict[str, object]:
-        if self._bottle_history_locked:
+        if include_final and self._bottle_history_locked:
             weight = parse_weight(self.mouse_weight_edit.text(), "Mouse weight", strict=strict)
             if weight == 0:
                 if strict:
@@ -405,22 +432,94 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
             strict=strict,
             mouse_weight=self.mouse_weight_edit.text(),
         )
-        if self._current_bottle_ids:
+        if include_final and self._current_bottle_ids:
             payload["current_bottle_ids"] = dict(self._current_bottle_ids)
         return payload
+
+    def set_run_state(self, state: str) -> None:
+        changed = self._run_state != state
+        if changed and state in {"ready", "starting"}:
+            self._save_acknowledged = False
+        self._run_state = state
+        if changed:
+            self.set_status({
+                "ready": "Enter fluids and starting weights. Start Recording saves them automatically.",
+                "starting": "Saving starting measurements with this run…",
+                "recording": "Starting measurements saved. Enter final weights after Stop Recording.",
+                "finalizing": "Wait for recording to finish before entering final weights.",
+                "complete": "Enter final bottle weights, then save.",
+                "failed": "Recording stopped. Measurements can still be saved; check Events for the run error.",
+            }.get(state, ""))
+        self._update_form_controls()
+
+    def _update_form_controls(self) -> None:
+        active = self._run_state in {"starting", "recording", "finalizing"}
+        if self._run_state is None:
+            active = self._swap_recording
+        for side in ("left", "right"):
+            for suffix in ("fluid_combo", "initial_weight_edit"):
+                widget = getattr(self, f"{side}_{suffix}")
+                widget.setEnabled(not active)
+                widget.setToolTip("Use Swap Bottles to preserve bottle history." if active else "")
+            getattr(self, f"{side}_final_weight_edit").setEnabled(
+                not active and self._run_state != "ready")
+            getattr(self, f"{side}_final_weight_edit").setPlaceholderText(
+                "After Stop" if active or self._run_state == "ready" else "final")
+        self.mouse_weight_edit.setEnabled(not active)
+        self.save_button.setText("Saved" if self._save_acknowledged else "Save weights")
+        self.save_button.setEnabled(not active and self._run_state != "ready" and not self._save_acknowledged)
+        self.save_button.setVisible(not active and self._run_state != "ready")
+        self.history_toggle.setVisible(self._run_state != "ready")
+        self._update_phase_heading()
+        self.save_button.setToolTip(
+            "Initial measurements are saved automatically when recording starts."
+            if self._run_state == "ready" else
+            "Stop recording before saving final measurements." if active else "")
 
     def clear_final_fields(self) -> None:
         self.left_final_weight_edit.clear()
         self.right_final_weight_edit.clear()
+        self._saved_final_weights = {"left": "", "right": ""}
+        self._form_edits.difference_update({("left", "final"), ("right", "final")})
+
+    def mark_saved(self) -> None:
+        self._form_edits.clear()
+        self._saved_final_weights = {
+            side: getattr(self, f"{side}_final_weight_edit").text()
+            for side in ("left", "right")
+        }
+        self._save_acknowledged = True
+        self._update_form_controls()
+
+    def _measurement_edited(self, side: str, field: str) -> None:
+        self._form_edits.add((side, field))
+        if self._save_acknowledged:
+            self._save_acknowledged = False
+            self.set_status("Unsaved changes.")
+            self._update_form_controls()
+
+    def has_unsaved_final_weights(self) -> bool:
+        return bool(self._current_bottle_ids) and any(
+            getattr(self, f"{side}_final_weight_edit").text().strip() != self._saved_final_weights[side].strip()
+            for side in ("left", "right")
+        )
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
 
     def set_completion_pending(self, pending: bool) -> None:
-        self.setStyleSheet(_PENDING_STYLE if pending else "")
-        self.save_button.setText(
-            "Save Final Weights" if pending else "Save Measurements"
-        )
+        self._completion_pending = pending
+        self._update_phase_heading()
+
+    def _update_phase_heading(self) -> None:
+        self.phase_label.setText({
+            "ready": "Before recording",
+            "starting": "Starting recording",
+            "recording": "Recording",
+            "finalizing": "Finishing recording",
+            "complete": "Final weights",
+            "failed": "Recording stopped",
+        }.get(self._run_state, "Before recording"))
 
 
 class _SwapComboBox(QtWidgets.QComboBox):
@@ -630,7 +729,7 @@ class BottleSwapDialog(QtWidgets.QDialog):
 class BottleSwapController(QtCore.QObject):
     """Perform all supervisor swap requests off the GUI heartbeat thread."""
 
-    finished = QtCore.Signal(str, object)
+    finished = QtCore.Signal(str, object, int)
 
     def __init__(self, panel, backend, recording, parent=None):
         super().__init__(parent)
@@ -640,6 +739,7 @@ class BottleSwapController(QtCore.QObject):
         self.snapshot: dict = {}
         self.busy = False
         self._operation = None
+        self._generation = 0
         self._queued_request = None
         self._was_recording = False
         self._terminal_refresh_pending = False
@@ -661,9 +761,30 @@ class BottleSwapController(QtCore.QObject):
         queued = self._queued_request is not None and self._queued_request[0] in {"begin", "resume"}
         return not self.recording() or changing or queued
 
+    def _panel_is_busy(self):
+        return self.busy and self._operation in {"begin", "resume", "history_weight"}
+
+    def begin_run(self):
+        """Retire the preceding run's polls before starting a new request."""
+        self._generation += 1
+        self.busy = False
+        self._operation = None
+        self._queued_request = None
+        self._terminal_refresh_pending = False
+        self._was_recording = False
+        self.snapshot = {}
+        self.panel._history_page = None
+        self.panel._history_offset = 0
+        self.panel._current_bottle_ids = {}
+        self.panel._bottle_history_locked = False
+        self.panel._form_edits.clear()
+        self.panel.apply_swap_snapshot({}, recording=False, busy=False)
+        if self.dialog:
+            self.dialog.close()
+
     def refresh(self):
         recording = self.recording()
-        self.panel.apply_swap_snapshot(self.snapshot, recording=recording, busy=self.busy)
+        self.panel.apply_swap_snapshot(self.snapshot, recording=recording, busy=self._panel_is_busy())
         if self._was_recording and not recording:
             self._terminal_refresh_pending = True
         self._was_recording = recording
@@ -691,10 +812,13 @@ class BottleSwapController(QtCore.QObject):
             self.snapshot = dict(self.snapshot, selected_sides=list(payload), state="PAUSING")
         elif operation == "resume":
             self.snapshot = dict(self.snapshot, resume_pending=True, state="CALIBRATING")
-        self.panel.apply_swap_snapshot(self.snapshot, recording=self.recording(), busy=True)
+        # Background reads do not disable/re-enable visible actions every poll.
+        changing = operation in {"begin", "resume", "history_weight"}
+        self.panel.apply_swap_snapshot(self.snapshot, recording=self.recording(), busy=changing)
         if self.dialog:
             self.dialog.apply_snapshot(self.snapshot, busy=self._dialog_is_busy())
         import threading
+        generation = self._generation
         def work():
             try:
                 if operation == "snapshot":
@@ -713,13 +837,15 @@ class BottleSwapController(QtCore.QObject):
             except Exception as exc:
                 result = dict(self.snapshot, state="UNCONFIRMED", error=str(exc))
             try:
-                self.finished.emit(operation, result)
+                self.finished.emit(operation, result, generation)
             except RuntimeError:
                 pass  # Window was destroyed while a supervisor request completed.
         threading.Thread(target=work, name="bottle-swap-gui", daemon=True).start()
 
-    @QtCore.Slot(str, object)
-    def _finished(self, operation, snapshot):
+    @QtCore.Slot(str, object, int)
+    def _finished(self, operation, snapshot, generation=None):
+        if generation is not None and generation != self._generation:
+            return
         self.busy = False
         self._operation = None
         if operation != "history_page" and self.snapshot.get("run_dir") != (snapshot or {}).get("run_dir"):
@@ -752,7 +878,7 @@ class BottleSwapController(QtCore.QObject):
 
     def _history_latest(self):
         self.panel._history_page = None
-        self.panel.apply_swap_snapshot(self.snapshot, recording=self.recording(), busy=self.busy)
+        self.panel.apply_swap_snapshot(self.snapshot, recording=self.recording(), busy=self._panel_is_busy())
 
     def edit_history_weight(self):
         row = self.panel.history_table.currentRow()

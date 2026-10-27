@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path, open_artifact
+
 import csv
 import json
 from dataclasses import dataclass
@@ -15,7 +17,7 @@ MAX_LEDGER_LINE_BYTES = 64 * 1024
 def _bounded_text_lines(path: Path) -> Iterator[str]:
     """Yield strict UTF-8 lines while bounding every individual record."""
 
-    with path.open("rb") as handle:
+    with open_artifact(path, "rb") as handle:
         line_number = 0
         while True:
             raw = handle.readline(MAX_LEDGER_LINE_BYTES + 1)
@@ -212,12 +214,10 @@ def recorded_payloads(
 ) -> Iterator[dict]:
     """Yield capture metadata only for frames admitted to recording."""
 
-    capture_path = run_dir / f"capture_cam{stream_id}.jsonl"
-    admission_path = run_dir / (
-        "record_admission.csv"
+    capture_path = artifact_path(run_dir, f"capture_cam{stream_id}.jsonl")
+    admission_path = artifact_path(run_dir, "record_admission.csv"
         if stream_id == 0
-        else f"record_admission_cam{stream_id}.csv"
-    )
+        else f"record_admission_cam{stream_id}.csv")
     admissions = iter_admission_pts(admission_path, stream_id)
     admission = next(admissions, None)
     for payload in iter_capture_payloads(capture_path, stream_id):

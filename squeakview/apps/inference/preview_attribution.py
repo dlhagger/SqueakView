@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import atexit
 import csv
 import json
@@ -29,7 +31,7 @@ HEADERS = (
 
 def boundary_path(run_dir: Path, stream_id: int, boundary: str) -> Path:
     suffix = "" if stream_id == 0 else f"_cam{stream_id}"
-    return Path(run_dir) / "diagnostics" / f"preview_{boundary}{suffix}.csv"
+    return artifact_path(Path(run_dir), "diagnostics") / f"preview_{boundary}{suffix}.csv"
 
 
 class PreviewBoundaryOperator(BatchMetadataOperator):
@@ -278,7 +280,7 @@ def reconcile_preview(run_dir: Path, camera_count: int, *, required: bool) -> di
     observed_names: set[str] = set()
     overflow = False
     try:
-        with os.scandir(Path(run_dir) / "diagnostics") as entries:
+        with os.scandir(artifact_path(Path(run_dir), "diagnostics")) as entries:
             for entry in entries:
                 if not Path(entry.name).match("preview_*.csv"):
                     continue

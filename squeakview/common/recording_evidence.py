@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import os
 import hashlib
 import stat
@@ -13,15 +15,13 @@ MAX_RECORDING_CAMERAS = 64
 
 def _artifact_path(run_dir: Path, stream_id: int, kind: str) -> Path:
     if kind == "video":
-        return run_dir / ("raw.mp4" if stream_id == 0 else f"raw_cam{stream_id}.mp4")
+        return artifact_path(run_dir, "raw.mp4" if stream_id == 0 else f"raw_cam{stream_id}.mp4")
     if kind == "capture_ledger":
-        return run_dir / f"capture_cam{stream_id}.jsonl"
+        return artifact_path(run_dir, f"capture_cam{stream_id}.jsonl")
     if kind == "admission_ledger":
-        return run_dir / (
-            "record_admission.csv"
+        return artifact_path(run_dir, "record_admission.csv"
             if stream_id == 0
-            else f"record_admission_cam{stream_id}.csv"
-        )
+            else f"record_admission_cam{stream_id}.csv")
     raise ValueError(f"unsupported recording artifact kind: {kind}")
 
 
@@ -110,12 +110,12 @@ def capture_recording_evidence(run_dir: Path, camera_count: int) -> dict[str, ob
     }
     patterns = {
         "video": "raw*.mp4",
-        "capture_ledger": "capture_cam*.jsonl",
-        "admission_ledger": "record_admission*.csv",
+        "capture_ledger": "capture_cam*.jsonl*",
+        "admission_ledger": "record_admission*.csv*",
     }
     sets_valid = True
     for kind, pattern in patterns.items():
-        observed, overflow = _bounded_matching_names(root, pattern, camera_count + 1)
+        observed, overflow = _bounded_matching_names(_artifact_path(root, 0, kind).parent, pattern, camera_count + 1)
         if overflow or observed != expected[kind]:
             sets_valid = False
     for stream_id in range(camera_count):
@@ -218,11 +218,11 @@ def recording_evidence_metadata_matches(
     }
     patterns = {
         "video": "raw*.mp4",
-        "capture_ledger": "capture_cam*.jsonl",
-        "admission_ledger": "record_admission*.csv",
+        "capture_ledger": "capture_cam*.jsonl*",
+        "admission_ledger": "record_admission*.csv*",
     }
     for kind, pattern in patterns.items():
-        observed, overflow = _bounded_matching_names(root, pattern, camera_count + 1)
+        observed, overflow = _bounded_matching_names(_artifact_path(root, 0, kind).parent, pattern, camera_count + 1)
         if overflow or observed != expected_sets[kind]:
             return False
     for stream_id, camera in enumerate(evidence["cameras"]):

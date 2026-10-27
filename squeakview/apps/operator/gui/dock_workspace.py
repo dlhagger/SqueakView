@@ -40,6 +40,11 @@ class DockWorkspace(QtCore.QObject):
         self._default_state = QtCore.QByteArray()
         self._user_editable = False
         self._runtime_locked = False
+        self._content_expansions = {}
+        self._pending_content_restores = {}
+        self._content_restore_timer = QtCore.QTimer(self)
+        self._content_restore_timer.setSingleShot(True)
+        self._content_restore_timer.timeout.connect(self._restore_content_sizes)
 
     @property
     def cards(self) -> Mapping[str, QtWidgets.QDockWidget]:
@@ -129,6 +134,8 @@ class DockWorkspace(QtCore.QObject):
         self._default_state = self._host.saveState(LAYOUT_SCHEMA_VERSION)
 
     def reset_layout(self) -> None:
+        self._content_expansions.clear()
+        self._pending_content_restores.clear()
         if self._default_state.isEmpty() or not self._host.restoreState(
             self._default_state, LAYOUT_SCHEMA_VERSION
         ):
@@ -138,6 +145,8 @@ class DockWorkspace(QtCore.QObject):
     def restore_layout(self) -> bool:
         """Restore a compatible saved state or atomically use the default."""
 
+        self._content_expansions.clear()
+        self._pending_content_restores.clear()
         raw_state = self._settings.value(LAYOUT_STATE_KEY)
         if isinstance(raw_state, bytes):
             raw_state = QtCore.QByteArray(raw_state)
@@ -163,6 +172,44 @@ class DockWorkspace(QtCore.QObject):
     def set_user_editable(self, editable: bool) -> None:
         self._user_editable = bool(editable)
         self._apply_all_card_features()
+
+    def set_card_content_expanded(self, card_id: str, expanded: bool) -> None:
+        """Return space borrowed by temporary card details after collapse.
+
+        Qt grows neighboring dock rows to satisfy an expanded child's minimum
+        size, but keeps those splitter sizes when the child is hidden again.
+        Remember sizes rather than the full dock state so visibility, card
+        placement, and recording controls are never reset.
+        """
+        if expanded:
+            self._pending_content_restores.pop(card_id, None)
+            self._content_expansions.setdefault(card_id, {
+                key: QtCore.QSize(dock.size()) for key, dock in self._cards.items()
+                if dock.isVisible()
+            })
+        else:
+            sizes = self._content_expansions.pop(card_id, None)
+            if sizes is not None:
+                self._pending_content_restores[card_id] = sizes
+                # Wait until the hidden children's minimum sizes propagate.
+                self._content_restore_timer.start(0)
+
+    def _restore_content_sizes(self) -> None:
+        pending = self._pending_content_restores
+        self._pending_content_restores = {}
+        for card_id, sizes in pending.items():
+            dock = self._cards[card_id]
+            if dock.isFloating():
+                if card_id in sizes:
+                    dock.resize(sizes[card_id])
+                continue
+            docked = [(self._cards[key], size) for key, size in sizes.items()
+                      if self._cards[key].isVisible() and not self._cards[key].isFloating()]
+            for orientation in (QtCore.Qt.Orientation.Horizontal, QtCore.Qt.Orientation.Vertical):
+                self._host.resizeDocks([widget for widget, _size in docked], [
+                    size.width() if orientation == QtCore.Qt.Orientation.Horizontal else size.height()
+                    for _widget, size in docked
+                ], orientation)
 
     def set_runtime_locked(self, locked: bool) -> None:
         self._runtime_locked = bool(locked)

@@ -3,6 +3,7 @@ from __future__ import annotations
 """Shared parsing helpers for the behavior dashboard."""
 
 import math
+import csv
 import re
 import time
 from dataclasses import dataclass
@@ -117,7 +118,13 @@ class DashboardEvent:
         source = raw_line
         if source.startswith("[Arduino] "):
             source = source[len("[Arduino] ") :].lstrip()
-        parts = [part.strip() for part in source.split(",", 9)]
+        try:
+            parts = [part.strip() for part in next(csv.reader([source]))]
+        except (csv.Error, StopIteration):
+            return None
+        if len(parts) > len(CSV_FIELDS):
+            # Historical firmware did not quote commas in its final reason.
+            parts = parts[:9] + [",".join(parts[9:])]
         truncated = raw_truncated
         values: dict[str, str] = {}
         if len(parts) >= len(CSV_FIELDS):

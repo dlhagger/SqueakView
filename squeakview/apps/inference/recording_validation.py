@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
@@ -115,7 +117,7 @@ def validate_recordings(
         video_path = (
             artifacts.raw_video
             if stream_id == 0
-            else run_dir / f"raw_cam{stream_id}.mp4"
+            else artifact_path(run_dir, f"raw_cam{stream_id}.mp4")
         )
         source_frames = source_counts.get(stream_id, 0)
         admitted_frames = recorded_counts.get(stream_id, 0)

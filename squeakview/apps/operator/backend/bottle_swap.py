@@ -5,10 +5,13 @@ while a bottle identity changes only on a selected side after confirmed resume.
 """
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path, is_primary_layout
+
 from copy import deepcopy
 import json
 import math
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -22,11 +25,21 @@ SIDES = ("left", "right")
 
 class BottleSwapService:
     def __init__(self, run_dir: Path, bottles: Mapping[str, Any] | None = None):
-        self.path = Path(run_dir) / "bottle_history.json"
-        if self.path.exists():
-            if self.path.stat().st_size > 64 * 1024 * 1024:
+        self.run_dir = Path(run_dir)
+        self._primary = is_primary_layout(self.run_dir)
+        self.path = artifact_path(self.run_dir, "weigh_in.csv" if self._primary else "bottle_history.json")
+        restored = None
+        if self._primary:
+            from squeakview.common.bottle_csv import load_swap_state
+            restored = load_swap_state(self.run_dir)
+            previous = artifact_path(self.run_dir, "bottle_history.json")
+            if restored is None and previous.exists():
+                from squeakview.common.run_context import read_json_required
+                restored = read_json_required(previous, max_bytes=64 * 1024 * 1024)
+        if restored is not None or (not self._primary and self.path.exists()):
+            if not self._primary and self.path.stat().st_size > 64 * 1024 * 1024:
                 raise ValueError("Bottle history exceeds the supported recovery size")
-            self._data = json.loads(self.path.read_text())
+            self._data = restored if restored is not None else json.loads(self.path.read_text())
             if self._data.get("schema_version") != 1:
                 raise ValueError("Unsupported bottle history schema")
             # A previous process cannot establish present hardware readiness.
@@ -44,6 +57,14 @@ class BottleSwapService:
                 values = (bottles or {}).get(side, {})
                 self._data["current"][side] = self._entry(side, values, 0, None)
             self._save()
+        if self._primary and restored is not None:
+            self._save()
+            previous_events = artifact_path(self.run_dir, "bottle_history_events.jsonl")
+            if previous_events.exists():
+                from squeakview.common.bounded_csv import bounded_csv_lines
+                from squeakview.common.bottle_csv import record_swap_event
+                for line in bounded_csv_lines(previous_events):
+                    record_swap_event(self.run_dir, json.loads(line))
 
     @staticmethod
     def _fluid(value):
@@ -57,6 +78,7 @@ class BottleSwapService:
         return {
             "bottle_id": uuid.uuid4().hex, "side": side,
             "fluid": BottleSwapService._fluid(values.get("fluid", "")),
+            "note": str(values.get("note") or ""),
             "initial_weight_g": values.get("initial_weight_g"),
             "final_weight_g": values.get("final_weight_g"),
             "start_count": count, "end_count": None,
@@ -64,9 +86,20 @@ class BottleSwapService:
         }
 
     def _save(self):
-        atomic_write_json(self.path, self._data)
+        if self._primary:
+            from squeakview.common.bottle_csv import save_swap_state
+            save_swap_state(self.run_dir, self._data)
+        else:
+            atomic_write_json(self.path, self._data)
 
     def _audit(self, event, **fields):
+        if self._primary:
+            from squeakview.common.bottle_csv import record_swap_event
+            record_swap_event(self.run_dir, {"event": event,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "host_unix_ns": time.time_ns(), "host_monotonic_ns": time.monotonic_ns(),
+                "swap_id": self._data["swap_id"], **fields})
+            return
         path = self.path.with_name("bottle_history_events.jsonl")
         created = not path.exists()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,7 +128,7 @@ class BottleSwapService:
         result = deepcopy({key: value for key, value in self._data.items()
                            if key not in ("history", "gaps", "pending_replacements")})
         result["history_count"] = len(self._data["history"])
-        result["run_dir"] = str(self.path.parent)
+        result["run_dir"] = str(self.run_dir)
         result["resume_pending"] = self._data["pending_replacements"] is not None
         result["measurements_complete"] = all(
             entry.get("fluid") and entry.get("initial_weight_g") is not None
@@ -138,6 +171,8 @@ class BottleSwapService:
                 raise ValueError("Missing controller response")
             self.observe_controller(response)
         except Exception as exc:
+            if self._primary:
+                self._audit("controller_command_failed", action=action, error=str(exc)[:1024])
             self._data["error"] = str(exc)[:1024]
             if action == "status":
                 self._data["available"] = False
@@ -157,6 +192,7 @@ class BottleSwapService:
         self._command(controller, "status")
         if not self._data["available"]:
             self._data["error"] = "Controller does not confirm bottle-swap support"
+            self._save()
             return self.snapshot()
         if self._data["swap_id"] and self._data["state"] != "ACTIVE":
             if selected != self._data["selected_sides"]:
@@ -197,7 +233,7 @@ class BottleSwapService:
             fluid = self._fluid(values.get("fluid", ""))
             if not fluid:
                 raise ValueError(f"{side.title()} replacement fluid is required")
-            cleaned[side] = {"fluid": fluid,
+            cleaned[side] = {"fluid": fluid, "note": str(values.get("note") or ""),
                              "initial_weight_g": self._weight(values.get("initial_weight_g"), True),
                              "final_weight_g": self._weight(values.get("final_weight_g"))}
         self._data.update(pending_replacements=cleaned, state="CALIBRATING", error="")
@@ -208,6 +244,8 @@ class BottleSwapService:
     def observe_controller(self, response: Mapping[str, Any]):
         if self._data["state"] == "STOPPED":
             return self.snapshot()
+        if self._primary:
+            self._audit("controller_state", response=dict(response))
         if "supported" in response:
             self._data["available"] = response["supported"] is True
         for side in SIDES:
@@ -260,7 +298,8 @@ class BottleSwapService:
                                ended_monotonic_us=gap["paused_monotonic_us"])
                     self._data["history"].append(old)
                     self._data["current"][side] = self._entry(side, {
-                        "fluid": values["fluid"], "initial_weight_g": values["initial_weight_g"]},
+                        "fluid": values["fluid"], "initial_weight_g": values["initial_weight_g"],
+                        "note": values.get("note", "")},
                         boundary_counts[side], timestamp)
                 gap.update(resumed_monotonic_us=timestamp,
                            resume_counts=boundary_counts)
@@ -304,9 +343,11 @@ class BottleSwapService:
             if not isinstance(values, Mapping):
                 continue
             entry = updated[side]
-            for key in ("fluid", "initial_weight_g", "final_weight_g"):
+            for key in ("fluid", "initial_weight_g", "final_weight_g", "note"):
                 if key in values:
-                    if key == "fluid":
+                    if key == "note":
+                        entry[key] = str(values[key] or "")
+                    elif key == "fluid":
                         entry[key] = self._fluid(values[key])
                     else:
                         entry[key] = self._weight(values[key])

@@ -1,6 +1,8 @@
 """Offline DeepStream replay of an immutable SqueakView ground-truth recording."""
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import argparse
 import csv
 import json
@@ -269,7 +271,7 @@ def _load_frame_ledger(path: Path) -> tuple[OfflineFrameLedger, int, int]:
 
 
 def _resolve_default_config(run_dir: Path) -> Path:
-    manifest = _read_json(run_dir / "run_manifest.json")
+    manifest = _read_json(artifact_path(run_dir, "run_manifest.json"))
     try:
         raw = manifest["inference"]["model_package"]["config"]
     except (KeyError, TypeError) as exc:
@@ -320,10 +322,10 @@ class OfflineInferenceApp:
     ):
         self.config = config
         self.run_dir = Path(config.run_dir).expanduser().resolve()
-        self.video_path = self.run_dir / "raw.mp4"
-        self.frames_path = self.run_dir / "frames.csv"
-        self.serial_path = self.run_dir / "serial.csv"
-        self.errors_path = self.run_dir / "diagnostics" / "errors.csv"
+        self.video_path = artifact_path(self.run_dir, "raw.mp4")
+        self.frames_path = artifact_path(self.run_dir, "frames.csv")
+        self.serial_path = artifact_path(self.run_dir, "serial.csv")
+        self.errors_path = artifact_path(self.run_dir, "diagnostics") / "errors.csv"
         for path in (self.video_path, self.frames_path, self.serial_path):
             _assert_direct_run_file(self.run_dir, path)
         if self.errors_path.exists():
@@ -342,7 +344,7 @@ class OfflineInferenceApp:
             self.out_dir = (
                 Path(config.out_dir).expanduser().resolve()
                 if config.out_dir is not None
-                else self.run_dir / "offline_inference" / f"{stamp}_{self.model.name}"
+                else artifact_path(self.run_dir, "offline_inference") / f"{stamp}_{self.model.name}"
             )
             if self.out_dir.exists() and any(self.out_dir.iterdir()):
                 raise FileExistsError(f"refusing to overwrite non-empty output directory: {self.out_dir}")
@@ -565,7 +567,7 @@ class OfflineInferenceApp:
                         "offline replay inputs changed during processing: "
                         + ", ".join(changed)
                     )
-                from scripts.align_run_outputs_streaming import build_alignment
+                from squeakview.apps.inference.legacy_alignment import build_alignment
                 build_alignment(
                     self.run_dir, self.out_dir,
                     objects_path=self.out_dir / "objects.csv",

@@ -57,7 +57,7 @@ squeakview/apps/inference/        Live and offline PyServiceMaker pipelines
 squeakview/apps/operator/         Qt operator GUI and run lifecycle
 squeakview/common/                Run, profile, serial, and dashboard utilities
 scripts/preflight.sh              Device/model readiness checks
-scripts/align_run_outputs.py      Camera, video, inference, and TTL alignment
+scripts/legacy/align_run_outputs.py      Camera, video, inference, and TTL alignment
 data_viz/README.md                Jetson-to-DGX transfer and analysis workflow
 data_viz/analysis_demo_viz.ipynb Scientific run analysis and visualization
 tests/                            Pure-Python and on-device pipeline tests
@@ -456,14 +456,28 @@ non-production bench development with older firmware.
 Protocol v2 is negotiated before the clock preflight and capture launch. The
 idempotent negotiation supports a freshly booted v1 controller and a controller
 that remained in v2 after an earlier run; idle `TIME_SYNC` and `SET_RTC`
-responses then use reliable v2 framing. Controller frames are CRC checked and stored, with an `fsync`, in
-`diagnostics/controller_v2.jsonl` before SqueakView sends a cumulative
+responses then use reliable v2 framing. A new run sends a unique `TIME_SYNC`
+challenge after `PROTO,2`. Its reliable idle-controller reply must echo both the
+request ID and host timestamp, pass CRC/schema checks, and be durably saved
+before negotiation completes. That reply establishes the new run's sequence
+baseline. Partial packets and queued messages preceding this boundary are
+counted separately as `startup_discarded_fragments`/`startup_discarded_frames`;
+they cannot establish or acknowledge the new journal. The verified boundary is
+recorded as `startup_handshake` in the controller transport summary. This uses
+existing firmware commands and requires no firmware update.
+
+An existing run's reconnect continues from its durable acknowledgement watermark
+and requests missing records; it never resets its sequence baseline. CRC errors,
+sequence gaps, and reboot detection after the startup boundary retain their
+normal validation and recovery behavior.
+
+Controller frames are CRC checked and stored, with an `fsync`, in
+`_metadata/diagnostics/controller_v2.jsonl` before SqueakView sends a cumulative
 `ACK_EVENTS`. The controller can then release the acknowledged RAM records.
 Camera timing uses `CAMERA_EPOCH`, periodic `CAMERA_CHECKPOINT`, and
 `CAMERA_STOP` rather than two serial lines per frame. A transport integrity
 fault, conflicting replay, unrecoverable sequence gap, or controller reboot
-during a run fails the run closed. `serial.csv` remains a compatibility export
-of decoded payloads; the JSONL journal is the v2 source of truth.
+during a run fails the run closed. `sensors.csv` contains decoded events with per-record timing; the JSONL journal is the v2 source of truth.
 
 The host indexes v2 identities and sequence gaps in a disposable SQLite cache
 beside the journal (`diagnostics/.controller_v2.jsonl.index-*.sqlite3`), with a
@@ -578,7 +592,7 @@ After both matched runs pass `scripts/qualify_run.py`, compare their bounded
 recording and system metrics with:
 
 ```bash
-.venv/bin/python scripts/compare_debug_overhead.py \
+.venv/bin/python scripts/qualification/compare_debug_overhead.py \
   "$SQUEAKVIEW_PROJECT/runs/<debug-off-run>" "$SQUEAKVIEW_PROJECT/runs/<debug-on-run>" \
   --thresholds "$SQUEAKVIEW_PROJECT/qualification/<approved-overhead-limits>.yaml" \
   --output "$SQUEAKVIEW_PROJECT/qualification/debug-overhead.json"
@@ -663,47 +677,97 @@ Runs are stored under:
 runs/<experiment>/<subject>/<subject>_<timestamp>_<shortid>/
 ```
 
-Important outputs include:
+New runs expose five primary files (additional cameras retain their own
+`raw_camN.mp4` and `frames_camN.csv`):
 
 ```text
-raw.mp4                         Authoritative compressed camera recording
-frames.csv                      Authoritative recorded-frame ledger
-serial.csv                      RP2040 events, TTLs, markers, and host clocks
-objects.csv                     Detector/tracker object rows
-keypoints.csv                   Normalized pose keypoints
-run_manifest.json               Configuration, model identity, and artifacts
-run_status.json                 Lifecycle, reconciliation, and validation
-alignment_summary.json          Compact frame/video/controller audit
-diagnostics/camera.csv          Temperature and transport health samples
-diagnostics/recording.csv       Recording queue and encoder telemetry
-diagnostics/system.csv          Capture-owned bounded Jetson resource telemetry
-diagnostics/errors.csv          Camera gaps, CRC, and incomplete-frame events
-diagnostics/camera_runtime.json Camera identity and clock calibration
-diagnostics/deepstream.log      Size-bounded capture/DeepStream child output
-diagnostics/post_run.log        Finalizer subprocess log
-diagnostics/preview_admission*.csv Source IDs entering each leaky preview queue
-diagnostics/preview_delivery*.csv  Source IDs delivered after preview shedding
-config/task.yaml               Immutable run-local task definition snapshot
+raw.mp4                         Camera recording; video timing maps to frames.csv
+frames.csv                      One timestamped row per recorded frame
+sensors.csv                     Box events, sensor streams, and synchronization records
+detections.csv                  One timestamped object/pose observation per row
+weigh_in.csv                    Timestamped bottle and mouse weight measurements
+_metadata/                      Configuration, provenance, validation, and recovery evidence
 ```
 
-`frames.csv` is written live by the FLIR source and is the source of truth for
-captured frame identity. It contains one row per emitted source buffer. Stop
-uses bounded tail reads and the MP4 sample table; it does not rebuild this file.
-Validation requires its final index to agree with the non-leaky recording
-admission ledger and the finalized MP4 sample count.
-The camera telemetry, error ledger, and runtime snapshot are also written by
-the source while acquisition is active, rather than reconstructed at shutdown.
-`objects.csv` is the single object-observation table; track summaries are
-derived from it when analyzed.
-Once a run reaches a terminal state, its acquisition, model, Git, and storage
-provenance in `run_manifest.json` is immutable. Later bottle entry updates only
-the bottle summary, artifact inventory, and manifest update timestamp.
+Every primary CSV row carries its own timing. `frames.csv` preserves native
+camera timestamps, host timestamps, frame identity, and the movie frame index.
+`detections.csv` includes that frame's timestamps directly, together with tracking
+and bounding-box fields and named `<keypoint>_x_px`, `<keypoint>_y_px`,
+`<keypoint>_confidence`, and `<keypoint>_visible` columns. Tracking-only observations
+have empty keypoint columns when no pose is available. A frame without an object
+observation still has its row in `frames.csv`.
 
-Source, admission, and inference ledgers (`capture_cam*.jsonl`,
-`record_admission*.csv`, and `inference/`) are retained after successful
-validation as primary scientific provenance. Only transient finalizer progress
-state is cleaned up. This costs additional storage but preserves the evidence
-needed to reproduce frame reconciliation and diagnose a later integrity issue.
+`sensors.csv` retains the decoded serial event fields and host receipt clocks,
+and adds controller time, boot/session identity, and reliable-record sequence.
+Sensor events, task activity, synchronization markers, and controller setup/
+protocol messages all stay in this table. Non-event messages use `context` and
+`reason` for their payload instead of putting settings or build text into time
+and measurement columns. Unstructured firmware text uses `CONTROLLER_LOG` as
+its event type. `rawLine` preserves the complete original message. Clock-sync,
+clock-status, camera-anchor, and bottle-state records use their own timestamp
+schemas so host timestamps cannot be mistaken for controller microseconds.
+CSV and terminal controller output share one event-record builder. Existing
+sensor-event fields pass through unchanged; other messages use the same logger
+with their content in `context`/`reason`. Controller terminal output uses the
+same ten event columns as the first ten columns of `sensors.csv`, including startup text, protocol replies, outgoing
+commands (`HOST_COMMAND`), and serial-service messages (`HOST_LOG`). Existing
+RX/TX tags remain in front of each record. CSV quoting protects commas and
+quotes; embedded newlines are escaped for one terminal line per message. The
+presentation formatter does not change transmitted commands or raw protocol
+records, so this formatting update requires no firmware flash.
+
+`weigh_in.csv` records bottle identity, side, fluid, initial/final weights, mouse
+weight, notes, and host entry time. It also holds the complete bottle-swap
+history: installations/removals, controller responses, pause/resume boundaries,
+cumulative lick counts, shared observation gaps, pending replacements, failed
+operations, interrupted swaps, and weight corrections. `record_type` distinguishes
+`measurement`, `bottle_state`, `swap_gap`, `swap_state`, and `swap_event` rows.
+Frequently used fields have their own columns; `details_json` preserves the
+complete structured record for recovery and less common fields. All rows have
+host timestamps, and controller-confirmed event rows preserve their direct
+controller time as `direct_boundary`. Changed measurements append new records;
+unchanged values keep their original entry timestamps. Manual entry time does
+not claim to be the physical time the weighing happened.
+
+After capture and serial close, finalization streams through the tables to add
+`controller_time_us`, `controller_time_method`, `controller_boot_id`, and
+`controller_session_id` to each row. Camera-trigger anchors are `exact_anchor`;
+intervening frame times are `piecewise_interpolated`. Sensor event times are
+`direct_event`; other controller records use `direct_record`. Host-only entries
+use the verified preflight clock midpoint as a `host_clock_estimate`, rather than
+claiming direct controller measurement. This estimate does not compensate for
+subsequent host wall-clock steps or clock drift. Without a usable synchronization
+anchor, the native timestamp remains present and controller time is explicitly
+`unavailable`. Live files have native timing; calculated controller columns are
+completed at finalization. Every MP4 frame retains video presentation timing and
+maps by frame index to the corresponding camera/controller timestamps in
+`frames.csv`; controller timestamps are not embedded as MP4 metadata.
+
+`_metadata/run_manifest.json` contains acquisition provenance, lifecycle status,
+and validation results. Bottle setup, measurements, and swap recovery state live
+in `weigh_in.csv`; separate bottle setup/summary JSON caches are no longer written.
+`_metadata/` also retains `config/`, `diagnostics/`, and recovery ledgers. These support reliable controller acknowledgements,
+recording validation, and crash recovery. New runs no longer create separate
+`objects.csv`, `keypoints.csv`, `serial.csv`, or `bottle_measurements.csv` streams.
+Older runs retain their existing paths and remain readable without migration.
+
+`frames.csv` is written live by the FLIR source and remains the source of truth
+for captured frame identity. Shutdown validates its final index against the
+recording-admission ledger and MP4 sample count before adding controller timing.
+The timing pass uses streaming CSV rewrites and a disposable disk index, so it
+scales with run length without loading the run into memory. It adds a sequential
+pass at Stop; it does not decode or re-encode the movie.
+
+Terminal acquisition, model, Git, and storage provenance remains immutable.
+Later weigh-ins update measurement records, bottle metadata, and artifact
+inventory. The durable controller journal and capture/admission/inference
+ledgers remain in `_metadata/`. After successful validation, ordinary new runs
+retain capture/admission/inference ledgers as gzip files in `_metadata/recovery/`.
+Each compressed file is read back and verified before its plain original is
+removed; the manifest records byte counts and SHA-256 hashes. Recovery readers
+accept both formats. Debug, qualification, and validation-failed runs retain
+plain ledgers. Transient finalizer progress is cleaned up.
+
 Routine finalization reads the bounded MP4 sample tables without parsing or
 decoding the complete H.264 stream. It requires the sample-size, timing, and
 sample-to-chunk totals to agree with the live frame manifest, source ledger,
@@ -738,8 +802,8 @@ cells, is in [docs/qualification/QUALIFICATION_WORKFLOW.md](docs/qualification/Q
 Enumerate the canonical IDs and create a non-overwriting assignment checklist:
 
 ```bash
-.venv/bin/python scripts/qualify_matrix.py --list-cases
-.venv/bin/python scripts/qualify_matrix.py \
+.venv/bin/python scripts/qualification/qualify_matrix.py --list-cases
+.venv/bin/python scripts/qualification/qualify_matrix.py \
   --init-assignments "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml"
 ```
 
@@ -747,7 +811,7 @@ Print the next unassigned case, its exact environment, and a copyable terminal
 launcher command without changing the checklist or starting hardware:
 
 ```bash
-.venv/bin/python scripts/qualify_matrix.py \
+.venv/bin/python scripts/qualification/qualify_matrix.py \
   "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
   --next-case
 ```
@@ -756,10 +820,10 @@ After each completed run, record its case with `--assign`, then evaluate matrix
 coverage with:
 
 ```bash
-.venv/bin/python scripts/qualify_matrix.py \
+.venv/bin/python scripts/qualification/qualify_matrix.py \
   "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
   --assign '<case-id>' '/absolute/path/to/completed/run'
-.venv/bin/python scripts/qualify_matrix.py "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml"
+.venv/bin/python scripts/qualification/qualify_matrix.py "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml"
 ```
 
 For the acquisition itself, export
@@ -785,7 +849,7 @@ model/engine identity.
 
 After all cells pass against reviewed limits, create and verify the bounded,
 content-addressed campaign inventory described in the workflow with
-`scripts/archive_qualification_campaign.py`. The tool does not copy or modify
+`scripts/qualification/archive_qualification_campaign.py`. The tool does not copy or modify
 run data; it rejects incomplete campaigns and verifies the separately copied
 archive tree byte-for-byte.
 
@@ -824,15 +888,20 @@ Bottle intake is calculated as initial minus final weight. A final weight above
 the initial weight is saved but shown as a plausibility warning.
 
 The **Weigh-In** panel groups the left/right bottle measurements and an optional
-mouse body weight in grams. Enter mouse weight before starting to save it with
-the initial measurements, or enter/correct it later with **Save Measurements**
-(**Save Final Weights** while bottle data is pending). Mouse weight must be a
-positive finite number; leaving it blank does not block recording or bottle
-completion. Check the retained initial measurements before each new run.
-For compatibility, the existing bottle artifact filenames remain in use:
-`bottle_setup.json` and `bottle_summary.json` store `mouse_weight_g` alongside
-the bottle data, and `run_manifest.json` includes it in the `bottles` snapshot.
-`bottle_measurements.csv` continues to contain only bottle measurements.
+mouse body weight in grams. Before **Start Recording**, enter the fluid types,
+initial bottle weights, and mouse weight. Start validates the form and saves
+these entries automatically with the new run; a separate Save is unnecessary.
+The form is locked during startup, recording, and finalization. After **Stop
+Recording** finishes, enter final bottle weights and click **Save weights**.
+The panel shows the current stage and next action without warning borders.
+Live lick counts, swap controls, and history are under **Bottle tools and history**.
+Status polls preserve
+unsaved entries, and a new recording cannot clear unsaved final weights. Mouse
+weight must be a positive finite number; empty fields remain optional. Check
+the retained initial measurements before each new run.
+`weigh_in.csv` contains bottle and mouse weight measurements with entry timestamps.
+The manifest includes a derived `bottles` snapshot. Historical runs with
+`bottle_setup.json` and `bottle_summary.json` remain supported.
 
 During a running experiment, use **Swap Bottles…** in Weigh-In to replace the
 left, right, or both bottles. Select the sides, then click **Pause Both Lick
@@ -874,11 +943,12 @@ free-runs; it emits no camera TTL pulses. Triggered runs retain the existing
 trigger-off run validates video against its capture/frame ledgers without
 requiring camera-TTL alignment or comparing the zero TTL count to video frames.
 
-`bottle_history.json` (schema version 1) holds current bottles, closed history,
-global counts, pending swap state, and shared observation gaps.
-`bottle_history_events.jsonl` preserves the swap audit trail. Existing bottle
-artifacts remain compatibility views; use the history to analyze experiments
-with replacements.
+New runs store the complete bottle-swap record and recovery state in
+`weigh_in.csv`; they do not create separate `bottle_history.json` or
+`bottle_history_events.jsonl` files. Analysis and recovery reconstruct bottle
+identities and shared gaps from the CSV. Historical runs using those JSON/JSONL
+files remain readable. Pre-consolidation new-layout history is imported when
+reopened without deleting the original files.
 
 To rerun the legacy bounded-memory recovery reconstruction explicitly:
 

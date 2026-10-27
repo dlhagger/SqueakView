@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Validate frame, object, video, and controller timing for one run.
+"""Validate legacy per-trigger controller alignment for one run.
 
-The current validator is bounded-memory and writes one compact
-``alignment_summary.json``. Canonical CSVs remain unchanged in the run root.
+This bounded-memory validator requires CAMERA_HIGH events. Production protocol
+v2 uses sparse camera anchors and is validated by the normal run finalizer.
+The summary goes into _metadata/ for new runs; canonical CSVs stay unchanged.
 """
 from __future__ import annotations
 
@@ -13,11 +14,12 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from squeakview.common import run_context  # noqa: E402
+from squeakview.common.run_layout import artifact_path  # noqa: E402
 from squeakview.common.run_context import atomic_write_json  # noqa: E402
 from squeakview.project import AppPaths, open_project  # noqa: E402
 
@@ -30,14 +32,7 @@ def build_alignment(
     video_validation: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Run the bounded-memory validator without copying canonical CSVs."""
-    try:
-        from scripts.align_run_outputs_streaming import build_alignment as streaming_build
-    except ModuleNotFoundError as exc:
-        if exc.name != "scripts":
-            raise
-        # When this file is invoked directly, Python places ``scripts/`` rather
-        # than the repository root on sys.path.
-        from align_run_outputs_streaming import build_alignment as streaming_build
+    from squeakview.apps.inference.legacy_alignment import build_alignment as streaming_build
 
     return streaming_build(
         run_dir,
@@ -65,13 +60,13 @@ def parse_args() -> argparse.Namespace:
         "--out-dir",
         type=Path,
         default=None,
-        help="Summary directory. Defaults to the run directory.",
+        help="Summary directory. Defaults to _metadata/ for new runs, or the root for older runs.",
     )
     parser.add_argument(
-        "--objects",
+        "--detections", "--objects", dest="objects",
         type=Path,
         default=None,
-        help="Object CSV to validate. Defaults to <run_dir>/objects.csv.",
+        help="Detection CSV to validate. Defaults to detections.csv for new runs or objects.csv for older runs.",
     )
     return parser.parse_args()
 
@@ -111,7 +106,7 @@ def main() -> int:
             within=project.paths.runs,
             must_exist=True,
         )
-    out_dir = (args.out_dir or run_dir).resolve()
+    out_dir = (args.out_dir or artifact_path(run_dir, "alignment_summary.json").parent).resolve()
     summary = build_alignment(
         run_dir,
         out_dir,

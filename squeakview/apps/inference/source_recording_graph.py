@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -36,7 +38,7 @@ def camera_source_properties(
     """Return the exact audited properties for one FLIR source element."""
 
     buffer_policy = capture_buffer_policy(config.fps)
-    diagnostics_dir = Path(run_dir) / "diagnostics"
+    diagnostics_dir = artifact_path(Path(run_dir), "diagnostics")
     suffix = "" if index == 0 else f"_cam{index}"
     properties: dict[str, object] = {
         "camera-index": index,
@@ -57,9 +59,9 @@ def camera_source_properties(
         "drop-incomplete": False,
         "buffer-handling": "OldestFirst",
         "stream-buffer-count": buffer_policy.source_transport_buffers,
-        "capture-log-path": str(Path(run_dir) / f"capture_cam{index}.jsonl"),
+        "capture-log-path": str(artifact_path(Path(run_dir), f"capture_cam{index}.jsonl")),
         "frame-manifest-path": str(
-            Path(run_dir) / ("frames.csv" if index == 0 else f"frames_cam{index}.csv")
+            artifact_path(Path(run_dir), "frames.csv" if index == 0 else f"frames_cam{index}.csv")
         ),
         "camera-telemetry-path": str(diagnostics_dir / f"camera{suffix}.csv"),
         "error-log-path": str(diagnostics_dir / f"errors{suffix}.csv"),
@@ -112,7 +114,7 @@ def add_camera_recording_branch(
     source_caps = f"source_caps{index}"
     tee = f"camera_tee{index}"
     record_queue = f"record_queue{index}"
-    raw_path = primary_raw_video if index == 0 else run_dir / f"raw_cam{index}.mp4"
+    raw_path = primary_raw_video if index == 0 else artifact_path(run_dir, f"raw_cam{index}.mp4")
     failure = config.failure_plan
     failure_applies = failure is not None and failure.stream_id == index
 
@@ -135,11 +137,11 @@ def add_camera_recording_branch(
         "queue", record_queue, non_leaky_record_queue_properties(buffer_policy)
     )
     admission_path = (
-        run_dir / "record_admission.csv"
+        artifact_path(run_dir, "record_admission.csv")
         if index == 0
-        else run_dir / f"record_admission_cam{index}.csv"
+        else artifact_path(run_dir, f"record_admission_cam{index}.csv")
     )
-    diagnostics_dir = run_dir / "diagnostics"
+    diagnostics_dir = artifact_path(run_dir, "diagnostics")
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     telemetry_path = diagnostics_dir / (
         "recording.csv" if index == 0 else f"recording_cam{index}.csv"

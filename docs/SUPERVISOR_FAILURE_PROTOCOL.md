@@ -7,7 +7,7 @@ production-data procedure. Use a test
 subject/input, remain at the Jetson, and verify the controller has a physical
 safe state before beginning.
 
-The guarded helper is `scripts/inject_supervisor_failure.py`. It never uses
+The guarded helper is `scripts/qualification/inject_supervisor_failure.py`. It never uses
 `pgrep`, process-name matching across the machine, shell globs, or process
 groups. Its default is inspection-only. Before it can send one signal, it
 requires and rechecks:
@@ -75,7 +75,7 @@ shows Recording. Record the absolute run directory and the supervisor PID.
 The following command only inspects and prints a JSON plan:
 
 ```bash
-.venv/bin/python scripts/inject_supervisor_failure.py \
+.venv/bin/python scripts/qualification/inject_supervisor_failure.py \
   --action gui-terminate \
   --supervisor-pid SUPERVISOR_PID \
   --run-dir /absolute/path/to/run \
@@ -86,7 +86,7 @@ For a selected barrier, let the helper boundedly wait for the exact persisted
 state instead of racing a brief stage:
 
 ```bash
-.venv/bin/python scripts/inject_supervisor_failure.py \
+.venv/bin/python scripts/qualification/inject_supervisor_failure.py \
   --action gui-terminate \
   --supervisor-pid SUPERVISOR_PID \
   --run-dir /absolute/path/to/run \
@@ -114,7 +114,7 @@ target `start_ticks` in the qualification notes. The dry run always ends with
 Repeat the same command with all three values copied exactly from the dry run:
 
 ```bash
-.venv/bin/python scripts/inject_supervisor_failure.py \
+.venv/bin/python scripts/qualification/inject_supervisor_failure.py \
   --action gui-terminate \
   --supervisor-pid SUPERVISOR_PID \
   --supervisor-start-ticks SUPERVISOR_START_TICKS \
@@ -144,7 +144,7 @@ that exactly one direct supervisor-owned `squeakview.apps.inference.post_run`
 worker names the run directory. Use both the persisted phase and stage:
 
 ```bash
-.venv/bin/python scripts/inject_supervisor_failure.py \
+.venv/bin/python scripts/qualification/inject_supervisor_failure.py \
   --action gui-terminate \
   --supervisor-pid SUPERVISOR_PID \
   --run-dir /absolute/path/to/run \

@@ -8,6 +8,8 @@ operator backend, and preserves acquisition provenance when a completed run is
 opened later to add bottle measurements.
 """
 
+from squeakview.common.run_layout import artifact_path, is_primary_layout, uses_compact_metadata
+
 import copy
 import hashlib
 import os
@@ -37,6 +39,15 @@ _ACQUISITION_OWNERS = frozenset(
 TASK_CONFIG_SNAPSHOT_PATH = Path("config/task.yaml")
 MAX_TASK_CONFIG_BYTES = 1024 * 1024
 RUN_MANIFEST_SCHEMA_VERSION = "3.0"
+# Manifest updates must not replay a stale status snapshot into the shared file.
+_MANIFEST_FIELDS = frozenset({
+    "schema_version", "run_id", "run_directory", "run_directory_relative",
+    "created_at", "updated_at", "application", "project", "process_topology",
+    "platform", "native_plugins", "git", "failure_injection", "production_eligible",
+    "production_disqualifiers", "qualification", "storage", "experiment_name", "mouse_id",
+    "capture", "inference", "recording", "task_config", "preflight", "clock_validation",
+    "serial", "observability", "bottles", "expected_outputs", "actual_outputs", "output_layout",
+})
 
 
 def _preflight_evidence_valid(value: Mapping[str, object] | None) -> bool:
@@ -72,7 +83,7 @@ def snapshot_task_config(run_dir: Path, source: Path) -> dict[str, object]:
             "task config exceeds bounded snapshot limit of "
             f"{MAX_TASK_CONFIG_BYTES} bytes: {original}"
         )
-    target = Path(run_dir) / TASK_CONFIG_SNAPSHOT_PATH
+    target = artifact_path(Path(run_dir), TASK_CONFIG_SNAPSHOT_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
@@ -106,7 +117,7 @@ def snapshot_task_config(run_dir: Path, source: Path) -> dict[str, object]:
             pass
     return {
         "original_path": str(original),
-        "snapshot_path": TASK_CONFIG_SNAPSHOT_PATH.as_posix(),
+        "snapshot_path": target.relative_to(run_dir).as_posix(),
         "size_bytes": size,
         "sha256": digest.hexdigest(),
     }
@@ -256,13 +267,16 @@ class RunManifestService:
 
     def output_snapshot(self, run_dir: Path) -> dict[str, Any]:
         artifacts = run_context.run_artifacts(run_dir)
-        diagnostics_dir = run_dir / "diagnostics"
+        diagnostics_dir = artifact_path(run_dir, "diagnostics")
         status = run_context.read_json(artifacts.status_json)
-        bottle_summary = run_context.read_json(artifacts.bottle_summary_json)
+        bottle_summary = run_context.bottle_summary(run_dir)
         video_files = sorted(run_dir.glob("raw*.mp4"))
-        return {
+        snapshot = {
             "csv_files": {
                 "frames": self.file_info(artifacts.frames_csv),
+                "sensors": self.file_info(artifact_path(run_dir, "serial.csv")),
+                "detections": self.file_info(artifacts.objects_csv),
+                "weigh_in": self.file_info(artifacts.bottle_measurements_csv),
                 "errors": self.file_info(artifacts.drop_events_csv),
                 "recording": self.file_info(diagnostics_dir / "recording.csv"),
                 "camera": self.file_info(diagnostics_dir / "camera.csv"),
@@ -286,8 +300,8 @@ class RunManifestService:
                 diagnostics_dir / "camera_runtime.json"
             ),
             "camera_telemetry": self.file_info(diagnostics_dir / "camera.csv"),
-            "alignment_summary": self.file_info(run_dir / "alignment_summary.json"),
-            "has_analysis": (run_dir / "alignment_summary.json").exists(),
+            "alignment_summary": self.file_info(artifact_path(run_dir, "alignment_summary.json")),
+            "has_analysis": (artifact_path(run_dir, "alignment_summary.json")).exists(),
             "bottle_measurements_complete": (
                 bool(bottle_summary.get("complete")) if bottle_summary else False
             ),
@@ -295,24 +309,33 @@ class RunManifestService:
                 "setup": self.file_info(artifacts.bottle_setup_json),
                 "measurements": self.file_info(artifacts.bottle_measurements_csv),
                 "summary": self.file_info(artifacts.bottle_summary_json),
-                "history": self.file_info(run_dir / "bottle_history.json"),
-                "history_events": self.file_info(run_dir / "bottle_history_events.jsonl"),
+                "history": self.file_info(artifact_path(run_dir, "weigh_in.csv" if is_primary_layout(run_dir) else "bottle_history.json")),
+                "history_events": self.file_info(artifact_path(run_dir, "weigh_in.csv" if is_primary_layout(run_dir) else "bottle_history_events.jsonl")),
             },
         }
+
+        if uses_compact_metadata(run_dir):
+            for key in ("objects", "keypoints", "serial", "bottle_measurements"):
+                snapshot["csv_files"].pop(key, None)
+            for key in ("recording_validation", "capture_reconciliation", "inference_admission"):
+                snapshot.pop(key, None)
+            for key in ("setup", "summary"):
+                snapshot["bottle_files"][key] = self.file_info(artifacts.weigh_in_csv)
+        return snapshot
 
     @staticmethod
     def bottle_snapshot(run_dir: Path) -> dict[str, Any]:
         artifacts = run_context.run_artifacts(run_dir)
-        summary = run_context.read_json(artifacts.bottle_summary_json)
+        summary = run_context.bottle_summary(run_dir)
         return {
-            "setup": artifacts.bottle_setup_json.name,
+            "setup": "weigh_in.csv" if uses_compact_metadata(run_dir) else artifacts.bottle_setup_json.relative_to(run_dir).as_posix(),
             "measurements": artifacts.bottle_measurements_csv.name,
-            "summary": artifacts.bottle_summary_json.name,
+            "summary": "weigh_in.csv" if uses_compact_metadata(run_dir) else artifacts.bottle_summary_json.relative_to(run_dir).as_posix(),
             "complete": bool(summary.get("complete")) if summary else False,
             "sides": summary.get("sides", {}) if summary else {},
             "mouse_weight_g": summary.get("mouse_weight_g") if summary else None,
-            "history": "bottle_history.json" if (run_dir / "bottle_history.json").exists() else None,
-            "history_events": "bottle_history_events.jsonl" if (run_dir / "bottle_history_events.jsonl").exists() else None,
+            "history": artifact_path(run_dir, "weigh_in.csv" if is_primary_layout(run_dir) else "bottle_history.json").relative_to(run_dir).as_posix() if (artifact_path(run_dir, "weigh_in.csv" if is_primary_layout(run_dir) else "bottle_history.json")).exists() else None,
+            "history_events": artifact_path(run_dir, "weigh_in.csv" if is_primary_layout(run_dir) else "bottle_history_events.jsonl").relative_to(run_dir).as_posix() if (artifact_path(run_dir, "weigh_in.csv" if is_primary_layout(run_dir) else "bottle_history_events.jsonl")).exists() else None,
         }
 
     def build(
@@ -347,7 +370,7 @@ class RunManifestService:
             disqualifiers = (*disqualifiers, "controller_watchdog_unqualified")
         if cfg.serial_enabled and cfg.controller_protocol != "v2":
             disqualifiers = (*disqualifiers, "controller_protocol_not_v2")
-        v2_summary_path = run_dir / "diagnostics" / "controller_v2_summary.json"
+        v2_summary_path = artifact_path(run_dir, "diagnostics") / "controller_v2_summary.json"
         v2_transport = (
             run_context.read_json_required(v2_summary_path)
             if cfg.serial_enabled
@@ -362,7 +385,7 @@ class RunManifestService:
             "check_interval_s": storage_policy.check_interval_s,
             "failure_policy": "fatal_graceful_capture_shutdown",
         }
-        return {
+        manifest = {
             "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
             "run_id": run_dir.name,
             "run_directory": str(run_dir),
@@ -627,6 +650,45 @@ class RunManifestService:
             "actual_outputs": inventory(run_dir),
         }
 
+        if is_primary_layout(run_dir):
+            outputs = manifest["expected_outputs"]
+            outputs.pop("keypoints", None)
+            outputs["detections"] = outputs.pop("objects", None)
+            outputs["sensors"] = outputs.pop("serial", None)
+            outputs["weigh_in"] = outputs.pop("bottle_measurements", None)
+            def relocate(value):
+                if isinstance(value, str):
+                    return artifact_path(run_dir, value).relative_to(run_dir).as_posix()
+                if isinstance(value, list):
+                    return [relocate(item) for item in value]
+                return value
+            manifest["expected_outputs"] = {key: relocate(value) for key, value in outputs.items()}
+            for key in ("v2_journal", "v2_summary"):
+                if manifest["serial"].get(key):
+                    manifest["serial"][key] = relocate(manifest["serial"][key])
+            manifest["capture"]["runtime_metadata"] = relocate(manifest["capture"]["runtime_metadata"])
+            for key in ("backpressure_telemetry", "drop_events", "camera_telemetry"):
+                manifest["recording"][key] = relocate(manifest["recording"][key])
+            manifest["recording"].pop("keypoints", None)
+            manifest["recording"]["detections"] = manifest["recording"].pop("objects")
+            manifest["recording"]["sensors"] = manifest["recording"].pop("serial")
+            for key in ("system_telemetry", "deepstream_log"):
+                manifest["observability"][key] = relocate(manifest["observability"][key])
+            preview = manifest["inference"]["preview_attribution"]
+            for key in ("admission", "delivery"):
+                preview[key] = relocate(preview[key])
+            preview["validation"] = "_metadata/" + preview["validation"]
+            manifest["recording"]["validation"] = "_metadata/" + manifest["recording"]["validation"]
+            if uses_compact_metadata(run_dir):
+                preview["validation"] = "_metadata/run_manifest.json:preview_attribution"
+                manifest["recording"]["validation"] = "_metadata/run_manifest.json:recording_validation"
+                manifest["expected_outputs"].pop("bottle_setup", None)
+                manifest["expected_outputs"].pop("bottle_summary", None)
+                manifest["expected_outputs"].pop("status", None)
+            manifest["output_layout"] = {"version": 1, "compact_metadata": uses_compact_metadata(run_dir), "metadata_directory": "_metadata",
+                "timing": "native timestamps and explicitly labelled controller mappings on each primary CSV row"}
+        return manifest
+
     def write(
         self,
         run_dir: Path,
@@ -640,8 +702,8 @@ class RunManifestService:
         """Persist a manifest, retaining completed-run acquisition provenance."""
 
         try:
-            manifest_path = run_dir / run_context.RUN_MANIFEST_FILENAME
-            status_path = run_dir / run_context.RUN_STATUS_FILENAME
+            manifest_path = artifact_path(run_dir, run_context.RUN_MANIFEST_FILENAME)
+            status_path = artifact_path(run_dir, run_context.RUN_STATUS_FILENAME)
 
             def read_existing(path: Path) -> dict[str, Any]:
                 try:
@@ -652,6 +714,8 @@ class RunManifestService:
 
             existing = read_existing(manifest_path)
             status = read_existing(status_path)
+            if uses_compact_metadata(run_dir) and "schema_version" not in existing and "capture" not in existing:
+                existing = {}  # Status can exist before the first manifest build.
             if existing and (
                 context.created_at is None
                 or status.get("state") in self.TERMINAL_STATES
@@ -671,6 +735,8 @@ class RunManifestService:
                 manifest = build_manifest(run_dir)
             else:
                 manifest = self.build(run_dir, context)
+            if uses_compact_metadata(run_dir):
+                manifest = {key: value for key, value in manifest.items() if key in _MANIFEST_FIELDS}
             path = run_context.write_manifest(run_dir, manifest)
             self._emit(f"[BACKEND] manifest written → {path}")
             return True

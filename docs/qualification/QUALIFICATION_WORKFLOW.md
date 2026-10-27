@@ -21,13 +21,13 @@ List the canonical case IDs and all required factors without accessing a camera
 or controller:
 
 ```bash
-.venv/bin/python scripts/qualify_matrix.py --list-cases
+.venv/bin/python scripts/qualification/qualify_matrix.py --list-cases
 ```
 
 Create a checklist containing every case ID. Existing files are never replaced:
 
 ```bash
-.venv/bin/python scripts/qualify_matrix.py \
+.venv/bin/python scripts/qualification/qualify_matrix.py \
   --init-assignments "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml"
 ```
 
@@ -38,7 +38,7 @@ Do not commit it when it contains local run paths.
 Print the first unassigned case as a read-only worksheet:
 
 ```bash
-.venv/bin/python scripts/qualify_matrix.py \
+.venv/bin/python scripts/qualification/qualify_matrix.py \
   "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
   --next-case
 ```
@@ -100,7 +100,7 @@ initial run status retain the matrix ID and SHA-256, case ID, and expected facto
 Record the run with the canonical case ID printed by `--list-cases`:
 
 ```bash
-.venv/bin/python scripts/qualify_matrix.py \
+.venv/bin/python scripts/qualification/qualify_matrix.py \
   "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
   --assign '<case-id>' '/absolute/path/to/completed/run'
 ```
@@ -124,7 +124,7 @@ campaign report a durable filename instead of relying on the replaceable
 default report:
 
 ```bash
-.venv/bin/python scripts/qualify_matrix.py \
+.venv/bin/python scripts/qualification/qualify_matrix.py \
   "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
   --limits "$SQUEAKVIEW_PROJECT/qualification/<reviewed-validated-limits>.yaml" \
   --output "$SQUEAKVIEW_PROJECT/qualification/results/<campaign>-matrix-report.json"
@@ -157,7 +157,7 @@ Create a durable content inventory outside every assigned run directory. This
 command never copies, archives, or changes run data:
 
 ```bash
-.venv/bin/python scripts/archive_qualification_campaign.py \
+.venv/bin/python scripts/qualification/archive_qualification_campaign.py \
   --matrix "$SQUEAKVIEW_PROJECT/qualification/matrix.v1.yaml" \
   --assignments "$SQUEAKVIEW_PROJECT/qualification/assignments.local.yaml" \
   --report "$SQUEAKVIEW_PROJECT/qualification/results/<campaign>-matrix-report.json" \
@@ -173,7 +173,7 @@ four control documents and every assigned-run file. Copy files to the recorded
 the exact copied tree without modifying it:
 
 ```bash
-.venv/bin/python scripts/archive_qualification_campaign.py \
+.venv/bin/python scripts/qualification/archive_qualification_campaign.py \
   --verify /absolute/copied-campaign-root \
   --inventory /absolute/archive-staging/<campaign>-inventory.json
 ```

@@ -163,6 +163,38 @@ class BottleSwapRuntimeTests(unittest.TestCase):
         self.assertTrue(outputs['bottle_files']['history']['exists'])
         self.assertTrue(outputs['bottle_files']['history_events']['exists'])
 
+    def test_compact_run_keeps_initial_and_final_measurements_across_stop(self):
+        import csv
+        from squeakview.common.run_layout import initialize_layout
+        from squeakview.apps.operator.gui.backend_proxy import launch_config_payload, launch_config_from_payload
+        from squeakview.apps.operator.backend.contracts import RunRequest
+        initialize_layout(self.run_dir, compact_metadata=True)
+        # Exercise the same immutable request and wire round trip as GUI Start.
+        config = launch_config_from_payload(launch_config_payload(RunRequest(bottles=self.initial)))
+        self.backend._bottle_swap = BottleSwapService(
+            self.run_dir, run_context.normalize_bottle_measurements(config.bottles))
+        self.backend._write_bottle_measurements(self.run_dir, config.bottles)
+        initial = run_context.bottle_summary(self.run_dir)
+        self.assertEqual(initial['mouse_weight_g'], 25)
+        self.assertEqual(initial['sides']['left']['initial_weight_g'], 100)
+        self.assertEqual(initial['sides']['right']['fluid'], 'water')
+        self.backend._bottle_swap.finalize()
+        self.backend._persist_bottle_swap_summary()
+        self.backend._state_machine._phase = RunPhase.FINALIZED
+        stopped = run_context.bottle_summary(self.run_dir)
+        self.assertEqual(stopped['sides']['left']['initial_weight_g'], 100)
+        final = deepcopy(self.initial)
+        final['left']['final_weight_g'] = 95
+        final['right']['final_weight_g'] = 96
+        summary = self.backend.save_bottle_measurements(final)
+        self.assertTrue(summary['complete'])
+        self.assertEqual(run_context.bottle_summary(self.run_dir)['sides']['left']['intake_g'], 5)
+        with (self.run_dir / 'weigh_in.csv').open(newline='') as handle:
+            measurements = [row for row in csv.DictReader(handle) if row['record_type'] == 'measurement']
+        self.assertEqual(len(measurements), 5)  # Two initial, mouse, two final.
+        self.assertTrue(all(row['host_unix_ns'] for row in measurements))
+        self.assertFalse((self.run_dir / '_metadata/bottle_setup.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

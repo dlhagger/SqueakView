@@ -240,6 +240,6 @@ durable v2 transport integrity failure is an acquisition-integrity failure.
 
 ## 9. Legacy runs
 
-The old `scripts/align_run_outputs.py` utility and `alignment_summary.json`
+The old `scripts/legacy/align_run_outputs.py` utility and `alignment_summary.json`
 workflow are retained only for historical runs containing per-frame
 `CAMERA_HIGH` records. Do not run that legacy aligner on protocol-v2 data.

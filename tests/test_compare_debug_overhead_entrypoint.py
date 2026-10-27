@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from scripts.compare_debug_overhead import main
+from scripts.qualification.compare_debug_overhead import main
 from squeakview.project import AppPaths, create_project
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import os
 import threading
 from pathlib import Path
@@ -247,7 +249,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if config.task_cfg:
             self.dashboard.apply_task_config(config.task_cfg)
         if snapshot.run_dir is not None:
-            setup = run_context.read_json(snapshot.run_dir / "bottle_setup.json") or {}
+            setup = run_context.bottle_setup(snapshot.run_dir) or {}
             self.bottle_panel.mouse_weight_edit.setText(str(setup.get("mouse_weight_g") or ""))
             for side, bottle in setup.get("sides", {}).items():
                 if side not in ("left", "right"):
@@ -256,7 +258,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 for phase in ("initial", "final"):
                     value = bottle.get(f"{phase}_weight_g")
                     getattr(self.bottle_panel, f"{side}_{phase}_weight_edit").setText("" if value is None else str(value))
-            self.dashboard.follow_run_telemetry(snapshot.run_dir / "diagnostics" / "system.csv")
+            self.dashboard.follow_run_telemetry(artifact_path(snapshot.run_dir, "diagnostics") / "system.csv")
         self._run_controller.handle_backend_event(BackendEvent("phase_changed", snapshot.phase, snapshot.run_dir))
         if snapshot.phase == RunPhase.RECORDING:
             self._run_controller.on_backend_run_started()
@@ -497,8 +499,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         presentation = present_saved_bottles(summary)
+        self.bottle_panel.mark_saved()
         self._set_bottle_completion_pending(presentation.completion_pending)
         self._set_bottle_status(presentation.status_text)
+        self._bottle_swap_controller._terminal_refresh_pending = True
+        self._bottle_swap_controller.refresh()
         if presentation.warning_message is not None:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -618,9 +623,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 label.setText(text)
 
     def _build_launch_config(self) -> process.LaunchConfig:
+        if self.bottle_panel.has_unsaved_final_weights():
+            raise ValueError("Save the previous run's final weights before starting another recording.")
         return build_launch_config(
             self._config_data,
-            bottles=self._collect_bottle_payload(include_final=False, strict=False),
+            bottles=self._collect_bottle_payload(include_final=False, strict=True),
             preview_window_id=self._preview_window_id,
             project=self.project,
         )
@@ -731,6 +738,12 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
 
     def _set_run_state(self, state: str) -> None:
+        # Reconfiguring the next session must not strand the previous run's
+        # still-pending final weights behind the initial-only Ready form.
+        bottle_state = state
+        if state == "ready" and self.backend.current_snapshot.run_dir is not None:
+            bottle_state = "complete"
+        self.bottle_panel.set_run_state(bottle_state)
         states = {
             "ready": ("READY", "#4357bd"),
             "starting": ("STARTING", "#a66a20"),

@@ -183,6 +183,15 @@ class V2AlignmentTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_primary_layout_reads_metadata_without_changing_alignment(self) -> None:
+        from squeakview.common.run_layout import initialize_layout, artifact_path
+        initialize_layout(self.run_dir)
+        for name in ("run_status.json", "run_manifest.json", "diagnostics"):
+            (self.run_dir / name).rename(artifact_path(self.run_dir, name))
+        run = load_v2_run(self.run_dir)
+        self.assertEqual(run.frames["frame_controller_us"].tolist(), [1000, 2000, 3000, 4000])
+        self.assertFalse(run.events.empty)
+
     def test_loads_sparse_v2_anchors_and_interpolates_frames(self) -> None:
         run = load_v2_run(self.run_dir)
 

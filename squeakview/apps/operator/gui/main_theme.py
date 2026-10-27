@@ -157,18 +157,16 @@ MAIN_WINDOW_STYLESHEET = """
                 padding: 8px 10px 10px 10px;
             }
             QLabel#bottleLickStatus {
-                background-color: #14192a;
-                border: 1px solid #303b55;
-                border-radius: 6px;
-                color: #d7e0f5;
-                padding: 8px;
+                background-color: transparent;
+                border: none;
+                color: #aeb8d8;
+                padding: 4px 0;
             }
             QToolButton#bottleHistoryToggle {
                 color: #d7e0f5;
-                background-color: #222a40;
-                border: 1px solid #3b4763;
-                border-radius: 6px;
-                padding: 6px 10px;
+                background-color: transparent;
+                border: none;
+                padding: 6px 0;
                 font-weight: 600;
             }
             QToolButton#bottleHistoryToggle:hover, QToolButton#bottleHistoryToggle:checked {
@@ -283,7 +281,13 @@ MAIN_WINDOW_STYLESHEET = """
             }
             QLabel#bottleStatus {
                 color: #aeb8d8;
-                font-size: 12px;
+                font-size: 13px;
+                padding-bottom: 6px;
+            }
+            QLabel#bottlePhase {
+                color: #eef1ff;
+                font-size: 16px;
+                font-weight: 700;
             }
             QLabel#taskTitle {
                 color: #eef1ff;

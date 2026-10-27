@@ -2,6 +2,16 @@ from __future__ import annotations
 
 """Serial helpers shared across capture/operator layers."""
 
+from squeakview.common.run_layout import artifact_path, is_primary_layout
+from squeakview.common.sensor_csv import (
+    EVENT_FIELDS,
+    make_event_record,
+    format_controller_log,
+    format_sensor_row,
+    normalize_existing_sensor_csv,
+    parse_controller_fields,
+)
+
 import atexit
 import csv
 import json
@@ -33,19 +43,12 @@ except Exception:  # pragma: no cover - optional dependency
     serial = None
 
 SERIAL_HEADER = [
-    "eventType",
-    "unixTime",
-    "rp2040Time",
-    "side",
-    "count",
-    "duration",
-    "latency",
-    "value",
-    "context",
-    "reason",
+    *EVENT_FIELDS,
     "hostUnixNs",
     "hostMonotonicNs",
     "rawLine",
+    "controller_time_us", "controller_time_method", "controller_boot_id",
+    "controller_session_id", "controller_sequence",
 ]
 MAX_SERIAL_LINE_BYTES = 64 * 1024
 MAX_BUFFERED_SERIAL_ROWS = 1024
@@ -120,7 +123,8 @@ class SerialHandle:
         # failure or prevent acknowledgement of an already-journaled frame.
         def emit_presentation(message: str) -> None:
             try:
-                emit_fn(message)
+                context = getattr(self, "_csv_context", None)
+                emit_fn(format_controller_log(message, getattr(context, "frame", None)))
             except Exception:
                 pass
 
@@ -179,6 +183,10 @@ class SerialHandle:
         self._protocol_v2_pending = False
         self._protocol_v2_seen = threading.Event()
         self._protocol_v2_error: str | None = None
+        self._protocol_v2_probe: tuple[int, int] | None = None
+        self._protocol_v2_proof: tuple[int, int] | None = None
+        self._v2_startup_handshake: dict[str, object] | None = None
+        self._ingest_lock = threading.RLock()
         self._v1_input = bytearray()
         self._v2_decoder = protocol_v2.StreamDecoder()
         self._v2_queue: queue.Queue[
@@ -201,6 +209,8 @@ class SerialHandle:
             "crc_or_framing_errors": 0,
             "conflicting_duplicates": 0,
             "boot_boundaries": 0,
+            "startup_discarded_fragments": 0,
+            "startup_discarded_frames": 0,
         }
         self._v2_last_status: dict[str, str] | None = None
         self._v2_ack_withheld = False
@@ -210,6 +220,7 @@ class SerialHandle:
         self._csv_lock = threading.Lock()
         self._csv_writer: csv.writer | None = None
         self._csv_file = None
+        self._primary_sensor_csv = False
         self._buffer_rows: list[list[str]] = []
         self._max_buffered_rows = MAX_BUFFERED_SERIAL_ROWS
         self._max_line_bytes = MAX_SERIAL_LINE_BYTES
@@ -304,6 +315,9 @@ class SerialHandle:
             self.last_error = detail
         if stop_reader:
             self._stop.set()
+        with self._ingest_lock:
+            if self._protocol_v2_pending and self._protocol_v2_probe is not None:
+                self._startup_v2_failure(detail)
         self._interrupt_clear_jam(detail)
         self._interrupt_clock_exchange(detail)
         self.emit(f"[{timestamp()}] [SER] FATAL: {detail}")
@@ -315,6 +329,9 @@ class SerialHandle:
 
     def _open_csv(self, path: Path) -> None:
         """Open CSV at the given path and flush any buffered lines."""
+        self._primary_sensor_csv = path.name == "sensors.csv" and is_primary_layout(path.parent)
+        if self._primary_sensor_csv:
+            normalize_existing_sensor_csv(path, SERIAL_HEADER)
         try:
             is_empty = (not path.exists()) or path.stat().st_size == 0
         except Exception:
@@ -329,8 +346,8 @@ class SerialHandle:
             self._csv_writer = writer
             self._csv_ready = True
             if self._buffer_rows:
-                self._csv_writer.writerows(self._buffer_rows)
-                self._row_count += len(self._buffer_rows)
+                for row in self._buffer_rows:
+                    self._append_csv_row(row)
                 self._buffer_rows.clear()
             self._csv_file.flush()
 
@@ -345,7 +362,7 @@ class SerialHandle:
         """Adopt the temp CSV into the official run dir by atomic rename."""
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
-            dst_path = run_dir / "serial.csv"
+            dst_path = artifact_path(run_dir, "serial.csv")
 
             with self._csv_lock:
                 if (
@@ -355,7 +372,7 @@ class SerialHandle:
                     and Path(self._csv_file.name).resolve() == dst_path.resolve()
                     and self._v2_journal is not None
                     and self._v2_journal.path.resolve()
-                    == (run_dir / "diagnostics" / "controller_v2.jsonl").resolve()
+                    == (artifact_path(run_dir, "diagnostics") / "controller_v2.jsonl").resolve()
                 ):
                     return True
                 if self._csv_file:
@@ -374,7 +391,7 @@ class SerialHandle:
 
             self._open_csv(dst_path)
 
-            diagnostics_dir = run_dir / "diagnostics"
+            diagnostics_dir = artifact_path(run_dir, "diagnostics")
             diagnostics_dir.mkdir(parents=True, exist_ok=True)
             if self._v2_journal is not None:
                 self._v2_journal.close()
@@ -429,6 +446,9 @@ class SerialHandle:
             self._protocol_mode = "v1"
             self._protocol_v2_pending = False
             self._protocol_v2_error = None
+            self._protocol_v2_probe = None
+            self._protocol_v2_proof = None
+            self._v2_startup_handshake = None
             self._protocol_v2_seen.clear()
             self._v1_input.clear()
             self._v2_decoder.reset()
@@ -512,6 +532,11 @@ class SerialHandle:
             self.emit(f"[{timestamp()}] [SER] reader thread exit")
 
     def _ingest_serial_bytes(self, chunk: bytes) -> None:
+        """Serialize parser transitions with the startup negotiation owner."""
+        with self._ingest_lock:
+            self._ingest_serial_bytes_locked(chunk)
+
+    def _ingest_serial_bytes_locked(self, chunk: bytes) -> None:
         """Route one read without losing the v1-ACK/v2-binary boundary."""
 
         if self._protocol_mode == "v2":
@@ -547,50 +572,110 @@ class SerialHandle:
                 f"{self._max_line_bytes} bytes"
             )
 
-    def _ingest_v2_resync_bytes(self, chunk: bytes) -> None:
-        """Resolve reconnect as continued binary mode or a rebooted v1 device."""
+    def _startup_v2_failure(self, detail: str) -> None:
+        self._protocol_v2_error = detail
+        self._protocol_v2_pending = False
+        self._protocol_v2_seen.set()
 
+    def _is_startup_v2_proof(self, frame: protocol_v2.Frame) -> bool:
+        """Only an idle controller's fresh, reliable clock echo can start a run."""
+        probe = self._protocol_v2_probe
+        if probe is None:
+            return False
+        if frame.integrity_latched or frame.message_type == protocol_v2.MessageType.INTEGRITY_FAULT:
+            self._v2_integrity_latched = True
+            self._startup_v2_failure("controller integrity fault during protocol-v2 startup: " + frame.text)
+            return False
+        if frame.text.startswith(("NACK,PROTO,", "NACK,TIME_SYNC,")):
+            self._startup_v2_failure("controller rejected startup handshake: " + frame.text)
+            return False
+        sequence, sent_ns = probe
+        if not frame.text.startswith(f"CLOCK_SYNC,{sequence},{sent_ns},"):
+            return False
+        from squeakview.common.clock_validation import parse_clock_response
+        try:
+            parse_clock_response(frame.text, sequence, sent_ns, time.time_ns())
+            if frame.message_type != protocol_v2.MessageType.COMMAND_RESULT or not frame.reliable or frame.sequence == 0 or frame.session_id != 0:
+                raise ValueError("fresh clock reply must be a reliable idle command result")
+        except (ValueError, RuntimeError) as exc:
+            self._startup_v2_failure(f"invalid startup handshake: {exc}")
+            return False
+        self._protocol_v2_proof = (frame.boot_id, frame.sequence)
+        self._v2_startup_handshake = {
+            "method": "fresh_idle_time_sync_echo", "probe_sequence": sequence,
+            "probe_host_unix_ns": sent_ns, "boot_id": frame.boot_id,
+            "journal_start_sequence": frame.sequence, "durable": False,
+        }
+        return True
+
+    def _ingest_v2_resync_bytes(self, chunk: bytes) -> None:
+        """Find a packet boundary, using a fresh idle reply for a new run.
+
+        Before the new run's boundary, fragments and old queued frames cannot
+        establish or acknowledge its journal. Reconnects with an existing journal
+        still recover every missing record from the durable watermark.
+        """
         self._v1_input.extend(chunk)
-        delimiter = self._v1_input.find(0)
-        ack = self._v1_input.find(b"ACK_PROTO,2\n")
-        nack = self._v1_input.find(b"NACK,PROTO,")
-        if ack >= 0 and (delimiter < 0 or ack < delimiter):
-            prefix = bytes(self._v1_input[:ack])
-            trailing = bytes(self._v1_input[ack + len(b"ACK_PROTO,2\n") :])
-            self._v1_input.clear()
-            for raw_line in prefix.splitlines():
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if line:
-                    self._handle_semantic_line(line, received_ns=time.time_ns())
-            self._protocol_mode = "v2"
-            self._v2_decoder.reset()
-            self._handle_semantic_line("ACK_PROTO,2", received_ns=time.time_ns())
-            self.emit(f"[{timestamp()}] [SER] controller protocol v2 active")
-            if trailing:
-                self._ingest_v2_bytes(trailing)
-            return
-        if nack >= 0 and (delimiter < 0 or nack < delimiter):
-            newline = self._v1_input.find(b"\n", nack)
-            if newline >= 0:
-                prefix = bytes(self._v1_input[:newline])
-                trailing = bytes(self._v1_input[newline + 1 :])
+        while True:
+            delimiter = self._v1_input.find(0)
+            ack = self._v1_input.find(b"ACK_PROTO,2\n")
+            nack = self._v1_input.find(b"NACK,PROTO,")
+            if ack >= 0 and (delimiter < 0 or ack < delimiter):
+                prefix = bytes(self._v1_input[:ack])
+                trailing = bytes(self._v1_input[ack + len(b"ACK_PROTO,2\n") :])
                 self._v1_input.clear()
                 for raw_line in prefix.splitlines():
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if line:
                         self._handle_semantic_line(line, received_ns=time.time_ns())
-                if trailing:
+                self._handle_semantic_line("ACK_PROTO,2", received_ns=time.time_ns())
+                if self._protocol_v2_probe is not None:
                     self._v1_input.extend(trailing)
+                    continue
+                self._protocol_mode = "v2"
+                self._v2_decoder.reset()
+                self.emit(f"[{timestamp()}] [SER] controller protocol v2 active")
+                if trailing:
+                    self._ingest_v2_bytes(trailing)
                 return
-        if delimiter >= 0:
+            if nack >= 0 and (delimiter < 0 or nack < delimiter):
+                newline = self._v1_input.find(b"\n", nack)
+                if newline >= 0:
+                    prefix = bytes(self._v1_input[:newline])
+                    trailing = bytes(self._v1_input[newline + 1 :])
+                    self._v1_input.clear()
+                    for raw_line in prefix.splitlines():
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if line:
+                            self._handle_semantic_line(line, received_ns=time.time_ns())
+                    self._v1_input.extend(trailing)
+                    return
+            if delimiter < 0:
+                if len(self._v1_input) > self._max_line_bytes:
+                    raise ValueError("protocol-v2 reconnect resynchronization exceeded its bound")
+                return
             buffered = bytes(self._v1_input)
             try:
-                protocol_v2.decode_frame(buffered[:delimiter])
+                frame = protocol_v2.decode_frame(buffered[:delimiter])
             except protocol_v2.ProtocolV2Error:
-                complete_first_frame = False
-            else:
-                complete_first_frame = True
-            if complete_first_frame:
+                frame = None
+            if self._protocol_v2_pending and self._protocol_v2_probe is not None:
+                if frame is not None and self._is_startup_v2_proof(frame):
+                    self._v1_input.clear()
+                    self._v2_decoder.reset()
+                    self._protocol_mode = "v2"
+                    # Queue the proof itself first. Negotiation completes only
+                    # after the persistence worker has fsynced this baseline.
+                    self._ingest_v2_bytes(buffered)
+                    return
+                if self._protocol_v2_error is not None:
+                    self._v1_input.clear()
+                    return
+                key = "startup_discarded_frames" if frame is not None else "startup_discarded_fragments"
+                self._v2_counts[key] += 1
+                del self._v1_input[:delimiter + 1]
+                continue
+            if frame is not None:
                 self._v1_input.clear()
                 self._v2_decoder.reset()
                 self._protocol_mode = "v2"
@@ -599,13 +684,7 @@ class SerialHandle:
                 return
             if self._protocol_v2_pending and self._v2_boot_id is None:
                 self._v1_input.clear()
-                self._protocol_v2_error = (
-                    "controller was already in v2 and the host attached in the "
-                    "middle of a frame; a safe run-local sequence baseline "
-                    "cannot be established"
-                )
-                self._protocol_v2_pending = False
-                self._protocol_v2_seen.set()
+                self._startup_v2_failure("cannot establish a safe run-local sequence baseline without a fresh startup probe")
                 return
             trailing = bytes(self._v1_input[delimiter + 1 :])
             self._v1_input.clear()
@@ -614,21 +693,13 @@ class SerialHandle:
             if self._v2_boot_id is not None and self._v2_journal is not None:
                 contiguous = self._v2_journal.contiguous(self._v2_boot_id)
                 if contiguous:
-                    self._queue_line(
-                        f"ACK_EVENTS,{self._v2_boot_id},{contiguous}",
-                        priority=_WRITE_PRIORITY_ACK,
-                        wait=False,
-                    )
+                    self._queue_line(f"ACK_EVENTS,{self._v2_boot_id},{contiguous}",
+                                     priority=_WRITE_PRIORITY_ACK, wait=False)
                 self._v2_last_resend_requested.pop(self._v2_boot_id, None)
-                self._request_v2_replay(
-                    self._v2_boot_id,
-                    contiguous + 1,
-                )
+                self._request_v2_replay(self._v2_boot_id, contiguous + 1)
             if trailing:
                 self._ingest_v2_bytes(trailing)
             return
-        if len(self._v1_input) > self._max_line_bytes:
-            raise ValueError("protocol-v2 reconnect resynchronization exceeded its bound")
 
     def _reconnect_v2(self, cause: BaseException) -> bool:
         """Reconnect without a second reader and recover from the durable watermark."""
@@ -708,7 +779,7 @@ class SerialHandle:
             elif line.startswith("NACK,START_BEHAVIOR,") or line.startswith("NACK,UNKNOWN,"):
                 self._behavior_start_error = line
                 self._behavior_start_seen.set()
-        if self._protocol_v2_pending and line == "ACK_PROTO,2":
+        if self._protocol_v2_pending and self._protocol_v2_probe is None and line == "ACK_PROTO,2":
             self._protocol_mode = "v2"
             self._protocol_v2_pending = False
             self._protocol_v2_seen.set()
@@ -806,7 +877,7 @@ class SerialHandle:
         if frame.session_id:
             self._v2_session_id = frame.session_id
         if result == protocol_v2.StoreResult.NEW:
-            self._publish_v2_frame(frame, host_unix_ns)
+            self._publish_v2_frame(frame, host_unix_ns, host_monotonic_ns)
 
         if frame.integrity_latched or frame.message_type == protocol_v2.MessageType.INTEGRITY_FAULT:
             self._v2_integrity_latched = True
@@ -827,8 +898,31 @@ class SerialHandle:
         if frame.reliable and frame.sequence > contiguous + 1:
             self._request_v2_replay(frame.boot_id, contiguous + 1)
         self._write_v2_summary()
+        with self._ingest_lock:
+            if self._protocol_v2_pending and self._protocol_v2_proof == (frame.boot_id, frame.sequence):
+                if contiguous < frame.sequence or self.fatal_error is not None:
+                    self._startup_v2_failure("startup handshake did not establish a durable contiguous baseline")
+                else:
+                    self._v2_startup_handshake["durable"] = True
+                    self._write_v2_summary()
+                    self._protocol_v2_probe = None
+                    self._protocol_v2_proof = None
+                    self._protocol_v2_pending = False
+                    self._protocol_v2_seen.set()
 
-    def _publish_v2_frame(self, frame: protocol_v2.Frame, received_ns: int) -> None:
+    def _publish_v2_frame(self, frame: protocol_v2.Frame, received_ns: int,
+                          host_monotonic_ns: int | None = None) -> None:
+        if not hasattr(self, "_csv_context"):
+            self._csv_context = threading.local()
+        self._csv_context.frame = frame
+        self._csv_context.received_ns = received_ns
+        self._csv_context.monotonic_ns = host_monotonic_ns
+        try:
+            self._publish_v2_frame_impl(frame, received_ns)
+        finally:
+            self._csv_context.frame = None
+
+    def _publish_v2_frame_impl(self, frame: protocol_v2.Frame, received_ns: int) -> None:
         text = frame.text
         message_type = frame.message_type
         with self._v2_observed:
@@ -922,6 +1016,7 @@ class SerialHandle:
             "integrity_latched": self._v2_integrity_latched,
             "counts": dict(self._v2_counts),
             "last_transport_status": self._v2_last_status,
+            "startup_handshake": self._v2_startup_handshake,
             "updated_unix_ns": time.time_ns(),
         }
         temp_path = path.with_suffix(path.suffix + ".tmp")
@@ -1033,16 +1128,18 @@ class SerialHandle:
                 self._write_queue.task_done()
 
     def _write_csv_line(self, line: str) -> None:
-        self._write_csv_fields(line.split(","), line)
+        self._write_csv_fields(parse_controller_fields(line), line)
 
     def _write_csv_fields(self, fields: list[str], raw_line: str) -> None:
-        row = list(fields)
-        serial_field_count = len(SERIAL_HEADER) - 3
-        if len(row) < serial_field_count:
-            row.extend([""] * (serial_field_count - len(row)))
-        elif len(row) > serial_field_count:
-            row = row[: serial_field_count - 1] + [",".join(row[serial_field_count - 1 :])]
-        row.extend([str(time.time_ns()), str(time.monotonic_ns()), raw_line])
+        context = getattr(self, "_csv_context", None)
+        frame = getattr(context, "frame", None)
+        record = make_event_record(
+            fields, raw_line, frame=frame,
+            host_unix_ns=getattr(context, "received_ns", None) if frame else None,
+            host_monotonic_ns=getattr(context, "monotonic_ns", None) if frame else None,
+            normalize=self._primary_sensor_csv,
+        )
+        row = [record.get(name, "") for name in SERIAL_HEADER]
         failure: str | None = None
         with self._csv_lock:
             if self._csv_ready and self._csv_writer:
@@ -1055,8 +1152,7 @@ class SerialHandle:
                         raise OSError(
                             "qualification-injected serial ledger write failure"
                         )
-                    self._csv_writer.writerow(row)
-                    self._row_count += 1
+                    self._append_csv_row(row)
                     if self._row_count % self._flush_every == 0 and self._csv_file:
                         self._csv_file.flush()
                 except Exception as exc:
@@ -1068,9 +1164,20 @@ class SerialHandle:
                         f"buffer reached {self._max_buffered_rows} rows"
                     )
                 else:
+                    if self._primary_sensor_csv:
+                        normalized = format_sensor_row(dict(zip(SERIAL_HEADER, row)))
+                        row = [normalized.get(name, "") for name in SERIAL_HEADER]
                     self._buffer_rows.append(row)
         if failure is not None:
             self._report_fatal(failure)
+
+    def _append_csv_row(self, row) -> None:
+        """Keep every message in the standard columns, under _csv_lock."""
+        if self._primary_sensor_csv:
+            normalized = format_sensor_row(dict(zip(SERIAL_HEADER, row)))
+            row = [normalized.get(name, "") for name in SERIAL_HEADER]
+        self._csv_writer.writerow(row)
+        self._row_count += 1
 
     def log_marker(self, marker: str) -> None:
         """Write a non-serial marker row into the CSV for later alignment."""
@@ -1227,36 +1334,53 @@ class SerialHandle:
             self._behavior_start_lock.release()
 
     def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None:
-        """Enter or rejoin v2, including when the controller is already active."""
-
-        if self._protocol_mode == "v2":
-            return
-        if self._protocol_v2_pending:
-            raise RuntimeError("protocol-v2 negotiation is already pending")
-        if self._v2_journal is None:
-            raise RuntimeError("protocol-v2 requires an established run directory")
-        self._protocol_v2_error = None
-        self._protocol_v2_seen.clear()
-        self._protocol_v2_pending = True
-        self._protocol_mode = "v2_resync"
-        self._v1_input.clear()
-        self._v2_decoder.discard_through_delimiter()
+        """Establish a fresh, durable idle-controller boundary before a new run."""
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not 0 < timeout_s <= 30:
+            raise ValueError("protocol-v2 startup timeout must be greater than zero and at most 30 seconds")
+        with self._ingest_lock:
+            if self._protocol_v2_pending:
+                raise RuntimeError("protocol-v2 negotiation is already pending")
+            if self._protocol_mode == "v2":
+                return
+            if self._v2_journal is None:
+                raise RuntimeError("protocol-v2 requires an established run directory")
+            if self._v2_journal.path.stat().st_size or not self._v2_queue.empty():
+                raise RuntimeError("an existing run must reconnect from its durable watermark")
+            self._v2_boot_id = None
+            self._v2_session_id = None
+            self._v2_integrity_latched = False
+            self._v2_last_ack_queued.clear()
+            self._v2_last_resend_requested.clear()
+            self._v2_counts = {key: 0 for key in self._v2_counts}
+            self._protocol_v2_error = None
+            self._protocol_v2_seen.clear()
+            self._protocol_v2_pending = True
+            self._protocol_v2_probe = (int.from_bytes(os.urandom(8), "big"), time.time_ns())
+            self._protocol_v2_proof = None
+            self._protocol_mode = "v2_resync"
+            self._v1_input.clear()
+            self._v2_decoder.reset()
+            sequence, sent_ns = self._protocol_v2_probe
         try:
             self._send_line("PROTO,2")
+            # Existing firmware echoes both arguments and rejects this command
+            # while a session/feed is active. No firmware reset or update needed.
+            self._send_line(f"TIME_SYNC,{sequence},{sent_ns}")
             if not self._protocol_v2_seen.wait(timeout=float(timeout_s)):
-                raise TimeoutError(
-                    f"controller did not acknowledge PROTO,2 within {timeout_s:g}s"
-                )
+                raise TimeoutError(f"controller did not establish a fresh idle protocol-v2 boundary within {timeout_s:g}s")
             if self._protocol_v2_error:
                 raise RuntimeError(self._protocol_v2_error)
-            if self._protocol_mode != "v2":
-                raise RuntimeError("controller negotiation completed without entering v2")
+            if self._protocol_mode != "v2" or self._v2_boot_id is None:
+                raise RuntimeError("protocol-v2 startup completed without a durable controller identity")
         finally:
-            if self._protocol_mode != "v2":
-                self._protocol_v2_pending = False
-                self._protocol_mode = "v1"
-                self._v1_input.clear()
-                self._v2_decoder.reset()
+            with self._ingest_lock:
+                if self._protocol_v2_pending or self._protocol_v2_error is not None or self._v2_boot_id is None:
+                    self._protocol_v2_pending = False
+                    self._protocol_v2_probe = None
+                    self._protocol_v2_proof = None
+                    self._protocol_mode = "v1"
+                    self._v1_input.clear()
+                    self._v2_decoder.reset()
 
     @property
     def protocol_v2_snapshot(self) -> dict[str, object]:
@@ -1269,6 +1393,7 @@ class SerialHandle:
             "last_transport_status": (
                 dict(self._v2_last_status) if self._v2_last_status else None
             ),
+            "startup_handshake": dict(self._v2_startup_handshake) if self._v2_startup_handshake else None,
         }
 
     def set_protocol_v2_ack_withheld(self, withheld: bool) -> None:

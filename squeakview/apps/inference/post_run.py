@@ -1,6 +1,8 @@
 """Bounded recording validation and automatic controller alignment."""
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path, open_artifact
+
 import argparse
 import csv
 import heapq
@@ -51,7 +53,7 @@ def _timestamp() -> str:
 
 
 def _update_progress(run_dir: Path, **updates) -> None:
-    path = Path(run_dir) / PROGRESS_FILENAME
+    path = artifact_path(Path(run_dir), PROGRESS_FILENAME)
     payload = run_context.read_json(path)
     payload.update(updates)
     run_context.atomic_write_json(path, payload)
@@ -142,9 +144,14 @@ def _promote(temp_dir: Path, run_dir: Path, paths: dict[str, str]) -> None:
     for source_name, destination_name in paths.items():
         source = temp_dir / source_name
         if source.exists():
-            destination = run_dir / destination_name
+            destination = artifact_path(run_dir, destination_name)
+            compressed = destination if destination.suffix == ".gz" else None
+            if compressed is not None:
+                destination = run_dir / "_metadata" / destination_name
             destination.parent.mkdir(parents=True, exist_ok=True)
             _durable_replace(source, destination)
+            if compressed is not None:
+                compressed.unlink()
 
 
 def _validate_recordings(
@@ -183,7 +190,7 @@ def _last_complete_line(path: Path) -> str | None:
     """Read one bounded final ledger record without scanning the whole file."""
 
     try:
-        with Path(path).open("rb") as handle:
+        with open_artifact(Path(path), "rb") as handle:
             handle.seek(0, os.SEEK_END)
             end = handle.tell()
             if end <= 0:
@@ -208,12 +215,10 @@ def _durable_ledger_counts(run_dir: Path, camera_count: int) -> dict[int, tuple[
 
     counts: dict[int, tuple[int, int]] = {}
     for stream_id in range(camera_count):
-        capture_path = run_dir / f"capture_cam{stream_id}.jsonl"
-        admission_path = run_dir / (
-            "record_admission.csv"
+        capture_path = artifact_path(run_dir, f"capture_cam{stream_id}.jsonl")
+        admission_path = artifact_path(run_dir, "record_admission.csv"
             if stream_id == 0
-            else f"record_admission_cam{stream_id}.csv"
-        )
+            else f"record_admission_cam{stream_id}.csv")
         capture_line = _last_complete_line(capture_path)
         admission_line = _last_complete_line(admission_path)
         try:
@@ -245,15 +250,23 @@ def _durable_frame_manifest_counts(run_dir: Path, camera_count: int) -> dict[int
 
     counts: dict[int, int] = {}
     for stream_id in range(camera_count):
-        path = run_dir / (
-            "frames.csv" if stream_id == 0 else f"frames_cam{stream_id}.csv"
-        )
+        path = artifact_path(run_dir, "frames.csv" if stream_id == 0 else f"frames_cam{stream_id}.csv")
         line = _last_complete_line(path)
         try:
+            from squeakview.common.run_outputs import TIMING_FIELDS
+            with open_artifact(path, "rb") as handle:
+                raw_header = handle.readline(16 * 1024 + 1)
+            if len(raw_header) > 16 * 1024:
+                raise ValueError("frame manifest header exceeds size limit")
+            header = next(csv.reader([raw_header.decode("utf-8")], strict=True))
+            native_header = list(FrameCsvOperator.HEADERS)
+            timed_header = native_header + [key for key in TIMING_FIELDS if key not in native_header]
+            if header not in (native_header, timed_header):
+                raise ValueError("unrecognized frame manifest header")
             fields = next(csv.reader([line or ""], strict=True))
-            if len(fields) != len(FrameCsvOperator.HEADERS):
+            if len(fields) != len(header):
                 raise ValueError(
-                    f"expected {len(FrameCsvOperator.HEADERS)} fields, got {len(fields)}"
+                    f"expected {len(header)} fields, got {len(fields)}"
                 )
             if fields[0] != str(stream_id):
                 raise ValueError(f"unexpected stream_id {fields[0]!r}")
@@ -274,7 +287,7 @@ def _bounded_acquisition_integrity(run_dir: Path, camera_count: int) -> tuple[di
 
     cameras: list[dict[str, object]] = []
     for stream_id in range(camera_count):
-        line = _last_complete_line(run_dir / f"capture_cam{stream_id}.jsonl")
+        line = _last_complete_line(artifact_path(run_dir, f"capture_cam{stream_id}.jsonl"))
         try:
             payload = json.loads(line or "")
         except json.JSONDecodeError as exc:
@@ -345,14 +358,14 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
         error=None,
     )
     run_context.atomic_write_json(
-        run_dir / PROGRESS_FILENAME,
+        artifact_path(run_dir, PROGRESS_FILENAME),
         {"stage": "recording_count_validation", "frames_processed": 0},
     )
     try:
         counts = _durable_ledger_counts(run_dir, camera_count)
         manifest_counts = _durable_frame_manifest_counts(run_dir, camera_count)
         prior_status = run_context.read_json_required(
-            run_dir / run_context.RUN_STATUS_FILENAME
+            artifact_path(run_dir, run_context.RUN_STATUS_FILENAME)
         )
         expected_ttl = prior_status.get("expected_ttl_count")
         if expected_ttl is not None and (
@@ -368,9 +381,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
             manifest_count = manifest_counts[stream_id]
             source_counts[stream_id] = source_count
             recorded_counts[stream_id] = admitted_count
-            video_path = run_dir / (
-                "raw.mp4" if stream_id == 0 else f"raw_cam{stream_id}.mp4"
-            )
+            video_path = artifact_path(run_dir, "raw.mp4" if stream_id == 0 else f"raw_cam{stream_id}.mp4")
             before = _video_metadata_identity(video_path)
             probe = probe_video_frames(video_path, expected_frames=admitted_count)
             after = _video_metadata_identity(video_path)
@@ -533,7 +544,7 @@ def finalize_run(
         run_dir, "finalizer:capture_reconciliation"
     )
     run_context.atomic_write_json(
-        run_dir / PROGRESS_FILENAME,
+        artifact_path(run_dir, PROGRESS_FILENAME),
         {"stage": "capture_reconciliation", "frames_processed": 0},
     )
     initial_recording_evidence = capture_recording_evidence(
@@ -546,7 +557,7 @@ def finalize_run(
     try:
         index = _open_index(temp_dir / "post_run.sqlite")
         if enable_infer:
-            _index_inference_frames(index, run_dir / "inference" / "frames.csv")
+            _index_inference_frames(index, artifact_path(run_dir, "inference/frames.csv"))
         operator = FrameCsvOperator(
             temp_dir / "frames.csv",
             meta_type=0,
@@ -559,7 +570,7 @@ def finalize_run(
         shutil.rmtree(temp_dir, ignore_errors=True)
         run_context.write_status(run_dir, "finalization_failed", error=str(exc))
         run_context.atomic_write_json(
-            run_dir / PROGRESS_FILENAME,
+            artifact_path(run_dir, PROGRESS_FILENAME),
             {"stage": "failed", "frames_processed": 0, "error": str(exc)},
         )
         raise
@@ -606,7 +617,7 @@ def finalize_run(
             now = time.monotonic()
             if processed % 100_000 == 0 or now - last_progress >= 5.0:
                 run_context.atomic_write_json(
-                    run_dir / PROGRESS_FILENAME,
+                    artifact_path(run_dir, PROGRESS_FILENAME),
                     {
                         "stage": "capture_reconciliation",
                         "frames_processed": processed,
@@ -740,7 +751,7 @@ def finalize_run(
         # preview evidence. A missing/corrupt manifest is rejected later by
         # qualification, while recording reconciliation remains recoverable.
         manifest = run_context.read_json(
-            run_dir / run_context.RUN_MANIFEST_FILENAME
+            artifact_path(run_dir, run_context.RUN_MANIFEST_FILENAME)
         )
         inference_manifest = (
             manifest.get("inference")
@@ -797,7 +808,7 @@ def finalize_run(
     except Exception as exc:
         run_context.write_status(run_dir, "finalization_failed", error=str(exc))
         run_context.atomic_write_json(
-            run_dir / PROGRESS_FILENAME,
+            artifact_path(run_dir, PROGRESS_FILENAME),
             {"stage": "failed", "frames_processed": processed, "error": str(exc)},
         )
         raise
@@ -818,7 +829,7 @@ def align_run(
 ) -> dict:
     """Build the compact alignment/validation summary without expanded CSV caches."""
 
-    from scripts.align_run_outputs_streaming import build_alignment
+    from squeakview.apps.inference.legacy_alignment import build_alignment
 
     run_dir = Path(run_dir).resolve()
     temp_dir = Path(tempfile.mkdtemp(prefix=".analysis.", dir=run_dir))
@@ -834,7 +845,7 @@ def align_run(
             video_validation=video_validation,
             include_objects=False,
         )
-        run_context.atomic_write_json(run_dir / "alignment_summary.json", summary)
+        run_context.atomic_write_json(artifact_path(run_dir, "alignment_summary.json"), summary)
         counts = summary.get("counts", {})
         validation = summary.get("validation", {})
         frame_alignment = summary.get("frame_alignment", {})
@@ -903,8 +914,9 @@ def cleanup_successful_run(run_dir: Path, camera_count: int) -> None:
     """Remove transient progress state while preserving scientific provenance."""
 
     run_dir = Path(run_dir)
-    _ = camera_count  # Retained for compatibility with existing callers.
-    (run_dir / PROGRESS_FILENAME).unlink(missing_ok=True)
+    from squeakview.common.metadata_retention import compact_successful_run
+    compact_successful_run(run_dir, camera_count)
+    (artifact_path(run_dir, PROGRESS_FILENAME)).unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -962,7 +974,15 @@ def main() -> int:
             overall_validation_passed=True,
         )
     if result.validation_passed:
-        cleanup_successful_run(args.run_dir, max(1, int(args.camera_count)))
+        try:
+            from squeakview.common.run_outputs import finalize_primary_tables
+            finalize_primary_tables(args.run_dir, max(1, int(args.camera_count)))
+            cleanup_successful_run(args.run_dir, max(1, int(args.camera_count)))
+        except Exception as exc:
+            run_context.write_status(args.run_dir, "finalization_failed", error=str(exc),
+                                     overall_validation_passed=False)
+            print(f"[{_timestamp()}] [POST-RUN] primary-table finalization or metadata compaction failed: {exc}", flush=True)
+            return 1
     return 0 if result.validation_passed else 2
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import math
 import re
 from pathlib import Path
@@ -237,10 +239,10 @@ def _read_evidence(
     run_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, object]]]:
     summary, summary_identity = run_context.read_json_required_with_identity(
-        Path(run_dir) / "qualification_summary.json"
+        artifact_path(Path(run_dir), "qualification_summary.json")
     )
     manifest, manifest_identity = run_context.read_json_required_with_identity(
-        Path(run_dir) / run_context.RUN_MANIFEST_FILENAME
+        artifact_path(Path(run_dir), run_context.RUN_MANIFEST_FILENAME)
     )
     if not summary:
         raise ValueError(f"qualification summary is missing: {run_dir}")
@@ -428,7 +430,7 @@ def deepstream_latency_evidence_for_run(
         if isinstance(declared_log, str) and declared_log
         else Path("diagnostics/deepstream.log")
     )
-    log_path = (run_dir / relative_log).resolve()
+    log_path = ((Path(run_dir) / relative_log) if relative_log.is_absolute() or ".." in relative_log.parts else artifact_path(run_dir, relative_log)).resolve()
     if not log_path.is_relative_to(run_dir):
         return {
             "path": str(log_path),
@@ -570,11 +572,11 @@ def compare_debug_overhead(
     debug, debug_manifest, debug_read_identities = _read_evidence(debug_dir)
     baseline_status, baseline_status_identity = (
         run_context.read_json_required_with_identity(
-        baseline_dir / run_context.RUN_STATUS_FILENAME
+        artifact_path(baseline_dir, run_context.RUN_STATUS_FILENAME)
         )
     )
     debug_status, debug_status_identity = run_context.read_json_required_with_identity(
-        debug_dir / run_context.RUN_STATUS_FILENAME
+        artifact_path(debug_dir, run_context.RUN_STATUS_FILENAME)
     )
     baseline_read_identities["run_status"] = baseline_status_identity
     debug_read_identities["run_status"] = debug_status_identity
@@ -732,11 +734,11 @@ def compare_debug_overhead(
 
     baseline_config_identity = canonical_acquisition_identity(
         baseline_manifest,
-        run_context.read_json(baseline_dir / "diagnostics/camera_runtime.json"),
+        run_context.read_json(artifact_path(baseline_dir, "diagnostics/camera_runtime.json")),
     )
     debug_config_identity = canonical_acquisition_identity(
         debug_manifest,
-        run_context.read_json(debug_dir / "diagnostics/camera_runtime.json"),
+        run_context.read_json(artifact_path(debug_dir, "diagnostics/camera_runtime.json")),
     )
     mismatches.extend(
         f"baseline {error}"
@@ -844,7 +846,7 @@ def compare_debug_overhead(
             ("run_status", run_context.RUN_STATUS_FILENAME),
         ):
             if not stable_file_matches_identity(
-                root / filename,
+                artifact_path(root, filename),
                 identities[name],
                 max_bytes=run_context.MAX_RUN_METADATA_BYTES,
             ):

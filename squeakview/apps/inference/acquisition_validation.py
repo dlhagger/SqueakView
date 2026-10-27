@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import csv
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,7 +105,7 @@ def validate_acquisition_integrity(
         raise ValueError("camera_count must be positive")
     expected_stream_ids = tuple(range(camera_count))
 
-    diagnostics = Path(run_dir) / "diagnostics"
+    diagnostics = artifact_path(Path(run_dir), "diagnostics")
     errors_path = diagnostics / "errors.csv"
     camera_path = diagnostics / "camera.csv"
     event_counts: dict[str, int] = {}

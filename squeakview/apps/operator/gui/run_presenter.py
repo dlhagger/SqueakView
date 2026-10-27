@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Qt controller orchestration for an operator run lifecycle."""
 
+from squeakview.common.run_layout import artifact_path
+
 import threading
 import time
 from pathlib import Path
@@ -207,8 +209,8 @@ class RunLifecycleController(QtCore.QObject):
             return
         run_path = Path(run_dir)
         self.view.stop_overlay.update_progress(
-            run_context.read_json(run_path / "run_status.json"),
-            run_context.read_json(run_path / "post_run_progress.json"),
+            run_context.read_json(artifact_path(run_path, "run_status.json")),
+            run_context.read_json(artifact_path(run_path, "post_run_progress.json")),
         )
 
     def start(self) -> None:
@@ -223,6 +225,10 @@ class RunLifecycleController(QtCore.QObject):
             return
         try:
             config = view._build_launch_config()
+        except ValueError as exc:
+            view._set_bottle_status(str(exc))
+            QtWidgets.QMessageBox.warning(view, "Weigh-In", str(exc))
+            return
         except RuntimeError:
             view._emit_log("[GUI] Please configure SqueakView first.")
             return
@@ -246,6 +252,9 @@ class RunLifecycleController(QtCore.QObject):
         # cannot leak from the preceding run. Authoritative device state such
         # as the feeder-jam latch is intentionally retained.
         view.dashboard.reset_run_data()
+        bottle_controller = getattr(view, "_bottle_swap_controller", None)
+        if bottle_controller is not None:
+            bottle_controller.begin_run()
         self.start_in_progress = True
         self.start_failure_reported = False
         self.pending_start_config = config
@@ -377,7 +386,7 @@ class RunLifecycleController(QtCore.QObject):
         view.preview.set_status("Recording")
         run_dir = view.backend.current_snapshot.run_dir
         if run_dir is not None:
-            view.dashboard.follow_run_telemetry(Path(run_dir) / "diagnostics" / "system.csv")
+            view.dashboard.follow_run_telemetry(artifact_path(Path(run_dir), "diagnostics") / "system.csv")
         view._emit_log("[GUI] Run started")
 
     def start_ipc_preview(self, config: process.LaunchConfig) -> None:
@@ -515,7 +524,7 @@ class RunLifecycleController(QtCore.QObject):
         view.preview.show_hint(True)
         view.preview.set_preview_enabled(True)
         run_dir = view.backend.current_snapshot.run_dir
-        status = run_context.read_json(Path(run_dir) / "run_status.json") if run_dir else {}
+        status = run_context.read_json(artifact_path(Path(run_dir), "run_status.json")) if run_dir else {}
         presentation = present_finalization(status)
         view._set_run_state(presentation.badge_state)
         view.preview.set_status(presentation.preview_status)
@@ -541,7 +550,7 @@ class RunLifecycleController(QtCore.QObject):
                     "Run validation failed; inspect Events before completing bottle data."
                 )
                 view._set_bottle_completion_pending(False)
-            elif bool(status.get("outputs", {}).get("bottle_measurements_complete")):
+            elif bool(status.get("outputs", status.get("actual_outputs", {})).get("bottle_measurements_complete")):
                 view._set_bottle_status("Run finalized; bottle measurements complete.")
                 view._set_bottle_completion_pending(False)
             else:

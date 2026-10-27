@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Deterministic capture-ledger drain checks used before MP4 finalization."""
 
+from squeakview.common.run_layout import artifact_path, open_artifact
+
 import json
 import math
 import os
@@ -45,14 +47,11 @@ class CaptureDrainHooks:
 def ledger_paths(run_dir: Path, camera_count: int) -> tuple[Path, ...]:
     paths: list[Path] = []
     for index in range(max(1, int(camera_count))):
-        paths.append(Path(run_dir) / f"capture_cam{index}.jsonl")
+        paths.append(artifact_path(Path(run_dir), f"capture_cam{index}.jsonl"))
         paths.append(
-            Path(run_dir)
-            / (
-                "record_admission.csv"
+            artifact_path(Path(run_dir), "record_admission.csv"
                 if index == 0
-                else f"record_admission_cam{index}.csv"
-            )
+                else f"record_admission_cam{index}.csv")
         )
     return tuple(paths)
 
@@ -71,7 +70,7 @@ def last_complete_ledger_line(path: Path) -> str | None:
     """Read the last complete nonempty line without scanning a long ledger."""
 
     try:
-        with Path(path).open("rb") as handle:
+        with open_artifact(Path(path), "rb") as handle:
             handle.seek(0, os.SEEK_END)
             end = handle.tell()
             if end <= 0:
@@ -97,7 +96,7 @@ def ledger_frame_counts(
     counts: list[int | None] = []
     for index in range(max(1, int(camera_count))):
         capture_line = last_complete_ledger_line(
-            Path(run_dir) / f"capture_cam{index}.jsonl"
+            artifact_path(Path(run_dir), f"capture_cam{index}.jsonl")
         )
         try:
             capture_count = (
@@ -105,11 +104,9 @@ def ledger_frame_counts(
             )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             capture_count = 0 if capture_line is None else None
-        admission_path = Path(run_dir) / (
-            "record_admission.csv"
+        admission_path = artifact_path(Path(run_dir), "record_admission.csv"
             if index == 0
-            else f"record_admission_cam{index}.csv"
-        )
+            else f"record_admission_cam{index}.csv")
         admission_line = last_complete_ledger_line(admission_path)
         try:
             admission_count = int(admission_line.split(",")[1]) + 1

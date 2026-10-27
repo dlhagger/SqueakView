@@ -7,7 +7,7 @@ not create, simulate, launch, resume, or modify a scientific run.
 ## Preconditions
 
 - Select one canonical case with
-  `.venv/bin/python scripts/qualify_matrix.py --list-cases`.
+  `.venv/bin/python scripts/qualification/qualify_matrix.py --list-cases`.
 - Use one reviewed `validated: true` qualification-limits file for both runs.
 - Use the same Jetson, software commit, model package, native plugins, camera,
 controller, capture configuration, preview state, named nvpmodel mode, and
@@ -90,7 +90,7 @@ must demonstrate that behavior before the instrumentation is accepted.
 Run the Qt-free checker with an explicit case guard and durable output path:
 
 ```bash
-.venv/bin/python scripts/compare_debug_overhead.py \
+.venv/bin/python scripts/qualification/compare_debug_overhead.py \
   /absolute/path/to/baseline-run \
   /absolute/path/to/debug-run \
   --case-id '<case-id>' \

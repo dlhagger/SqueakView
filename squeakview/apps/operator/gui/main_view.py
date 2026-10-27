@@ -274,6 +274,9 @@ def build_main_view(
     workspace.add_card("clock", "Clock Preflight", clock_group)
     workspace.add_card("task", "Live Task State", task_state_group)
     workspace.add_card("bottles", "Weigh-In", bottle_panel)
+    bottle_panel.details_expansion_changed.connect(
+        lambda expanded: workspace.set_card_content_expanded("bottles", expanded)
+    )
     workspace.add_card("behavior", "Behavior Dashboard", dashboard_group)
     event_dock = workspace.add_card("events", "Operator Events", event_panel)
     workspace.establish_default_layout()

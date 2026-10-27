@@ -11,7 +11,7 @@ from unittest import mock
 
 import yaml
 
-from scripts.qualify_matrix import (
+from scripts.qualification.qualify_matrix import (
     _next_case_worksheet,
     _record_assignment,
     _write_new_assignment_checklist,
@@ -96,6 +96,17 @@ class QualificationMatrixCliTests(unittest.TestCase):
             load_assignments(self.assignments_path),
             {case_id: None for case_id in self.case_ids},
         )
+
+    def test_assignment_reads_metadata_directory_for_new_runs(self) -> None:
+        from squeakview.common.run_layout import initialize_layout, artifact_path
+        _write_new_assignment_checklist(self.assignments_path, self.matrix)
+        run_dir = self.root / "primary-run"
+        run_dir.mkdir()
+        initialize_layout(run_dir)
+        artifact_path(run_dir, "run_manifest.json").write_text(json.dumps({}))
+        artifact_path(run_dir, "run_status.json").write_text(json.dumps({"state": "finalized"}))
+        _record_assignment(self.assignments_path, self.matrix, self.case_id, run_dir)
+        self.assertEqual(load_assignments(self.assignments_path)[self.case_id], str(run_dir.resolve()))
 
     def test_records_completed_run_and_rejects_reuse(self) -> None:
         _write_new_assignment_checklist(self.assignments_path, self.matrix)

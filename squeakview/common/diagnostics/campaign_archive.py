@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import os
 import stat
 from pathlib import Path
@@ -257,17 +259,17 @@ def build_campaign_inventory(
         if not isinstance(report_run, str) or Path(report_run).resolve() != run_dir:
             raise ValueError(f"matrix report run does not match assignment: {case_id}")
         for required in ("run_manifest.json", "run_status.json", "qualification_summary.json"):
-            if not (run_dir / required).is_file():
+            if not (artifact_path(run_dir, required)).is_file():
                 raise ValueError(f"assigned run is missing {required}: {run_dir}")
         status = read_json_object(
-            run_dir / "run_status.json",
+            artifact_path(run_dir, "run_status.json"),
             max_bytes=run_context.MAX_RUN_METADATA_BYTES,
             label="run_status.json",
         )
         if status.get("state") not in TERMINAL_SUCCESS_STATES:
             raise ValueError(f"assigned run is not successfully finalized: {run_dir}")
         summary = read_json_object(
-            run_dir / "qualification_summary.json",
+            artifact_path(run_dir, "qualification_summary.json"),
             max_bytes=run_context.MAX_RUN_METADATA_BYTES,
             label="qualification_summary.json",
         )

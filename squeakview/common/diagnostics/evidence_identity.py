@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import hashlib
 import os
 import stat
@@ -307,7 +309,7 @@ def capture_source_evidence(
     """Identify source artifacts, retaining identities from exact parsed bytes."""
 
     root = Path(run_dir).resolve()
-    manifest_path = root / run_context.RUN_MANIFEST_FILENAME
+    manifest_path = artifact_path(root, run_context.RUN_MANIFEST_FILENAME)
     if manifest_snapshot is None:
         manifest, parsed_manifest_identity = (
             run_context.read_json_required_with_identity(manifest_path)
@@ -321,7 +323,7 @@ def capture_source_evidence(
         else None
     )
     relative_log = Path(declared_log) if isinstance(declared_log, str) and declared_log else Path("diagnostics/deepstream.log")
-    log_path = (root / relative_log).resolve()
+    log_path = ((root / relative_log) if relative_log.is_absolute() or ".." in relative_log.parts else artifact_path(root, relative_log)).resolve()
     if not log_path.is_relative_to(root):
         log_identity: dict[str, object] = {
             "path": str(log_path), "available": False,
@@ -340,7 +342,7 @@ def capture_source_evidence(
         if isinstance(declared_task_snapshot, str) and declared_task_snapshot
         else Path("config/task.yaml")
     )
-    task_path = (root / relative_task).resolve()
+    task_path = ((root / relative_task) if relative_task.is_absolute() or ".." in relative_task.parts else artifact_path(root, relative_task)).resolve()
     if not task_path.is_relative_to(root):
         task_identity: dict[str, object] = {
             "path": str(task_path),
@@ -370,7 +372,7 @@ def capture_source_evidence(
         else None
     )
     recording_paths: list[Path] = []
-    for path in (root / "diagnostics").glob("recording*.csv"):
+    for path in (artifact_path(root, "diagnostics")).glob("recording*.csv"):
         if len(recording_paths) >= recording_limit:
             raise ValueError(
                 "recording telemetry file set exceeds bounded expected camera count"
@@ -424,7 +426,7 @@ def capture_source_evidence(
             for boundary in ("admission", "delivery"):
                 preview_attribution.append(
                     stable_file_identity(
-                        root / "diagnostics" / f"preview_{boundary}{suffix}.csv"
+                        artifact_path(root, "diagnostics") / f"preview_{boundary}{suffix}.csv"
                     )
                 )
     return {
@@ -432,9 +434,9 @@ def capture_source_evidence(
         "run_status": (
             dict(status_identity)
             if status_identity is not None
-            else stable_file_identity(root / run_context.RUN_STATUS_FILENAME)
+            else stable_file_identity(artifact_path(root, run_context.RUN_STATUS_FILENAME))
         ),
-        "system_telemetry": stable_file_identity(root / "diagnostics/system.csv"),
+        "system_telemetry": stable_file_identity(artifact_path(root, "diagnostics/system.csv")),
         "recording_telemetry": [
             stable_file_identity(path)
             for path in recording_paths
@@ -443,14 +445,14 @@ def capture_source_evidence(
         "deepstream_log": log_identity,
         "task_config": task_identity,
         "camera_runtime": stable_file_identity(
-            root / "diagnostics/camera_runtime.json",
+            artifact_path(root, "diagnostics/camera_runtime.json"),
             max_bytes=MAX_QUALIFICATION_INPUT_BYTES,
         ),
         "alignment_summary": (
             dict(alignment_identity)
             if alignment_identity is not None
             else stable_file_identity(
-                root / "alignment_summary.json",
+                artifact_path(root, "alignment_summary.json"),
                 max_bytes=MAX_QUALIFICATION_INPUT_BYTES,
             )
         ),
@@ -579,7 +581,7 @@ def source_evidence_errors(
     if verify_recording_content:
         recorded_artifacts = recorded.get("recording_artifacts")
         current_artifacts = current.get("recording_artifacts")
-        manifest = run_context.read_json(Path(run_dir) / run_context.RUN_MANIFEST_FILENAME)
+        manifest = run_context.read_json(artifact_path(Path(run_dir), run_context.RUN_MANIFEST_FILENAME))
         capture = manifest.get("capture") if isinstance(manifest.get("capture"), Mapping) else {}
         camera_count = capture.get("num_cameras")
         if (

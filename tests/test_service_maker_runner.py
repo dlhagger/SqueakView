@@ -1828,7 +1828,7 @@ class ServiceMakerRunnerTests(unittest.TestCase):
             "error": None,
         }
         with mock.patch(
-            "scripts.align_run_outputs_streaming.build_alignment",
+            "squeakview.apps.inference.legacy_alignment.build_alignment",
             return_value=summary,
         ) as build:
             with self.assertRaisesRegex(RuntimeError, "alignment validation failed"):
@@ -1876,7 +1876,7 @@ class ServiceMakerRunnerTests(unittest.TestCase):
         }
 
         with mock.patch(
-            "scripts.align_run_outputs_streaming.build_alignment",
+            "squeakview.apps.inference.legacy_alignment.build_alignment",
             return_value=summary,
         ):
             post_run.align_run(self.root)

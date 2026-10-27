@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import csv
 import hashlib
 import math
@@ -719,7 +721,7 @@ def _scan_recording_file(
 def _scan_recording(
     run_dir: Path, *, expected_camera_count: int | None
 ) -> dict[str, Any]:
-    diagnostics = run_dir / "diagnostics"
+    diagnostics = artifact_path(run_dir, "diagnostics")
     valid_expected_count = (
         expected_camera_count
         if type(expected_camera_count) is int
@@ -807,7 +809,7 @@ def _task_config_snapshot_valid(run_dir: Path, manifest: dict[str, Any]) -> bool
         or expected_size > MAX_TASK_CONFIG_BYTES
     ):
         return False
-    path = run_dir / relative_path
+    path = artifact_path(run_dir, relative_path)
     try:
         raw = read_stable_regular_file(
             path, max_bytes=MAX_TASK_CONFIG_BYTES, label="task config snapshot"
@@ -1059,7 +1061,7 @@ def _integrity_gates(
         }
         observed_names: set[str] = set()
         try:
-            with os.scandir(run_dir / "diagnostics") as entries:
+            with os.scandir(artifact_path(run_dir, "diagnostics")) as entries:
                 for entry in entries:
                     if not Path(entry.name).match("preview_*.csv"):
                         continue
@@ -1090,7 +1092,7 @@ def _integrity_gates(
             for boundary in ("admission", "delivery"):
                 expected = camera.get(f"{boundary}_identity")
                 current = stable_file_identity(
-                    run_dir / "diagnostics" / f"preview_{boundary}{suffix}.csv"
+                    artifact_path(run_dir, "diagnostics") / f"preview_{boundary}{suffix}.csv"
                 )
                 if not isinstance(expected, dict) or any(
                     expected.get(field) != current.get(field)
@@ -1378,10 +1380,10 @@ def qualify_run(
 
     run_dir = Path(run_dir).resolve()
     manifest, manifest_identity = run_context.read_json_required_with_identity(
-        run_dir / run_context.RUN_MANIFEST_FILENAME
+        artifact_path(run_dir, run_context.RUN_MANIFEST_FILENAME)
     )
     status, status_identity = run_context.read_json_required_with_identity(
-        run_dir / run_context.RUN_STATUS_FILENAME
+        artifact_path(run_dir, run_context.RUN_STATUS_FILENAME)
     )
     limits, limits_error, limits_identity = _read_yaml_with_identity(
         Path(limits_path) if limits_path is not None else None
@@ -1396,7 +1398,7 @@ def qualify_run(
 
     capture_duration_s = _duration_seconds(status)
     system = _scan_system(
-        run_dir / "diagnostics" / "system.csv",
+        artifact_path(run_dir, "diagnostics") / "system.csv",
         expected_interval_ms,
         capture_duration_s,
     )
@@ -1416,7 +1418,7 @@ def qualify_run(
         try:
             alignment_summary, alignment_identity = (
                 run_context.read_json_required_with_identity(
-                run_dir / "alignment_summary.json"
+                artifact_path(run_dir, "alignment_summary.json")
                 )
             )
         except (OSError, ValueError):
@@ -1610,10 +1612,10 @@ def qualify_run(
         "capture_validity_unchanged": True,
         "source_evidence": source_evidence,
     }
-    destination = output_path or (run_dir / "qualification_summary.json")
+    destination = output_path or (artifact_path(run_dir, "qualification_summary.json"))
     core_sources = (
-        (run_dir / run_context.RUN_MANIFEST_FILENAME, manifest_identity),
-        (run_dir / run_context.RUN_STATUS_FILENAME, status_identity),
+        (artifact_path(run_dir, run_context.RUN_MANIFEST_FILENAME), manifest_identity),
+        (artifact_path(run_dir, run_context.RUN_STATUS_FILENAME), status_identity),
     )
     if any(
         not stable_file_matches_identity(

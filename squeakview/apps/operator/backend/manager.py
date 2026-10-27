@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Backend orchestrator for the operator GUI."""
 
+from squeakview.common.run_layout import artifact_path, is_primary_layout, uses_compact_metadata
+
 import math
 import os
 import subprocess
@@ -518,15 +520,16 @@ class OperatorBackend:
     def _write_bottle_measurements(self, run_dir: Path, bottles: dict[str, Any] | None) -> dict[str, Any]:
         summary = run_context.write_bottle_artifacts(run_dir, bottles)
         service = getattr(self, "_bottle_swap", None)
-        if service is not None and service.path.parent == run_dir:
+        if service is not None and service.run_dir == run_dir:
             history = service.snapshot()
             summary["complete"] = bool(history["measurements_complete"])
-            summary["history"] = "bottle_history.json"
-            summary["history_events"] = "bottle_history_events.jsonl"
+            summary["history"] = artifact_path(run_dir, "weigh_in.csv" if is_primary_layout(run_dir) else "bottle_history.json").relative_to(run_dir).as_posix()
+            summary["history_events"] = artifact_path(run_dir, "weigh_in.csv" if is_primary_layout(run_dir) else "bottle_history_events.jsonl").relative_to(run_dir).as_posix()
             summary["closed_bottle_count"] = history["history_count"]
-            run_context.atomic_write_json(run_dir / run_context.BOTTLE_SUMMARY_FILENAME, summary)
+            if not uses_compact_metadata(run_dir):
+                run_context.atomic_write_json(artifact_path(run_dir, run_context.BOTTLE_SUMMARY_FILENAME), summary)
         state = "complete" if summary.get("complete") else "incomplete"
-        self._log(f"[BOTTLES] saved {state} bottle metadata → {run_dir / run_context.BOTTLE_MEASUREMENTS_FILENAME}")
+        self._log(f"[BOTTLES] saved {state} bottle metadata → {artifact_path(run_dir, run_context.BOTTLE_MEASUREMENTS_FILENAME)}")
         for warning in summary.get("warnings", []):
             self._log(f"[BOTTLES] warning: {warning}")
         return summary
@@ -551,13 +554,13 @@ class OperatorBackend:
             must_exist=True,
         )
         service = getattr(self, "_bottle_swap", None)
-        if service is not None and service.path.parent == target:
+        if service is not None and service.run_dir == target:
             current = service.snapshot()
             if current.get("history_count", len(current["history"])):
                 # After a replacement, stale form fields cannot rename a bottle
                 # or attach an old bottle's final weight to its replacement.
                 supplied = bottles or {}
-                merged = dict(run_context.read_json(target / run_context.BOTTLE_SUMMARY_FILENAME) or {})
+                merged = dict(run_context.bottle_summary(target) or {})
                 merged = {"mouse_weight_g": merged.get("mouse_weight_g"), **current["current"]}
                 if "mouse_weight_g" in supplied:
                     merged["mouse_weight_g"] = supplied["mouse_weight_g"]
@@ -570,7 +573,7 @@ class OperatorBackend:
                             merged[side] = {**merged[side], "final_weight_g": supplied[side].get("final_weight_g")}
                 bottles = merged
             else:
-                previous = run_context.read_json(target / run_context.BOTTLE_SETUP_FILENAME) or {}
+                previous = run_context.bottle_setup(target) or {}
                 bottles = {**previous.get("sides", {}), "mouse_weight_g": previous.get("mouse_weight_g"), **(bottles or {})}
             service.sync_measurements(bottles or {})
         summary = self._write_bottle_measurements(target, bottles)
@@ -664,8 +667,8 @@ class OperatorBackend:
         if service is None:
             return
         snapshot = service.snapshot()
-        run_dir = service.path.parent
-        previous = run_context.read_json(run_dir / run_context.BOTTLE_SUMMARY_FILENAME) or {}
+        run_dir = service.run_dir
+        previous = run_context.bottle_summary(run_dir) or {}
         self._write_bottle_measurements(run_dir, {
             **snapshot["current"], "mouse_weight_g": previous.get("mouse_weight_g"),
         })
@@ -1026,11 +1029,11 @@ class OperatorBackend:
                 preflight=self._preflight_evidence,
                 qualification=self._qualification_case,
             )
-            self._write_bottle_measurements(
-                prepared.run_dir, getattr(cfg, "bottles", None)
-            )
             self._bottle_swap = BottleSwapService(
                 prepared.run_dir, run_context.normalize_bottle_measurements(cfg.bottles)
+            )
+            self._write_bottle_measurements(
+                prepared.run_dir, getattr(cfg, "bottles", None)
             )
             self._write_run_manifest(prepared.run_dir, required=True)
             run_context.write_status(prepared.run_dir, "starting")
@@ -1066,7 +1069,7 @@ class OperatorBackend:
         def validate_clock(
             handle: serial_util.SerialHandle, prepared: startup.PreparedRun
         ) -> dict[str, Any]:
-            evidence_path = prepared.run_dir / "diagnostics" / "clock_validation.json"
+            evidence_path = artifact_path(prepared.run_dir, "diagnostics") / "clock_validation.json"
 
             def publish(state: str, snapshot: dict[str, Any]) -> None:
                 summary = snapshot.get("after") or snapshot.get("before") or {}

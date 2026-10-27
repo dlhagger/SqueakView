@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from squeakview.common.run_layout import open_artifact
 
 
 MAX_CSV_RECORD_BYTES = 256 * 1024
@@ -28,7 +29,7 @@ def bounded_csv_lines(
     if max_record_bytes < 1:
         raise ValueError("max_record_bytes must be positive")
     path = Path(path)
-    with path.open("rb") as handle:
+    with open_artifact(path, "rb") as handle:
         line_number = 0
         while True:
             raw = handle.readline(max_record_bytes + 1)

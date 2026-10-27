@@ -9,6 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from squeakview.common.run_layout import artifact_path, is_primary_layout
 from typing import Any
 
 
@@ -53,13 +54,21 @@ class BottleHistory:
 
 def load_bottle_history(run_dir: str | Path) -> BottleHistory | None:
     path = Path(run_dir)
-    if path.is_dir():
-        path /= 'bottle_history.json'
-    if not path.exists():
-        return None
-    if path.stat().st_size > 64 * 1024 * 1024:
-        raise ValueError('Bottle history is unexpectedly large')
-    payload = json.loads(path.read_text(encoding='utf-8'))
+    payload = None
+    if (path.is_dir() and is_primary_layout(path)) or path.name == 'weigh_in.csv':
+        from squeakview.common.bottle_csv import load_swap_state
+        root = path if path.is_dir() else path.parent
+        payload = load_swap_state(root)
+        if payload is None and path.name == 'weigh_in.csv':
+            return None
+    if payload is None:
+        if path.is_dir():
+            path = artifact_path(path, 'bottle_history.json')
+        if not path.exists():
+            return None
+        if path.stat().st_size > 64 * 1024 * 1024:
+            raise ValueError('Bottle history is unexpectedly large')
+        payload = json.loads(path.read_text(encoding='utf-8'))
     if payload.get('schema_version') != 1:
         raise ValueError('Unsupported bottle history schema')
     bottles = [*payload['history'], *payload['current'].values()]

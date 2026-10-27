@@ -7,6 +7,8 @@ serial message per trigger.  Exact anchor timestamps are retained; timestamps
 for intervening frames are explicitly labelled as piecewise interpolations.
 """
 
+from squeakview.common.run_layout import artifact_path
+
 import csv
 import json
 import os
@@ -420,7 +422,7 @@ def load_v2_run(run_dir: Path) -> V2RunData:
     """Load a finalized production-v2 run and construct its analysis timeline."""
 
     run_dir = Path(run_dir).expanduser().resolve()
-    status = _read_json(run_dir / "run_status.json")
+    status = _read_json(artifact_path(run_dir, "run_status.json"))
     if status.get("state") != "finalized":
         raise ValueError(f"run is not finalized: state={status.get('state')!r}")
     if status.get("overall_validation_passed") is not True:
@@ -428,14 +430,14 @@ def load_v2_run(run_dir: Path) -> V2RunData:
     if status.get("recording_validation_passed") is not True:
         raise ValueError("run did not pass recording validation")
 
-    manifest = _read_json(run_dir / "run_manifest.json")
+    manifest = _read_json(artifact_path(run_dir, "run_manifest.json"))
     serial = manifest.get("serial", {})
     if serial.get("controller_protocol") != "v2":
         raise ValueError("run manifest does not declare controller protocol v2")
     if serial.get("alignment_required") is not False:
         raise ValueError("v2 run unexpectedly requests legacy TTL alignment")
 
-    summary = _read_json(run_dir / "diagnostics" / "controller_v2_summary.json")
+    summary = _read_json(artifact_path(run_dir, "diagnostics") / "controller_v2_summary.json")
     if summary.get("protocol") != "mousehouse_v2":
         raise ValueError("controller transport summary is not protocol v2")
     counts = summary.get("counts", {})
@@ -448,7 +450,7 @@ def load_v2_run(run_dir: Path) -> V2RunData:
     if int(counts.get("conflicting_duplicates", 0)) != 0:
         raise ValueError("controller transport reported conflicting duplicates")
 
-    journal = load_v2_journal(run_dir / "diagnostics" / "controller_v2.jsonl")
+    journal = load_v2_journal(artifact_path(run_dir, "diagnostics") / "controller_v2.jsonl")
     if int(counts.get("frames_stored", -1)) != len(journal):
         raise ValueError("controller summary/journal stored-frame counts disagree")
     journal_start = summary.get("journal_start_sequence")
@@ -463,7 +465,7 @@ def load_v2_run(run_dir: Path) -> V2RunData:
     ):
         raise ValueError("controller summary/camera session IDs disagree")
     frames = align_frames_v2(
-        pd.read_csv(run_dir / "frames.csv", low_memory=False), anchors
+        pd.read_csv(artifact_path(run_dir, "frames.csv"), low_memory=False), anchors
     )
     events = controller_events(journal, anchors)
     return V2RunData(

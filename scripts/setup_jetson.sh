@@ -7,6 +7,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+step() {
+  printf '\n[%s/4] %s\n' "$1" "$2"
+  printf '%s\n' '------------------------------------------------------------'
+}
+
+printf '\n%s\n' 'SqueakView | Jetson setup'
+printf '%s\n' '============================================================'
+step 1 'Check desktop user and prepare project storage'
+
 if [ "$(id -u)" -eq 0 ]; then
   TARGET_USER="${SQUEAKVIEW_DESKTOP_USER:-${SUDO_USER:-}}"
   if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
@@ -30,6 +39,9 @@ if [ -z "$TARGET_USER_HOME" ] || [ ! -d "$TARGET_USER_HOME" ]; then
   printf '[FAIL] Could not resolve the home directory for %s.\n' "$TARGET_USER" >&2
   exit 2
 fi
+
+printf '[INFO] Desktop user: %s\n' "$TARGET_USER"
+printf '[INFO] Application:  %s\n' "$ROOT"
 
 PROJECTS_PARENT_RAW="${SQUEAKVIEW_PROJECTS_DIR:-$TARGET_USER_HOME/Documents/SqueakView Projects}"
 case "$PROJECTS_PARENT_RAW" in
@@ -71,7 +83,11 @@ else
   printf '[PASS] Created project parent: %s\n' "$PROJECTS_PARENT"
 fi
 
-printf 'Configuring this Jetson for SqueakView (desktop user: %s)\n' "$TARGET_USER"
+step 2 'Install system packages'
+printf '[INFO] Media:     VLC, FFmpeg, and ffprobe\n'
+printf '[INFO] Build:     C/C++ toolchain, CMake, and pkg-config\n'
+printf '[INFO] GStreamer: tools, plugins, and development libraries\n'
+printf '[INFO] Package installation may request your sudo password.\n'
 "${AS_ROOT[@]}" apt-get install -y \
   ffmpeg \
   vlc \
@@ -85,8 +101,13 @@ printf 'Configuring this Jetson for SqueakView (desktop user: %s)\n' "$TARGET_US
   libgstreamer1.0-dev \
   libgstreamer-plugins-base1.0-dev
 
+printf '[PASS] VLC is installed.\n'
+printf '[PASS] FFmpeg/ffprobe is installed.\n'
+printf '[PASS] Build tools and GStreamer dependencies are installed.\n'
+
 # Configure serial permissions before compilation so a failed native build
 # cannot skip this device-provisioning step.
+step 3 'Configure serial-controller access'
 if ! getent group dialout >/dev/null; then
   printf '[FAIL] The required dialout group does not exist on this system.\n' >&2
   exit 1
@@ -100,6 +121,8 @@ else
   printf '[ACTION REQUIRED] Sign out and back in (or reboot) before using a serial controller.\n'
 fi
 
+step 4 'Build and verify native camera and pose components'
+printf '[INFO] Building as desktop user: %s\n' "$TARGET_USER"
 if [ "$(id -u)" -eq 0 ]; then
   if ! command -v runuser >/dev/null 2>&1; then
     printf '[FAIL] runuser is required to keep native build outputs owned by %s.\n' "$TARGET_USER" >&2
@@ -117,5 +140,8 @@ else
   bash "$ROOT/scripts/build_native.sh"
 fi
 
-printf '[PASS] FFmpeg/ffprobe is installed.\n'
+printf '[PASS] Native camera plugin and pose parser are built and verified.\n'
+printf '\n%s\n' '============================================================'
+printf '[SETUP COMPLETE] All four setup steps succeeded.\n'
+printf '[INFO] Project storage: %s\n' "$PROJECTS_PARENT"
 printf '[SETUP COMPLETE] Reboot this Jetson before starting SqueakView.\n'

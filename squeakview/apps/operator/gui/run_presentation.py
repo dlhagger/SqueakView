@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 """Qt-free presentation policy and bounded readers for live run artifacts."""
 
 import csv
@@ -197,7 +199,7 @@ def scan_capture_health(run_path: Path) -> CaptureHealthSnapshot:
 
     capture: dict[str, Any] = {}
     for raw in reversed(
-        _tail_text_lines(Path(run_path) / "capture_cam0.jsonl", complete_only=True)
+        _tail_text_lines(artifact_path(Path(run_path), "capture_cam0.jsonl"), complete_only=True)
     ):
         try:
             payload = json.loads(raw)
@@ -206,7 +208,7 @@ def scan_capture_health(run_path: Path) -> CaptureHealthSnapshot:
         if isinstance(payload, dict):
             capture = payload
             break
-    recording = _last_complete_csv_row(Path(run_path) / "diagnostics" / "recording.csv")
+    recording = _last_complete_csv_row(artifact_path(Path(run_path), "diagnostics") / "recording.csv")
     raw_sequence = capture.get("source_sequence_index")
     try:
         parsed_sequence = int(raw_sequence)  # type: ignore[arg-type]

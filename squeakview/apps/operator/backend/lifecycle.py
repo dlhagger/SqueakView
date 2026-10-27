@@ -9,6 +9,8 @@ drain capture ledgers, close capture, close serial, then validate artifacts.
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import signal
 import subprocess
 import time
@@ -274,7 +276,7 @@ def finalize_run(
         elif finalizer_returncode not in (0,):
             failure_reasons.append(f"post-run finalizer exit code {finalizer_returncode}")
         if final_state == "finalized":
-            status = run_context.read_json_required(Path(run_dir) / "run_status.json")
+            status = run_context.read_json_required(artifact_path(Path(run_dir), "run_status.json"))
             validation = status.get("recording_validation")
             if not isinstance(validation, dict):
                 failure_reasons.append("recording validation was not produced")
@@ -299,13 +301,13 @@ def finalize_run(
         hooks.log(f"[BACKEND] run failed validation: {error}")
 
     finalizer_status = (
-        run_context.read_json_required(Path(run_dir) / "run_status.json")
+        run_context.read_json_required(artifact_path(Path(run_dir), "run_status.json"))
         if run_dir
         else {}
     )
     analysis_summary = (
-        run_context.read_json_required(Path(run_dir) / "alignment_summary.json")
-        if run_dir and (Path(run_dir) / "alignment_summary.json").exists()
+        run_context.read_json_required(artifact_path(Path(run_dir), "alignment_summary.json"))
+        if run_dir and (artifact_path(Path(run_dir), "alignment_summary.json")).exists()
         else None
     )
     if run_dir:

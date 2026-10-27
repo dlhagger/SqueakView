@@ -267,7 +267,7 @@ class SerialProtocolV2BoundaryTests(unittest.TestCase):
             self.assertEqual(handle.protocol_v2_snapshot["boot_id"], 99)
             handle._v2_journal.close()
 
-    def test_new_handle_fails_closed_when_attached_midframe(self) -> None:
+    def test_unprobed_midframe_attach_cannot_establish_a_baseline(self) -> None:
         handle = serial_util.SerialHandle("/dev/test", 115200, lambda _line: None)
         handle._protocol_mode = "v2_resync"
         handle._protocol_v2_pending = True

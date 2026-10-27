@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -28,6 +28,7 @@ from squeakview.common.diagnostics.qualification import (  # noqa: E402
     TERMINAL_FAILURE_STATES,
     TERMINAL_SUCCESS_STATES,
 )
+from squeakview.common.run_layout import artifact_path
 from squeakview.common.run_context import atomic_write_text  # noqa: E402
 from squeakview.project import AppPaths, open_project  # noqa: E402
 
@@ -172,7 +173,7 @@ def _record_assignment(
         raise ValueError(f"assigned run directory does not exist: {resolved}")
     metadata: dict[str, dict] = {}
     for filename in ("run_manifest.json", "run_status.json"):
-        artifact = resolved / filename
+        artifact = artifact_path(resolved, filename)
         if not artifact.exists():
             raise ValueError(f"assigned run is missing {filename}: {resolved}")
         metadata[filename] = _load_run_metadata(artifact)

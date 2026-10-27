@@ -1,6 +1,8 @@
 """DeepStream 9.1 inference runner built on the PyServiceMaker Pipeline API."""
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import math
 import os
 import signal
@@ -111,7 +113,7 @@ class ServiceMakerApp:
         self.preview_boundaries = []
         self._stop_event = threading.Event()
         self.system_telemetry = system_telemetry_factory(
-            self.run_dir / "diagnostics" / "system.csv",
+            artifact_path(self.run_dir, "diagnostics") / "system.csv",
             on_error=self._system_telemetry_fault,
             shutdown_requested=self._stop_event.is_set,
         )
@@ -506,7 +508,7 @@ class ServiceMakerApp:
 def run(config: InferenceConfig) -> int:
     install_crash_diagnostics(
         "capture",
-        log_path=(Path(config.run_dir) / "diagnostics" / "capture_crash.log")
+        log_path=(artifact_path(Path(config.run_dir), "diagnostics") / "capture_crash.log")
         if config.run_dir is not None
         else None,
     )

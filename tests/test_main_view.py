@@ -56,7 +56,7 @@ class MainViewTest(unittest.TestCase):
         self.assertTrue(self.view.event_log.isReadOnly())
         self.assertEqual(self.view.event_log.document().maximumBlockCount(), 500)
         self.assertIs(self.view.stop_overlay.parentWidget(), self.window)
-        self.assertEqual(self.view.bottle_panel.save_button.text(), "Save Measurements")
+        self.assertEqual(self.view.bottle_panel.save_button.text(), "Save weights")
         self.assertIs(self.view.workspace.parent(), self.window)
         self.assertEqual(
             set(self.view.workspace.cards),
@@ -90,6 +90,44 @@ class MainViewTest(unittest.TestCase):
         self.callbacks.create_experiment.assert_called_once_with()
         self.callbacks.create_subject.assert_called_once_with()
         self.callbacks.save_bottles.assert_called_once_with()
+
+    def test_collapsing_bottle_tools_returns_space_to_dashboard_in_custom_layout(self):
+        workspace = self.view.workspace
+        cards = workspace.cards
+        cards['task'].hide()
+        cards['clock'].show()
+        cards['events'].show()
+        self.window.splitDockWidget(cards['system'], cards['bottles'], QtCore.Qt.Orientation.Horizontal)
+        self.window.splitDockWidget(cards['bottles'], cards['clock'], QtCore.Qt.Orientation.Horizontal)
+        panel = self.view.bottle_panel
+        panel.set_run_state('recording')
+        workspace.set_runtime_locked(True)
+        panel.apply_swap_snapshot({
+            'available': True, 'state': 'ACTIVE',
+            'current': {'left': {'bottle_id': 'l1', 'side': 'left', 'fluid': 'water', 'initial_weight_g': 100}},
+        }, recording=True, busy=False)
+        self.window.resize(1800, 1100)
+        self.window.show()
+        for _ in range(4):
+            self.app.processEvents()
+        self.window.resizeDocks([cards['preview'], cards['behavior'], cards['events']],
+                                [400, 380, 200], QtCore.Qt.Orientation.Vertical)
+        for _ in range(4):
+            self.app.processEvents()
+        before = {key: QtCore.QSize(cards[key].size()) for key in ('preview', 'bottles', 'behavior', 'events')}
+        for _cycle in range(2):
+            panel.history_toggle.setChecked(True)
+            for _ in range(4):
+                self.app.processEvents()
+            self.assertGreater(cards['bottles'].height(), before['bottles'].height())
+            panel.history_toggle.setChecked(False)
+            for _ in range(4):
+                self.app.processEvents()
+            for key, size in before.items():
+                self.assertAlmostEqual(cards[key].height(), size.height(), delta=3, msg=key)
+                self.assertAlmostEqual(cards[key].width(), size.width(), delta=3, msg=key)
+        self.assertTrue(cards['events'].isVisible())
+        self.assertEqual(panel.phase_label.text(), 'Recording')
 
     def test_native_title_menu_toggles_all_card_visibility(self) -> None:
         self.window.show()

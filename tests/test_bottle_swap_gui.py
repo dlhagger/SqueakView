@@ -26,6 +26,110 @@ class BottleSwapGuiTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
+    def test_stop_and_late_terminal_snapshot_preserve_unsaved_form_values(self):
+        panel = BottleMeasurementPanel()
+        self.addCleanup(panel.close)
+        panel.apply_swap_snapshot(snapshot(), recording=True, busy=False)
+        # Reproduce edits made before Stop in the former editable live form.
+        panel.left_fluid_combo.setCurrentText("custom fluid")
+        panel.left_initial_weight_edit.setText("123.5")
+        panel.left_final_weight_edit.setText("98.5")
+        panel.mouse_weight_edit.setText("26.25")
+        panel.apply_swap_snapshot(snapshot(), recording=False, busy=False)
+        panel.apply_swap_snapshot(snapshot("STOPPED", available=False), recording=False, busy=False)
+        self.assertEqual(panel.left_fluid_combo.currentText(), "custom fluid")
+        self.assertEqual(panel.left_initial_weight_edit.text(), "123.5")
+        self.assertEqual(panel.left_final_weight_edit.text(), "98.5")
+        self.assertEqual(panel.mouse_weight_edit.text(), "26.25")
+        self.assertTrue(panel.has_unsaved_final_weights())
+        panel.mark_saved()
+        self.assertFalse(panel.has_unsaved_final_weights())
+
+    def test_first_idle_recovery_poll_cannot_erase_new_setup_or_final_weight(self):
+        panel = BottleMeasurementPanel()
+        self.addCleanup(panel.close)
+        panel.left_fluid_combo.setCurrentText("ethanol")
+        panel.left_initial_weight_edit.setText("123")
+        panel.left_final_weight_edit.setText("99")
+        panel.apply_swap_snapshot(snapshot("STOPPED"), recording=False, busy=False)
+        self.assertEqual(panel.left_fluid_combo.currentText(), "ethanol")
+        self.assertEqual(panel.left_initial_weight_edit.text(), "123")
+        self.assertEqual(panel.left_final_weight_edit.text(), "99")
+        self.assertTrue(panel.has_unsaved_final_weights())
+
+    def test_recording_poll_never_flashes_action_buttons_or_replaces_history_items(self):
+        panel = BottleMeasurementPanel()
+        self.addCleanup(panel.close)
+        entered, release = threading.Event(), threading.Event()
+        class Backend:
+            def bottle_swap_snapshot(self):
+                entered.set()
+                release.wait(2)
+                return snapshot()
+        controller = BottleSwapController(panel, Backend(), lambda: True)
+        self.addCleanup(controller.deleteLater)
+        controller.timer.stop()
+        controller._finished("snapshot", snapshot())
+        panel.history_table.setCurrentCell(0, 1)
+        item = panel.history_table.item(0, 1)
+        try:
+            controller.refresh()
+            self.assertTrue(entered.wait(1))
+            self.assertTrue(panel.swap_button.isEnabled())
+            self.assertTrue(panel.check_status_button.isEnabled())
+            controller.refresh()  # Another timer tick while a read is pending.
+            self.assertTrue(panel.swap_button.isEnabled())
+            self.assertTrue(panel.check_status_button.isEnabled())
+            self.assertIs(panel.history_table.item(0, 1), item)
+            self.assertEqual(panel.history_table.currentColumn(), 1)
+        finally:
+            release.set()
+            deadline = time.monotonic() + 2
+            while controller.busy and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+
+    def test_new_run_ignores_late_previous_run_poll_and_collects_all_initial_fields(self):
+        panel = BottleMeasurementPanel()
+        self.addCleanup(panel.close)
+        controller = BottleSwapController(panel, object(), lambda: False)
+        self.addCleanup(controller.deleteLater)
+        controller.timer.stop()
+        panel.apply_swap_snapshot(snapshot(history=[dict(side="left")], gaps=[{}]), recording=True, busy=False)
+        panel.left_fluid_combo.setCurrentText("ethanol")
+        panel.left_initial_weight_edit.setText("120")
+        payload = panel.collect_payload(include_final=False, strict=True)
+        self.assertEqual(payload["left"]["fluid"], "ethanol")
+        self.assertEqual(payload["left"]["initial_weight_g"], 120)
+        self.assertNotIn("current_bottle_ids", payload)
+        previous_generation = controller._generation
+        controller.begin_run()
+        controller._finished("snapshot", snapshot(), previous_generation)
+        self.assertEqual(controller.snapshot, {})
+        self.assertEqual(panel.left_fluid_combo.currentText(), "ethanol")
+        self.assertEqual(panel.left_initial_weight_edit.text(), "120")
+
+    def test_entry_controls_follow_start_record_stop_save_workflow(self):
+        panel = BottleMeasurementPanel()
+        self.addCleanup(panel.close)
+        panel.set_run_state("ready")
+        self.assertTrue(panel.left_initial_weight_edit.isEnabled())
+        self.assertTrue(panel.mouse_weight_edit.isEnabled())
+        self.assertFalse(panel.left_final_weight_edit.isEnabled())
+        self.assertFalse(panel.save_button.isEnabled())
+        panel.left_fluid_combo.setCurrentText("water")
+        panel.left_initial_weight_edit.setText("120")
+        for phase in ("starting", "recording", "finalizing"):
+            panel.set_run_state(phase)
+            panel.apply_swap_snapshot(snapshot(), recording=phase == "recording", busy=False)
+            self.assertFalse(panel.left_initial_weight_edit.isEnabled())
+            self.assertFalse(panel.left_final_weight_edit.isEnabled())
+            self.assertFalse(panel.mouse_weight_edit.isEnabled())
+            self.assertFalse(panel.save_button.isEnabled())
+        panel.set_run_state("complete")
+        self.assertTrue(panel.left_final_weight_edit.isEnabled())
+        self.assertTrue(panel.save_button.isEnabled())
+
     def test_stop_refresh_waits_for_final_controller_counts(self):
         panel = BottleMeasurementPanel()
         controller = BottleSwapController(panel, object(), lambda: False)
@@ -191,7 +295,7 @@ class BottleSwapGuiTests(unittest.TestCase):
             panel.apply_swap_snapshot(data, recording=True, busy=False)
             self.assertFalse(panel.right_initial_weight_edit.isEnabled())
             self.assertEqual(panel.history_table.rowCount(), 3)
-            self.assertIn("Right bottle saline: 47 licks", panel.lick_status_label.text())
+            self.assertIn("Session licks · Left 32 · Right 47", panel.lick_status_label.text())
             panel.mouse_weight_edit.setText("26.5")
             self.assertEqual(panel.collect_payload(include_final=True, strict=True), {"mouse_weight_g": 26.5})
             panel.apply_swap_snapshot(data, recording=False, busy=False)

@@ -1,6 +1,8 @@
 """Shared run-directory utilities for the Jetson capture suite."""
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path, initialize_layout, is_primary_layout, uses_compact_metadata
+
 import json
 import csv
 import fcntl
@@ -161,6 +163,7 @@ def create_run_dir(
             root.mkdir(parents=False, exist_ok=False)
         except FileExistsError:
             continue
+        initialize_layout(root, compact_metadata=True)
         _atomic_write_latest(runs_root, root)
         return root, run_id
     raise FileExistsError(f"could not create unique run directory under {base}")
@@ -208,20 +211,32 @@ class RunArtifacts:
     bottle_summary_json: Path
     serial_csv: Path | None = None
 
+    @property
+    def sensors_csv(self) -> Path | None:
+        return self.serial_csv
+
+    @property
+    def detections_csv(self) -> Path:
+        return self.objects_csv
+
+    @property
+    def weigh_in_csv(self) -> Path:
+        return self.bottle_measurements_csv
+
 
 def run_artifacts(run_dir: Path, include_serial: bool = True) -> RunArtifacts:
     return RunArtifacts(
-        raw_video=run_dir / "raw.mp4",
-        frames_csv=run_dir / "frames.csv",
-        drop_events_csv=run_dir / "diagnostics" / "errors.csv",
-        objects_csv=run_dir / "objects.csv",
-        keypoints_csv=run_dir / "keypoints.csv",
-        manifest_json=run_dir / RUN_MANIFEST_FILENAME,
-        status_json=run_dir / RUN_STATUS_FILENAME,
-        bottle_setup_json=run_dir / BOTTLE_SETUP_FILENAME,
-        bottle_measurements_csv=run_dir / BOTTLE_MEASUREMENTS_FILENAME,
-        bottle_summary_json=run_dir / BOTTLE_SUMMARY_FILENAME,
-        serial_csv=(run_dir / "serial.csv") if include_serial else None,
+        raw_video=artifact_path(run_dir, "raw.mp4"),
+        frames_csv=artifact_path(run_dir, "frames.csv"),
+        drop_events_csv=artifact_path(run_dir, "diagnostics") / "errors.csv",
+        objects_csv=artifact_path(run_dir, "objects.csv"),
+        keypoints_csv=artifact_path(run_dir, "keypoints.csv"),
+        manifest_json=artifact_path(run_dir, RUN_MANIFEST_FILENAME),
+        status_json=artifact_path(run_dir, RUN_STATUS_FILENAME),
+        bottle_setup_json=artifact_path(run_dir, BOTTLE_SETUP_FILENAME),
+        bottle_measurements_csv=artifact_path(run_dir, BOTTLE_MEASUREMENTS_FILENAME),
+        bottle_summary_json=artifact_path(run_dir, BOTTLE_SUMMARY_FILENAME),
+        serial_csv=(artifact_path(run_dir, "serial.csv")) if include_serial else None,
     )
 
 
@@ -345,12 +360,18 @@ def write_bottle_artifacts(run_dir: Path, bottles: dict[str, Any] | None) -> dic
     updated_at = _now_iso()
     updated_at_ns = time.time_ns()
     summary = build_bottle_summary(bottles, updated_at=updated_at)
+    if is_primary_layout(run_dir):
+        summary["measurements"] = "weigh_in.csv"
+    if uses_compact_metadata(run_dir):
+        from squeakview.common.run_outputs import write_weigh_in
+        write_weigh_in(run_dir, {**summary["sides"], "mouse_weight_g": summary["mouse_weight_g"]})
+        return summary
     setup = {
         "schema_version": "1.0",
         "updated_at": updated_at,
         "mouse_weight_g": summary["mouse_weight_g"],
-        "measurements": BOTTLE_MEASUREMENTS_FILENAME,
-        "summary": BOTTLE_SUMMARY_FILENAME,
+        "measurements": artifacts.bottle_measurements_csv.name,
+        "summary": artifacts.bottle_summary_json.relative_to(run_dir).as_posix(),
         "sides": {
             side: {
                 "fluid": info["fluid"],
@@ -403,17 +424,55 @@ def write_bottle_artifacts(run_dir: Path, bottles: dict[str, Any] | None) -> dic
     lines.append(buffer.getvalue())
 
     atomic_write_json(artifacts.bottle_setup_json, setup)
-    atomic_write_text(artifacts.bottle_measurements_csv, "".join(lines))
+    if is_primary_layout(run_dir):
+        from squeakview.common.run_outputs import write_weigh_in
+        write_weigh_in(run_dir, {**summary["sides"], "mouse_weight_g": summary["mouse_weight_g"]})
+    else:
+        atomic_write_text(artifacts.bottle_measurements_csv, "".join(lines))
     atomic_write_json(artifacts.bottle_summary_json, summary)
     return summary
 
 
+def bottle_summary(run_dir: Path) -> dict[str, Any]:
+    """Derive compact-run bottle views from the canonical weigh-in journal."""
+    if not uses_compact_metadata(run_dir):
+        return read_json(run_artifacts(run_dir).bottle_summary_json)
+    from squeakview.common.bottle_csv import load_swap_state
+    state = load_swap_state(run_dir)
+    current = dict(state["current"]) if state else {}
+    mouse_weight = None
+    weigh_path = artifact_path(run_dir, "weigh_in.csv")
+    records = csv.DictReader(bounded_csv_lines(weigh_path)) if weigh_path.exists() else ()
+    for row in records:
+        if row.get("record_type") in (None, "", "measurement"):
+            if row.get("measurement_type") == "mouse":
+                mouse_weight = _optional_float(row.get("weight_g"))
+            elif not state and row.get("side") in ("left", "right"):
+                side = current.setdefault(row["side"], {})
+                side.update(fluid=row.get("fluid", ""), note=row.get("note", ""))
+                if row.get("phase") in ("initial", "final"):
+                    side[row["phase"] + "_weight_g"] = _optional_float(row.get("weight_g"))
+    summary = build_bottle_summary({**current, "mouse_weight_g": mouse_weight})
+    summary["measurements"] = "weigh_in.csv"
+    if state:
+        summary["complete"] = all(entry.get("fluid") and entry.get("initial_weight_g") is not None and entry.get("final_weight_g") is not None for entry in [*state["history"], *state["current"].values()])
+        summary.update(history="weigh_in.csv", history_events="weigh_in.csv", closed_bottle_count=len(state["history"]))
+    return summary
+
+
+def bottle_setup(run_dir: Path) -> dict[str, Any]:
+    if uses_compact_metadata(run_dir):
+        summary = bottle_summary(run_dir)
+        return {"mouse_weight_g": summary["mouse_weight_g"], "sides": summary["sides"]}
+    return read_json(run_artifacts(run_dir).bottle_setup_json)
+
+
 def status_path(run_dir: Path) -> Path:
-    return run_dir / RUN_STATUS_FILENAME
+    return artifact_path(run_dir, RUN_STATUS_FILENAME)
 
 
 def manifest_path(run_dir: Path) -> Path:
-    return run_dir / RUN_MANIFEST_FILENAME
+    return artifact_path(run_dir, RUN_MANIFEST_FILENAME)
 
 
 MAX_RUN_METADATA_BYTES = 16 * 1024 * 1024
@@ -497,7 +556,12 @@ def write_status(run_dir: Path, state: str, **updates: Any) -> Path:
         if not isinstance(history, list):
             history = []
         entry = {"state": state, "timestamp": _now_iso()}
-        entry.update({key: value for key, value in updates.items() if value is not None})
+        compact = uses_compact_metadata(run_dir)
+        entry.update({key: value for key, value in updates.items() if value is not None and
+                      (not compact or key in {"stage", "error", "message", "reason"})})
+        if compact and "outputs" in updates:
+            updates["actual_outputs"] = updates.pop("outputs")
+            payload.pop("outputs", None)
         history.append(entry)
         payload.update(updates)
         payload["state"] = state
@@ -516,6 +580,9 @@ def update_status(run_dir: Path, **updates: Any) -> Path:
     path = status_path(run_dir)
     with _metadata_file_lock(path):
         payload = _read_json_for_update(path)
+        if uses_compact_metadata(run_dir) and "outputs" in updates:
+            updates["actual_outputs"] = updates.pop("outputs")
+            payload.pop("outputs", None)
         payload.update({key: value for key, value in updates.items() if value is not None})
         payload["updated_at"] = _now_iso()
         return atomic_write_json(path, payload)
@@ -524,6 +591,8 @@ def update_status(run_dir: Path, **updates: Any) -> Path:
 def write_manifest(run_dir: Path, payload: dict[str, Any]) -> Path:
     path = manifest_path(run_dir)
     with _metadata_file_lock(path):
+        if uses_compact_metadata(run_dir):
+            payload = {**_read_json_for_update(path), **payload}
         return atomic_write_json(path, payload)
 
 

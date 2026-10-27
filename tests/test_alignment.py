@@ -10,7 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts import align_run_outputs, align_run_outputs_streaming as streaming
+from scripts.legacy import align_run_outputs
+from squeakview.apps.inference import legacy_alignment as streaming
 from squeakview.common.serial import SERIAL_HEADER
 from squeakview.common.diagnostics import qualification
 
@@ -278,7 +279,7 @@ class AlignmentIntegrationTests(unittest.TestCase):
         result = subprocess.run(
             [
                 "python3",
-                str(Path(__file__).resolve().parents[1] / "scripts" / "align_run_outputs.py"),
+                str(Path(__file__).resolve().parents[1] / "scripts" / "legacy" / "align_run_outputs.py"),
                 str(self.run_dir),
                 "--out-dir",
                 str(cli_out),
@@ -294,6 +295,26 @@ class AlignmentIntegrationTests(unittest.TestCase):
             json.loads((cli_out / "alignment_summary.json").read_text())["counts"]["recorded_frames"],
             3,
         )
+
+
+class PrimaryLayoutAlignmentTests(unittest.TestCase):
+    def test_default_output_and_inputs_use_primary_layout(self) -> None:
+        from squeakview.common.run_layout import initialize_layout, artifact_path
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary) / "run"
+            write_minimal_run(run)
+            initialize_layout(run)
+            (run / "serial.csv").rename(artifact_path(run, "serial.csv"))
+            write_csv(run / "detections.csv", OBJECT_HEADER, [])
+            original = (run / "frames.csv").read_bytes()
+            summary = streaming.build_alignment(run, run, video_validation={
+                "count": 1, "method": "test_sample_count", "error": None})
+            self.assertTrue(align_run_outputs.validation_passed(summary))
+            self.assertEqual(summary["time_base"], "sensors.csv CAMERA_HIGH rp2040Time")
+            self.assertTrue((run / "_metadata" / "alignment_summary.json").exists())
+            self.assertFalse((run / "alignment_summary.json").exists())
+            self.assertEqual((run / "frames.csv").read_bytes(), original)
+            self.assertFalse(list((run / "_metadata").glob(".alignment_index.*")))
 
 
 class AlignmentFailureTests(unittest.TestCase):
@@ -547,6 +568,7 @@ class AlignmentFailureTests(unittest.TestCase):
                     str(
                         Path(__file__).resolve().parents[1]
                         / "scripts"
+                        / "legacy"
                         / "align_run_outputs.py"
                     ),
                     str(run_dir),

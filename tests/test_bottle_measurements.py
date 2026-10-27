@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import unittest
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -18,6 +19,7 @@ from squeakview.apps.operator.gui.bottle_measurements import (
 )
 from squeakview.apps.operator.gui.main_window import (
     BOTTLE_FLUID_PRESETS as LEGACY_BOTTLE_FLUID_PRESETS,
+    MainWindow,
 )
 from squeakview.common.run_context import normalize_bottle_measurements
 
@@ -113,7 +115,7 @@ class BottlePayloadTests(unittest.TestCase):
 
         complete = present_saved_bottles({"complete": True, "warnings": []})
         self.assertFalse(complete.completion_pending)
-        self.assertEqual(complete.status_text, "Measurements saved; bottle weights complete.")
+        self.assertEqual(complete.status_text, "Measurements saved.")
         self.assertIsNone(complete.warning_message)
 
 
@@ -186,11 +188,71 @@ class BottleMeasurementPanelTests(unittest.TestCase):
         self.assertEqual(requested, [True])
 
         self.panel.set_completion_pending(True)
-        self.assertEqual(self.panel.save_button.text(), "Save Final Weights")
-        self.assertIn("#b98335", self.panel.styleSheet())
-        self.panel.set_completion_pending(False)
-        self.assertEqual(self.panel.save_button.text(), "Save Measurements")
+        self.assertEqual(self.panel.save_button.text(), "Save weights")
         self.assertEqual(self.panel.styleSheet(), "")
+        self.panel.set_completion_pending(False)
+        self.assertEqual(self.panel.save_button.text(), "Save weights")
+        self.panel.mark_saved()
+        self.assertEqual(self.panel.save_button.text(), "Saved")
+        self.assertFalse(self.panel.save_button.isEnabled())
+
+    def test_workflow_has_one_instruction_and_only_the_relevant_action(self):
+        self.panel.set_run_state("ready")
+        self.assertEqual(self.panel.phase_label.text(), "Before recording")
+        self.assertIn("automatically", self.panel.status_label.text())
+        self.assertTrue(self.panel.save_button.isHidden())
+        self.assertTrue(self.panel.history_toggle.isHidden())
+        self.panel.set_run_state("recording")
+        self.assertEqual(self.panel.phase_label.text(), "Recording")
+        self.assertTrue(self.panel.save_button.isHidden())
+        self.assertTrue(self.panel.lick_status_label.isHidden())
+        self.assertTrue(self.panel.swap_button.isHidden())
+        self.panel.set_run_state("complete")
+        self.panel.set_completion_pending(True)
+        self.assertEqual(self.panel.phase_label.text(), "Final weights")
+        self.assertFalse(self.panel.save_button.isHidden())
+        self.assertEqual(self.panel.styleSheet(), "")
+        self.panel.set_completion_pending(False)
+        self.panel.mark_saved()
+        self.assertEqual(self.panel.phase_label.text(), "Final weights")
+        self.assertEqual(self.panel.save_button.text(), "Saved")
+        self.assertEqual(self.panel.styleSheet(), "")
+
+    def test_editing_any_measurement_restores_save_button_without_changing_heading(self):
+        self.panel.set_run_state("complete")
+        for widget, change in (
+            (self.panel.left_fluid_combo, lambda widget: widget.setCurrentText("water")),
+            (self.panel.right_initial_weight_edit, lambda widget: widget.setText("100")),
+            (self.panel.left_final_weight_edit, lambda widget: widget.setText("95")),
+            (self.panel.mouse_weight_edit, lambda widget: widget.setText("25")),
+        ):
+            self.panel.mark_saved()
+            self.panel.apply_swap_snapshot({}, recording=False, busy=False)
+            self.assertEqual(self.panel.save_button.text(), "Saved")
+            change(widget)
+            self.assertEqual(self.panel.save_button.text(), "Save weights")
+            self.assertTrue(self.panel.save_button.isEnabled())
+            self.assertEqual(self.panel.phase_label.text(), "Final weights")
+
+    def test_saving_refreshes_the_secondary_controller_details(self):
+        self.panel.left_fluid_combo.setCurrentText("water")
+        self.panel.left_initial_weight_edit.setText("33")
+        self.panel.left_final_weight_edit.setText("30")
+        controller = SimpleNamespace(_terminal_refresh_pending=False, refresh=mock.Mock())
+        backend = SimpleNamespace(
+            current_snapshot=SimpleNamespace(run_dir="run"),
+            save_bottle_measurements=mock.Mock(return_value={"complete": True}),
+        )
+        view = SimpleNamespace(
+            bottle_panel=self.panel, backend=backend, _bottle_swap_controller=controller,
+            _collect_bottle_payload=self.panel.collect_payload,
+            _set_bottle_completion_pending=self.panel.set_completion_pending,
+            _set_bottle_status=self.panel.set_status, _emit_log=mock.Mock(),
+        )
+        MainWindow._on_save_bottles(view)
+        self.assertTrue(controller._terminal_refresh_pending)
+        controller.refresh.assert_called_once_with()
+        self.assertEqual(self.panel.status_label.text(), "Measurements saved.")
 
     def test_clear_final_fields_does_not_clear_initial_measurements(self) -> None:
         self.panel.left_initial_weight_edit.setText("10")
@@ -202,6 +264,39 @@ class BottleMeasurementPanelTests(unittest.TestCase):
         self.assertEqual(self.panel.left_initial_weight_edit.text(), "10")
         self.assertEqual(self.panel.left_final_weight_edit.text(), "")
         self.assertEqual(self.panel.right_final_weight_edit.text(), "")
+
+    def test_start_validates_initial_entries_and_rejects_unsaved_previous_finals(self):
+        view = SimpleNamespace(
+            bottle_panel=self.panel, _config_data={}, _preview_window_id=None,
+            project=object(), _collect_bottle_payload=self.panel.collect_payload,
+        )
+        self.panel.mouse_weight_edit.setText("bad")
+        with mock.patch("squeakview.apps.operator.gui.main_window.build_launch_config") as build:
+            with self.assertRaisesRegex(ValueError, "Mouse weight must be a number"):
+                MainWindow._build_launch_config(view)
+            build.assert_not_called()
+            self.panel.mouse_weight_edit.setText("25.5")
+            self.panel.left_fluid_combo.setCurrentText("water")
+            self.panel.left_initial_weight_edit.setText("100")
+            MainWindow._build_launch_config(view)
+            self.assertEqual(build.call_args.kwargs['bottles']['left']['initial_weight_g'], 100)
+            self.assertEqual(build.call_args.kwargs['bottles']['mouse_weight_g'], 25.5)
+            self.panel._current_bottle_ids = {'left': 'l1'}
+            self.panel.left_final_weight_edit.setText("95")
+            with self.assertRaisesRegex(ValueError, "Save the previous run"):
+                MainWindow._build_launch_config(view)
+
+    def test_reconfiguring_next_session_keeps_previous_final_weights_saveable(self):
+        view = SimpleNamespace(
+            bottle_panel=self.panel, run_state_label=mock.Mock(),
+            backend=SimpleNamespace(current_snapshot=SimpleNamespace(run_dir=None)),
+        )
+        MainWindow._set_run_state(view, "ready")
+        self.assertFalse(self.panel.save_button.isEnabled())
+        view.backend.current_snapshot.run_dir = "previous-run"
+        MainWindow._set_run_state(view, "ready")
+        self.assertTrue(self.panel.left_final_weight_edit.isEnabled())
+        self.assertTrue(self.panel.save_button.isEnabled())
 
 
 if __name__ == "__main__":

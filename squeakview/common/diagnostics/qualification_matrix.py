@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import json
 import math
 from itertools import product
@@ -603,10 +605,10 @@ def _provenance_evidence(
     # matrix can report factor/provenance mismatches for every cell instead of
     # aborting the complete report.
     manifest = run_context.read_json(
-        Path(run_dir) / run_context.RUN_MANIFEST_FILENAME
+        artifact_path(Path(run_dir), run_context.RUN_MANIFEST_FILENAME)
     )
     status = run_context.read_json(
-        Path(run_dir) / run_context.RUN_STATUS_FILENAME
+        artifact_path(Path(run_dir), run_context.RUN_STATUS_FILENAME)
     )
     git = manifest.get("git") if isinstance(manifest.get("git"), Mapping) else {}
     observability = (
@@ -617,7 +619,7 @@ def _provenance_evidence(
     identity = _model_identity(manifest)
     device_identity = canonical_runtime_identity(manifest)
     camera_runtime = run_context.read_json(
-        Path(run_dir) / "diagnostics/camera_runtime.json"
+        artifact_path(Path(run_dir), "diagnostics/camera_runtime.json")
     )
     acquisition_identity = canonical_acquisition_identity(manifest, camera_runtime)
     qualification_binding = manifest.get("qualification")
@@ -853,7 +855,7 @@ def qualify_matrix(
         assigned_dirs.add(run_dir)
         summary = qualifier(Path(run_dir), limits_path=limits_path)
         summary_identity = stable_file_identity(
-            Path(run_dir) / "qualification_summary.json",
+            artifact_path(Path(run_dir), "qualification_summary.json"),
             max_bytes=run_context.MAX_RUN_METADATA_BYTES,
         )
         mismatches = _factor_mismatches(case, summary)

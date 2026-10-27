@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Qt-free owner for one GUI lease and one :class:`OperatorBackend`."""
 
+from squeakview.common.run_layout import artifact_path
+
 import dataclasses
 import enum
 import json
@@ -638,7 +640,7 @@ class SupervisorServer:
                 run_dir = snapshot.run_dir
                 if run_dir is not None and not isinstance(run_dir, (str, Path)):
                     run_dir = None
-                directory = (Path(run_dir) / "diagnostics" if run_dir is not None
+                directory = (artifact_path(Path(run_dir), "diagnostics") if run_dir is not None
                              else self.runtime_context.user.state / "logs")
                 directory.mkdir(parents=True, exist_ok=True)
                 path = directory / "supervisor_recovery.jsonl"

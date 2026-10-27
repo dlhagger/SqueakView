@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import json
 import os
 import platform
@@ -91,7 +93,7 @@ class GuiStallDiagnostics:
         run_dir = self._run_dir
         if run_dir is None:
             return
-        path = run_dir / "diagnostics" / "gui_stalls.jsonl"
+        path = artifact_path(run_dir, "diagnostics") / "gui_stalls.jsonl"
         try:
             used = self._written.get(path)
             if used is None:

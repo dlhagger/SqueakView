@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -89,7 +91,7 @@ def build_pipeline(
             )
             add_inference_input_branch(pipeline, config, index, recording.tee)
 
-        inference_dir = run_dir / "inference"
+        inference_dir = artifact_path(run_dir, "inference")
         inference_dir.mkdir(parents=True, exist_ok=True)
         frames = FrameCsvOperator(
             inference_dir / "frames.csv",

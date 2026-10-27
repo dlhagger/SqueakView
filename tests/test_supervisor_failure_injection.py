@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from scripts import inject_supervisor_failure as injection
+from scripts.qualification import inject_supervisor_failure as injection
 
 
 class SupervisorFailureInjectionTests(unittest.TestCase):

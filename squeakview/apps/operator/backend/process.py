@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Subprocess helpers for the operator GUI."""
 
+from squeakview.common.run_layout import artifact_path
+
 import copy
 import hashlib
 import json
@@ -121,7 +123,7 @@ def _localize_deepstream_config(
         ) from exc
 
     config_dir = config_path.parent
-    localized_dir = Path(run_dir) / "config"
+    localized_dir = artifact_path(Path(run_dir), "config")
     localized_config = localized_dir / config_path.name
     class_labels_target = localized_dir / f"{config_path.stem}.classes.txt"
     class_labels_payload: str | None = None
@@ -447,7 +449,7 @@ def spawn_inference(
         else:
             emit(f"【DS】 WARN: FLIR direct plugin build directory not found: {plugin_dir}")
     output_log_path = (
-        Path(config.run_dir) / "diagnostics" / "deepstream.log"
+        artifact_path(Path(config.run_dir), "diagnostics") / "deepstream.log"
         if config.run_dir is not None
         else None
     )
@@ -498,7 +500,7 @@ def spawn_post_run(
         else package_root
     )
     env["PYTHONUNBUFFERED"] = "1"
-    log_path = Path(run_dir) / "diagnostics" / "post_run.log"
+    log_path = artifact_path(Path(run_dir), "diagnostics") / "post_run.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("ab", buffering=0)
     try:

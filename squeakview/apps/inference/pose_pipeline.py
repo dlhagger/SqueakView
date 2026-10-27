@@ -366,7 +366,7 @@ class ObservationOperator(BatchMetadataOperator):
         self.source_name = str(source_name)
         self._lock = threading.Lock()
         self._closed = False
-        self.persistence = PoseCsvWriter(run_dir)
+        self.persistence = PoseCsvWriter(run_dir, schema.keypoint_names)
         # Retain these implementation attributes for compatibility with local
         # diagnostics that inspected the former inline writer.
         self._files = self.persistence._files
@@ -498,7 +498,9 @@ class ObservationOperator(BatchMetadataOperator):
                             detector_bbox.get("w", ""), detector_bbox.get("h", ""),
                             float(rect.left), float(rect.top), float(rect.width), float(rect.height),
                             int(pose is not None), pose.get("schema_version", "") if pose else "",
-                        ]
+                        ],
+                        host_unix_ns=flir.get("host_received_unix_ns", flir.get("host_unix_ns", "")),
+                        host_monotonic_ns=flir.get("host_received_monotonic_ns", flir.get("host_monotonic_ns", ""))
                     )
                     if pose:
                         self.persistence.write_keypoints(

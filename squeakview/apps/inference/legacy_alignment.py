@@ -1,6 +1,8 @@
 """Disk-backed, bounded-memory alignment for long SqueakView runs."""
 from __future__ import annotations
 
+from squeakview.common.run_layout import artifact_path
+
 import csv
 import json
 import os
@@ -591,15 +593,18 @@ def build_alignment(
     run_dir = raw_run_dir.resolve()
     raw_out_dir.mkdir(parents=True, exist_ok=True)
     out_dir = raw_out_dir.resolve()
+    if out_dir == run_dir:
+        out_dir = artifact_path(run_dir, "alignment_summary.json").parent
+        out_dir.mkdir(parents=True, exist_ok=True)
     if not out_dir.is_dir():
         raise ValueError(f"alignment output is not a directory: {out_dir}")
-    frames_path, serial_path = run_dir / "frames.csv", run_dir / "serial.csv"
-    objects_path = Path(objects_path).absolute() if objects_path else run_dir / "objects.csv"
+    frames_path, serial_path = artifact_path(run_dir, "frames.csv"), artifact_path(run_dir, "serial.csv")
+    objects_path = Path(objects_path).absolute() if objects_path else artifact_path(run_dir, "objects.csv")
     evidence_paths = {
         "frames": frames_path,
         "serial": serial_path,
-        "errors": run_dir / "diagnostics" / "errors.csv",
-        "video": run_dir / "raw.mp4",
+        "errors": artifact_path(run_dir, "diagnostics") / "errors.csv",
+        "video": artifact_path(run_dir, "raw.mp4"),
     }
     if include_objects:
         evidence_paths["objects"] = objects_path
@@ -714,10 +719,10 @@ def build_alignment(
                 and within is not False
             ),
         })
-        decoded = _video_validation(run_dir / "raw.mp4", video_validation)
+        decoded = _video_validation(artifact_path(run_dir, "raw.mp4"), video_validation)
         video_frames = decoded["count"]
         video_info = {
-            "file": str(run_dir / "raw.mp4"),
+            "file": str(artifact_path(run_dir, "raw.mp4")),
             "file_name": "raw.mp4",
             "decoded_frames": video_frames,
             "frame_count_method": decoded.get("method"),
@@ -726,14 +731,14 @@ def build_alignment(
         summary = {
             "schema_version": "2.0",
             "run_dir": str(run_dir), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "time_base": "serial.csv CAMERA_HIGH rp2040Time",
+            "time_base": f"{serial_path.name} CAMERA_HIGH rp2040Time",
             "frame_alignment_rule": "camera_frame_id = CAMERA_HIGH count + dynamic offset",
             "frame_alignment": epoch,
             "start_marker_seen": serial["start_marker_seen"],
             "counts": {"recorded_frames": frames["count"], "camera_high_events": serial["camera_high_events"],
                        "serial_rows": serial["serial_rows"],
                        "object_observations": observations["count"] if include_objects else None,
-                       "drop_events": _data_rows(run_dir / "diagnostics" / "errors.csv"),
+                       "drop_events": _data_rows(artifact_path(run_dir, "diagnostics") / "errors.csv"),
                        "frame_gaps_detected": frames["gap_count"],
                        "camera_frames_missing": frames["missing_camera_frames"],
                        "frames_missing_ttl": frames["missing_ttl"]},

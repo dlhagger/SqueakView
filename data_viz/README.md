@@ -36,7 +36,8 @@ deferred.
 1. Wait until the GUI reports that capture validation and finalization are
    complete.
 2. Enter and save final bottle weights when the experiment uses them.
-3. Confirm that `run_status.json` contains `"state": "finalized"`.
+3. Confirm that `_metadata/run_manifest.json` contains `"state": "finalized"`
+   (`run_status.json` for historical recordings).
 4. Copy the entire run directory to an external drive, network share, or other
    manually selected destination.
 5. Copy that complete directory to the DGX Spark.
@@ -59,26 +60,27 @@ runs/<experiment>/<subject>/<subject>_<timestamp>_<shortid>/
 
 ## Canonical Run Files
 
-A normal finalized single-camera run contains:
+A new finalized single-camera run contains:
 
 ```text
 raw.mp4                         Authoritative H.264 camera recording
-frames.csv                      One row per recorded frame
-serial.csv                      Decoded compatibility export and host markers
-objects.csv                     Live detector/tracker observations
-keypoints.csv                   Live normalized pose observations
-run_manifest.json               Immutable acquisition and model provenance
-run_status.json                 Lifecycle and validation result
-diagnostics/                    Camera, recording, error, and finalizer records
-  controller_v2.jsonl          Durable CRC-checked controller journal
-  controller_v2_summary.json   Controller transport integrity summary
-config/                         Run-local configuration snapshots
-bottle_setup.json               Bottle setup, when used
-bottle_measurements.csv         Entered bottle weights, when used
-bottle_summary.json             Derived bottle intake, when used
-bottle_history.json             Current/closed bottles and shared lick observation gaps
-bottle_history_events.jsonl      Bottle swap and calibration audit events
+frames.csv                      Frame identity and timing
+sensors.csv                     Sensor events and controller/host messages
+detections.csv                  Pose observations and timing
+weigh_in.csv                    Bottle/mouse measurements and bottle swap journal
+_metadata/
+  run_manifest.json             Provenance, lifecycle status, validation results
+  layout.json                   Run layout marker
+  config/                       Configuration snapshots
+  diagnostics/                  Controller journal and runtime evidence
+  recovery/                     Verified gzip capture/admission/inference ledgers
 ```
+
+Historical recordings retain their original files, including `run_status.json`,
+`serial.csv`, `objects.csv`, and `keypoints.csv`. Readers resolve both layouts.
+For new runs, references to run status below mean the status fields in
+`_metadata/run_manifest.json`; bottle history and audit records are in
+`weigh_in.csv`. Debug and qualification runs retain plain recovery ledgers.
 
 Some optional CSVs may contain only their header when no observations or errors
 occurred. That is not by itself a failure. `run_status.json` and
@@ -108,7 +110,7 @@ absence of lick events during a gap does not mean zero drinking. Inspect
 `bottle_history_events.jsonl` for calibration retries and interruption history.
 Missing final weights produce incomplete intake measurements, and final weights
 above initial weights remain visible with a plausibility warning. Mouse weight is
-run-level metadata in the existing bottle setup/summary and manifest artifacts.
+recorded in `weigh_in.csv` and reflected in the manifest bottle snapshot.
 
 ## DGX Directory Layout
 
@@ -219,3 +221,14 @@ loader. Both sides are unavailable throughout each pause/calibration gap;
 exclude those intervals from observation duration instead of interpreting them
 as zero licking. The helper leaves unrelated sensor events unassigned and
 returns `None` when loading an older run without bottle history.
+
+New recordings use `frames.csv`, `raw.mp4`, `sensors.csv`, `detections.csv`, and
+`weigh_in.csv`, with recovery and provenance artifacts under `_metadata/`.
+The Python loaders resolve both this layout and historical runs. Primary CSVs
+contain native timestamps and labelled controller-time mappings on each row
+after finalization; manual weigh-in times describe entry time.
+
+Bottle history and observation gaps for new runs are loaded directly from
+`weigh_in.csv`, including controller-confirmed swap boundaries and cumulative
+lick counters. Separate bottle-history JSON/JSONL files are only used by older
+recordings.
