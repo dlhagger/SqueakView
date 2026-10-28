@@ -259,15 +259,15 @@ def camera_anchors(journal: pd.DataFrame) -> pd.DataFrame:
     return anchors
 
 
-def controller_events(journal: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFrame:
+def controller_events(journal: pd.DataFrame, anchors: pd.DataFrame, *, timing=None) -> pd.DataFrame:
     """Return controller messages inside the camera epoch in plotting form."""
 
-    start_sequence = int(anchors["sequence"].min())
-    stop_sequence = int(anchors["sequence"].max())
+    start_sequence = timing.start_sequence if timing else int(anchors["sequence"].min())
+    stop_sequence = timing.stop_sequence if timing else int(anchors["sequence"].max())
     active = journal.loc[
         journal["sequence"].between(start_sequence, stop_sequence)
     ].copy()
-    camera_by_sequence = anchors.set_index("sequence")
+    camera_by_sequence = anchors.set_index("sequence") if not anchors.empty else pd.DataFrame()
     records: list[dict[str, Any]] = []
     for row in active.itertuples(index=False):
         payload = str(row.payload_utf8)
@@ -294,7 +294,7 @@ def controller_events(journal: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFr
             "rawLine": payload,
         }
         if int(row.message_type) == 1 and len(parsed) >= 2:
-            values = parsed[:9]
+            values = (parsed + [""] * 9)[:9]
             values.append(",".join(parsed[9:]) if len(parsed) > 9 else "")
             for name, value in zip(EVENT_COLUMNS, values, strict=True):
                 record[name] = value
@@ -314,7 +314,7 @@ def controller_events(journal: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFr
         "value",
     ):
         events[column] = pd.to_numeric(events[column], errors="coerce")
-    epoch_us = int(anchors.iloc[0]["timestamp_us"])
+    epoch_us = timing.start_us if timing else int(anchors.iloc[0]["timestamp_us"])
     events["event_time_s"] = (events["rp2040Time"] - epoch_us) / 1_000_000.0
     return events
 
@@ -359,11 +359,15 @@ def align_frames_v2(frames: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFrame
         )
 
     controller_count = epoch_count + expected_index
-    anchor_count = anchors["count"].to_numpy(dtype=np.int64)
-    anchor_time = anchors["timestamp_us"].to_numpy(dtype=np.int64)
-    estimated_time = np.rint(
-        np.interp(controller_count, anchor_count, anchor_time)
-    ).astype(np.int64)
+    unique_anchors = anchors.drop_duplicates("count", keep="first")
+    anchor_count = unique_anchors["count"].to_numpy(dtype=np.int64)
+    anchor_time = unique_anchors["timestamp_us"].to_numpy(dtype=np.int64)
+    from squeakview.common.v2_timing import camera_time
+    anchor_records = unique_anchors.to_dict("records")
+    estimated_time = np.fromiter(
+        (camera_time(anchor_records, int(count), counts=anchor_count)[0] for count in controller_count),
+        dtype=np.int64, count=len(controller_count),
+    )
     insertion = np.searchsorted(anchor_count, controller_count, side="left")
     exact = (insertion < len(anchor_count)) & (
         anchor_count[np.minimum(insertion, len(anchor_count) - 1)] == controller_count
@@ -388,6 +392,35 @@ def align_frames_v2(frames: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFrame
     return aligned
 
 
+def align_free_running_frames(frames: pd.DataFrame, *, epoch_us: int | None = None) -> pd.DataFrame:
+    """Use exported mappings; never manufacture camera TTL anchors/counts."""
+    if frames.empty or frames["stream_id"].nunique() != 1:
+        raise ValueError("visualization requires one nonempty camera stream")
+    frames = frames.sort_values("source_sequence_index", kind="stable").reset_index(drop=True).copy()
+    expected = np.arange(len(frames), dtype=np.int64)
+    for key in ("source_sequence_index", "raw_frame_index"):
+        if not np.array_equal(pd.to_numeric(frames[key], errors="raise"), expected):
+            raise ValueError(f"{key} is not contiguous from zero")
+    native = pd.to_numeric(frames["camera_timestamp_ns"], errors="raise")
+    if not np.isfinite(native).all() or native.lt(0).any() or not native.diff().dropna().gt(0).all():
+        raise ValueError("camera timestamps are missing or not strictly increasing")
+    methods = frames.get("controller_time_method", pd.Series("unavailable", index=frames.index))
+    if not methods.isin(["host_clock_estimate", "unavailable"]).all():
+        raise ValueError("free-running frames claim unsupported controller timing")
+    times = pd.to_numeric(frames.get("controller_time_us", pd.Series(np.nan, index=frames.index)), errors="raise")
+    if (methods.eq("host_clock_estimate") & ~np.isfinite(times)).any() or (methods.eq("unavailable") & times.notna()).any():
+        raise ValueError("controller timing value/method mismatch")
+    frames["controller_time_method"] = methods
+    frames["frame_controller_us"] = times
+    frames["controller_count"] = pd.Series(pd.NA, dtype="Int64", index=frames.index)
+    frames["video_frame_index"] = expected
+    frames["frame_time_s"] = (native - native.iloc[0]) / 1_000_000_000.0
+    if epoch_us is not None:
+        valid = times.notna()
+        frames.loc[valid, "frame_time_s"] = (times.loc[valid] - epoch_us) / 1_000_000.0
+    return frames
+
+
 def associate_events_to_frames(
     events: pd.DataFrame, frames: pd.DataFrame
 ) -> pd.DataFrame:
@@ -404,7 +437,11 @@ def associate_events_to_frames(
             "frame_controller_us",
             "controller_time_method",
         ]
-    ].sort_values("frame_controller_us")
+    ].dropna(subset=["frame_controller_us"]).sort_values("frame_controller_us")
+    if frame_lookup.empty and not event_rows.empty:
+        raise ValueError("events cannot be associated with frames without a controller clock mapping")
+    frame_lookup["frame_controller_us"] = frame_lookup["frame_controller_us"].astype(np.int64)
+    event_rows["rp2040Time"] = event_rows["rp2040Time"].astype(np.int64)
     associated = pd.merge_asof(
         event_rows,
         frame_lookup,
@@ -423,7 +460,7 @@ def load_v2_run(run_dir: Path) -> V2RunData:
 
     run_dir = Path(run_dir).expanduser().resolve()
     status = _read_json(artifact_path(run_dir, "run_status.json"))
-    if status.get("state") != "finalized":
+    if status.get("state") not in {"finalized", "post_run_complete", "analysis_complete"}:
         raise ValueError(f"run is not finalized: state={status.get('state')!r}")
     if status.get("overall_validation_passed") is not True:
         raise ValueError("run did not pass overall acquisition validation")
@@ -458,16 +495,20 @@ def load_v2_run(run_dir: Path) -> V2RunData:
         journal.iloc[0]["sequence"]
     ):
         raise ValueError("controller summary/journal start sequences disagree")
-    anchors = camera_anchors(journal)
+    from squeakview.common.v2_timing import read_v2_timing, verify_v2_frame_timing
+    triggered = manifest.get("capture", {}).get("trigger_on", True)
+    if manifest.get("capture", {}).get("num_cameras", 1) != 1:
+        raise ValueError("visualization currently requires one camera; use the streaming timing report for multiple cameras")
+    timing = read_v2_timing(run_dir, triggered=triggered)
+    verify_v2_frame_timing(run_dir, triggered=triggered, camera_count=1)
+    anchors = pd.DataFrame.from_records(timing.anchors)
     summary_session = summary.get("session_id")
-    if summary_session is not None and int(summary_session) != int(
-        anchors.iloc[0]["session_id"]
-    ):
+    if summary_session is not None and int(summary_session) != timing.session_id:
         raise ValueError("controller summary/camera session IDs disagree")
-    frames = align_frames_v2(
-        pd.read_csv(artifact_path(run_dir, "frames.csv"), low_memory=False), anchors
-    )
-    events = controller_events(journal, anchors)
+    source_frames = pd.read_csv(artifact_path(run_dir, "frames.csv"), low_memory=False)
+    frames = (align_frames_v2(source_frames, anchors) if triggered else
+              align_free_running_frames(source_frames, epoch_us=timing.start_us))
+    events = controller_events(journal, anchors, timing=timing)
     return V2RunData(
         status=status,
         manifest=manifest,

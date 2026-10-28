@@ -258,6 +258,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 for phase in ("initial", "final"):
                     value = bottle.get(f"{phase}_weight_g")
                     getattr(self.bottle_panel, f"{side}_{phase}_weight_edit").setText("" if value is None else str(value))
+            self.bottle_panel.mark_saved()
             self.dashboard.follow_run_telemetry(artifact_path(snapshot.run_dir, "diagnostics") / "system.csv")
         self._run_controller.handle_backend_event(BackendEvent("phase_changed", snapshot.phase, snapshot.run_dir))
         if snapshot.phase == RunPhase.RECORDING:
@@ -476,27 +477,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bottle_panel.set_completion_pending(pending)
 
     @QtCore.Slot()
-    def _on_save_bottles(self) -> None:
+    def _on_save_bottles(self) -> bool:
         try:
             payload = self._collect_bottle_payload(include_final=True, strict=True)
         except ValueError as exc:
             message = str(exc)
             self._set_bottle_status(message)
             QtWidgets.QMessageBox.warning(self, "Weigh-In", message)
-            return
+            return False
 
         run_dir = self.backend.current_snapshot.run_dir
         if run_dir is None:
             self._set_bottle_status("Measurements pending for next run.")
             self._emit_log("[BOTTLES] no active run; measurements will be saved when the next run starts")
-            return
+            return False
 
         try:
             summary = self.backend.save_bottle_measurements(payload, run_dir=run_dir)
         except Exception as exc:
             self._set_bottle_status("Measurement save failed.")
             self._emit_log(f"[BOTTLES] save failed: {exc}")
-            return
+            return False
 
         presentation = present_saved_bottles(summary)
         self.bottle_panel.mark_saved()
@@ -510,6 +511,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Weigh-In",
                 presentation.warning_message,
             )
+        return True
+
+    def _confirm_measurement_close(self) -> bool:
+        answer = QtWidgets.QMessageBox.question(
+            self, "Unsaved measurements",
+            "Save changes to this run's measurements before closing?",
+            QtWidgets.QMessageBox.StandardButton.Save
+            | QtWidgets.QMessageBox.StandardButton.Discard
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Save,
+        )
+        if answer == QtWidgets.QMessageBox.StandardButton.Save:
+            return self._on_save_bottles()
+        return answer == QtWidgets.QMessageBox.StandardButton.Discard
 
     def _reload_profiles(self) -> None:
         self._session_controller.reload()

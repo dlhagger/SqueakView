@@ -44,6 +44,27 @@ class FakeSerial:
 
 
 class BottleSwapRuntimeTests(unittest.TestCase):
+    def test_recovering_sensors_cannot_create_a_swap_transaction(self):
+        self.backend._bottle_swap.observe_lick_recovery({"state": "RECOVERING", "available": False})
+        self.backend._observe_bottle_runtime()
+        before = self.backend._bottle_swap.snapshot()
+        with self.assertRaisesRegex(ValueError, "recovering"):
+            self.backend.begin_bottle_swap(["left"])
+        after = self.backend._bottle_swap.snapshot()
+        self.assertEqual(after["swap_id"], before["swap_id"])
+        self.assertEqual(after["current"], before["current"])
+
+    def test_recovery_is_persisted_separately_from_bottle_identity(self):
+        before = self.backend._bottle_swap.snapshot()
+        recovery = {"state": "FAILED", "available": False, "recovery_id": 1, "reason": "READINESS_TIMEOUT"}
+        self.backend._bottle_swap.observe_lick_recovery(recovery)
+        after = self.backend._bottle_swap.snapshot()
+        self.assertEqual(after["lick_recovery"], recovery)
+        self.assertEqual(after["state"], before["state"])
+        self.assertEqual(after["current"], before["current"])
+        restored = BottleSwapService(self.run_dir, self.initial).snapshot()
+        self.assertEqual(restored["lick_recovery"], recovery)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

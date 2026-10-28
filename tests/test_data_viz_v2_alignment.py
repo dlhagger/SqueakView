@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import pandas as pd
+from squeakview.common import controller_protocol_v2 as protocol
 
 from data_viz.v2_alignment import (
     associate_events_to_frames,
@@ -159,7 +160,10 @@ class V2AlignmentTests(unittest.TestCase):
             "sequence": sequence,
             "monotonic_us": monotonic_us,
             "payload_utf8": payload,
-            "decoded_hex": "00",
+            "decoded_hex": protocol.cobs_decode(protocol.encode_frame(
+                message_type=message_type, flags=1, boot_id=12_345, session_id=7,
+                sequence=sequence, monotonic_us=monotonic_us, payload=payload.encode(),
+            )[:-1]).hex(),
         }
 
     def _write_journal(self) -> None:
@@ -172,6 +176,8 @@ class V2AlignmentTests(unittest.TestCase):
             json.dumps(
                 {
                     "protocol": "mousehouse_v2",
+                    "boot_id": 12_345,
+                    "session_id": 7,
                     "integrity_latched": False,
                     "counts": {
                         "frames_stored": len(self.rows),
@@ -188,6 +194,12 @@ class V2AlignmentTests(unittest.TestCase):
         initialize_layout(self.run_dir)
         for name in ("run_status.json", "run_manifest.json", "diagnostics"):
             (self.run_dir / name).rename(artifact_path(self.run_dir, name))
+        frames = pd.read_csv(self.run_dir / "frames.csv")
+        frames["controller_time_us"] = [1000, 2000, 3000, 4000]
+        frames["controller_time_method"] = ["exact_anchor", "piecewise_interpolated", "exact_anchor", "exact_anchor"]
+        frames["controller_boot_id"] = 12_345
+        frames["controller_session_id"] = 7
+        frames.to_csv(self.run_dir / "frames.csv", index=False)
         run = load_v2_run(self.run_dir)
         self.assertEqual(run.frames["frame_controller_us"].tolist(), [1000, 2000, 3000, 4000])
         self.assertFalse(run.events.empty)
@@ -251,6 +263,99 @@ class V2AlignmentTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "boot boundary"):
             load_v2_run(self.run_dir)
+
+    def _behavior_only(self, *, mapped=True):
+        manifest_path = self.run_dir / "run_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["serial"]["enabled"] = True
+        manifest["capture"] = {"trigger_on": False, "num_cameras": 1}
+        manifest_path.write_text(json.dumps(manifest))
+        self.rows = [self._journal_row(10, 2, 1000, "ACK_START_BEHAVIOR"),
+                     self._journal_row(11, 1, 2500, "POKE_START,123,2500,L,1,69420,69420,69420,Eligible,nan"),
+                     self._journal_row(12, 2, 5000, "ACK_STOP")]
+        self._write_journal()
+        if mapped:
+            (self.run_dir / "diagnostics" / "clock_validation.json").write_text(json.dumps({
+                "result": "PASS", "before_samples": [{"round_trip_ns": 200,
+                    "rp2040_receive_us": 1000, "rp2040_send_us": 1000,
+                    "jetson_send_ns": 1000000000, "jetson_receive_ns": 1000000200}]}))
+        from squeakview.common.run_outputs import ClockMapping
+        frames = pd.read_csv(self.run_dir / "frames.csv")
+        frames["host_unix_ns"] = [1000000100, 1001000100, 1002000100, 1003000100]
+        mapping = ClockMapping(self.run_dir)
+        pd.DataFrame([mapping.apply(row) for row in frames.to_dict("records")]).to_csv(self.run_dir / "frames.csv", index=False)
+
+    def test_free_running_uses_labelled_estimates_without_ttl_counts(self):
+        self._behavior_only()
+        run = load_v2_run(self.run_dir)
+        self.assertTrue(run.anchors.empty)
+        self.assertTrue(run.frames["controller_count"].isna().all())
+        self.assertEqual(run.frames["controller_time_method"].unique().tolist(), ["host_clock_estimate"])
+        self.assertEqual(run.frames["frame_controller_us"].tolist(), [1000, 2000, 3000, 4000])
+        associated = associate_events_to_frames(run.events, run.frames)
+        self.assertEqual(int(associated.loc[associated.eventType.eq("POKE_START"), "raw_frame_index"].iloc[0]), 1)
+
+    def test_unavailable_free_running_clock_stays_unavailable(self):
+        self._behavior_only(mapped=False)
+        run = load_v2_run(self.run_dir)
+        self.assertTrue(run.frames.frame_controller_us.isna().all())
+        with self.assertRaisesRegex(ValueError, "without a controller clock mapping"):
+            associate_events_to_frames(run.events, run.frames)
+
+    def test_changed_exported_clock_mapping_is_rejected(self):
+        self._behavior_only()
+        frames = pd.read_csv(self.run_dir / "frames.csv")
+        frames.loc[1, "controller_time_us"] += 1
+        frames.to_csv(self.run_dir / "frames.csv", index=False)
+        with self.assertRaisesRegex(ValueError, "mapping disagrees"):
+            load_v2_run(self.run_dir)
+
+    def test_rejects_journal_projection_disagreeing_with_crc_bytes(self):
+        self.rows[1]["payload_utf8"] = "changed"
+        self._write_journal()
+        with self.assertRaisesRegex(ValueError, "payload disagrees"):
+            load_v2_run(self.run_dir)
+
+    def test_one_frame_epoch_stop_and_multi_camera_timing(self):
+        from squeakview.common.v2_timing import verify_v2_frame_timing
+        self.rows = [self._journal_row(10, 3, 1000, "CAMERA_EPOCH,count=1,timestamp_us=1000,period_us=1000,pulse_us=10,health=0x3,queue=0/8,suppressed=0,reason=Start"),
+                     self._journal_row(11, 5, 1100, "CAMERA_STOP,count=1,timestamp_us=1000,period_us=1000,pulse_us=10,health=0x1,queue=0/8,suppressed=0,reason=StopCommand")]
+        self._write_journal()
+        frames = pd.read_csv(self.run_dir / "frames.csv").iloc[:1]
+        frames.to_csv(self.run_dir / "frames.csv", index=False)
+        self.assertEqual(load_v2_run(self.run_dir).frames.frame_controller_us.tolist(), [1000])
+        frames["stream_id"] = 1
+        frames.to_csv(self.run_dir / "frames_cam1.csv", index=False)
+        self.assertEqual(len(verify_v2_frame_timing(self.run_dir, triggered=True, camera_count=2)["cameras"]), 2)
+
+    def test_qualification_dispatch_and_derived_reports(self):
+        from squeakview.common.diagnostics.qualification import _integrity_gates
+        from squeakview.common.analysis_timing import summarize_recording_timing
+        for triggered in (True, False):
+            if not triggered:
+                self._behavior_only()
+            manifest = json.loads((self.run_dir / "run_manifest.json").read_text())
+            manifest["serial"]["enabled"] = True
+            manifest.setdefault("capture", {})["trigger_on"] = triggered
+            manifest["capture"]["num_cameras"] = 1
+            (self.run_dir / "run_manifest.json").write_text(json.dumps(manifest))
+            gates = _integrity_gates({}, manifest, self.run_dir)
+            self.assertTrue(gates["alignment_validated_when_required"])
+            self.assertTrue(gates["v2_controller_timing_validated_when_required"])
+            with tempfile.TemporaryDirectory() as output:
+                report = summarize_recording_timing(self.run_dir, Path(output), video_validation={"count": 4})
+                self.assertTrue(report["validation"]["passed"])
+            self.rows.pop()
+            self._write_journal()
+            gates = _integrity_gates({}, manifest, self.run_dir)
+            self.assertFalse(gates["v2_controller_timing_validated_when_required"])
+
+    def test_native_timing_report_requires_no_controller(self):
+        from squeakview.common.analysis_timing import summarize_recording_timing
+        (self.run_dir / "run_manifest.json").write_text(json.dumps({"serial": {"enabled": False}, "capture": {"trigger_on": False}}))
+        with tempfile.TemporaryDirectory() as output:
+            report = summarize_recording_timing(self.run_dir, Path(output), video_validation={"count": 4})
+            self.assertEqual(report["timing"]["method"], "camera_native")
 
 
 if __name__ == "__main__":

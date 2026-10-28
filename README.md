@@ -895,6 +895,25 @@ The form is locked during startup, recording, and finalization. After **Stop
 Recording** finishes, enter final bottle weights and click **Save weights**.
 The panel shows the current stage and next action without warning borders.
 Live lick counts, swap controls, and history are under **Bottle tools and history**.
+
+With the updated controller firmware, lick sensing automatically recovers from
+chip faults, configuration mismatches, or a contact held active for 5 seconds.
+Autoconfiguration stays enabled; touch/release thresholds remain 2/0 and
+debounce remains 0/0. Recovery preserves cumulative counts, pauses both lick
+channels, and resumes only after configuration verification, settling, and
+confirmed release. Camera recording and the rest of the task continue.
+Retries have a cooldown and a bounded budget; repeated failures leave lick
+sensing unavailable until a successful manual bottle recalibration or a new
+recording. These limits still require physical-rig checks before production use.
+
+The Weigh-In card shows recovering/unavailable status even when bottle tools
+are collapsed. Recovery is separate from bottle-swap state and never changes
+bottle identities. Timestamped `LICK_RECOVERY_*` events in `sensors.csv` record
+per-side absolute counts, observation-gap duration, attempt count, and recovery
+ID; `MPR121_DIAG` rows preserve signal and register diagnostics. Updating the
+application alone does not enable recovery: flash the matching task firmware
+onto each RP2040 controller after stopping recording. Older firmware remains
+readable but does not provide the new recovery status.
 Status polls preserve
 unsaved entries, and a new recording cannot clear unsaved final weights. Mouse
 weight must be a positive finite number; empty fields remain optional. Check

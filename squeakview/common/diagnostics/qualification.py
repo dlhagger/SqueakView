@@ -802,7 +802,7 @@ def _task_config_snapshot_valid(run_dir: Path, manifest: dict[str, Any]) -> bool
         not isinstance(original_path, str)
         or not original_path.strip()
         or not isinstance(relative_path, str)
-        or relative_path != "config/task.yaml"
+        or relative_path not in {"config/task.yaml", "_metadata/config/task.yaml"}
         or not _valid_sha256(expected_hash)
         or expected_size is None
         or expected_size < 0
@@ -811,6 +811,9 @@ def _task_config_snapshot_valid(run_dir: Path, manifest: dict[str, Any]) -> bool
         return False
     path = artifact_path(run_dir, relative_path)
     try:
+        if (not path.resolve().is_relative_to(Path(run_dir).resolve()) or
+            any(part.is_symlink() for part in (path, *path.parents) if part != Path(run_dir) and part.is_relative_to(run_dir))):
+            return False
         raw = read_stable_regular_file(
             path, max_bytes=MAX_TASK_CONFIG_BYTES, label="task config snapshot"
         )
@@ -853,7 +856,8 @@ def _integrity_gates(
     reconciliation = status.get("capture_reconciliation")
     serial_enabled = bool((manifest.get("serial") or {}).get("enabled"))
     trigger_enabled = (manifest.get("capture") or {}).get("trigger_on") is True
-    alignment_required = serial_enabled and trigger_enabled
+    protocol_v2 = (manifest.get("serial") or {}).get("controller_protocol") == "v2"
+    alignment_required = serial_enabled and trigger_enabled and not protocol_v2
     capture_exit_code = status.get("capture_exit_code")
     parsed_exit_code = _optional_int(capture_exit_code)
     inference = (
@@ -954,6 +958,17 @@ def _integrity_gates(
             and isinstance(validation, dict)
             and validation.get("video_frame_count_matches_frames_csv") is True
         )
+
+    def v2_timing_valid() -> bool | None:
+        if not serial_enabled or not protocol_v2:
+            return True
+        from squeakview.common.v2_timing import verify_v2_frame_timing
+        try:
+            verify_v2_frame_timing(run_dir, triggered=trigger_enabled,
+                                   camera_count=(manifest.get("capture") or {}).get("num_cameras"))
+            return True
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return False
 
     def recording_validation_valid() -> bool:
         if (
@@ -1223,6 +1238,7 @@ def _integrity_gates(
         "alignment_validated_when_required": (
             alignment_valid() if alignment_required else True
         ),
+        "v2_controller_timing_validated_when_required": v2_timing_valid(),
         "overall_validation_passed": (
             bool(status.get("overall_validation_passed"))
             if "overall_validation_passed" in status
@@ -1411,7 +1427,7 @@ def qualify_run(
         else False
     )
     trigger_enabled = capture.get("trigger_on") is True
-    alignment_required = serial_enabled and trigger_enabled
+    alignment_required = serial_enabled and trigger_enabled and serial_config.get("controller_protocol") != "v2"
     alignment_summary: dict[str, Any] | None = None
     alignment_identity: dict[str, object] | None = None
     if alignment_required:

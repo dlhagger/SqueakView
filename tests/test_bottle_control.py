@@ -4,7 +4,7 @@ import threading
 import unittest
 from unittest import mock
 
-from squeakview.common.bottle_control import parse_bottle_state
+from squeakview.common.bottle_control import parse_bottle_state, parse_lick_recovery
 from squeakview.common.serial import SerialHandle
 from squeakview.common import controller_protocol_v2 as v2
 
@@ -17,6 +17,41 @@ def line(state="PAUSED", identity=IDENTITY, left=7, right=11, stamp=100):
 
 
 class BottleControlTests(unittest.TestCase):
+    def test_recovery_status_preserves_counts_and_bottle_transaction(self):
+        handle = self.handle()
+        handle._ingest_bottle_line(line("ACTIVE", left=21, right=16))
+        for event, stamp, gap, attempt in (("START", 1000, 0, 0), ("ATTEMPT", 1010, 10, 1),
+                                           ("RETRY", 2000, 1000, 1), ("READY", 800000, 799000, 2)):
+            for side, count in (("LD", 21), ("RD", 16)):
+                handle._ingest_bottle_line(f"LICK_RECOVERY_{event},1,{stamp},{side},{count},{gap},{attempt},1,task,READY")
+            snapshot = handle.bottle_control_snapshot
+            self.assertEqual(snapshot["counts"], {"left": 21, "right": 16})
+            self.assertEqual(snapshot["controller"]["swap_id"], IDENTITY)
+            self.assertEqual(snapshot["controller"]["state"], "ACTIVE")
+            self.assertEqual(snapshot["lick_recovery"]["available"], event == "READY")
+            self.assertEqual(snapshot["lick_recovery"]["gap_start_us"], 1000)
+        handle._ingest_bottle_line("ACK_START,1,2,nan,30,nan,nan,nan,task,nan")
+        self.assertIsNone(handle.bottle_control_snapshot["lick_recovery"])
+
+    def test_recovery_decoder_rejects_malformed_fields(self):
+        valid = "LICK_RECOVERY_FAILED,1,1000,LD,21,100,3,1,task,READINESS_TIMEOUT"
+        self.assertEqual(parse_lick_recovery(valid)["state"], "FAILED")
+        for malformed in (valid.replace("FAILED", "BOGUS"), valid.replace(",LD,", ",LEFT,"),
+                          valid.replace(",100,3,", ",100,4,"), valid.replace(",100,3,", ",1001,3,"),
+                          valid.replace(",21,", ",-1,")):
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                parse_lick_recovery(malformed)
+
+    def test_recovery_events_use_standard_csv_fields_and_direct_timestamps(self):
+        from squeakview.common.sensor_csv import make_event_record, EVENT_FIELDS
+        text = "LICK_RECOVERY_READY,12345,1000,LD,21,900,1,1,task,READY"
+        row = make_event_record(text.split(","), text, host_unix_ns=5, host_monotonic_ns=6)
+        self.assertEqual(row["eventType"], "LICK_RECOVERY_READY")
+        self.assertEqual(row["controller_time_us"], 1000)
+        self.assertEqual(row["controller_time_method"], "direct_event")
+        self.assertEqual(row["count"], "21")
+        self.assertTrue(all(field in row for field in EVENT_FIELDS))
+
     def handle(self):
         handle = SerialHandle("/unused", 115200, lambda _line: None)
         handle._protocol_mode = "v2"

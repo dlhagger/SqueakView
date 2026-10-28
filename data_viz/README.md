@@ -151,9 +151,25 @@ v2 journals, controller boot boundaries, malformed camera anchors, and final
 controller/frame count mismatches. Write resulting Parquet tables under the
 matching analysis-results directory, never into the copied source run.
 
+The v2 loader branches on `capture.trigger_on`. Triggered frames use exact
+camera anchors and integer interpolation between them. Free-running frames use
+the exported `host_clock_estimate` mapping and behavior start/stop boundaries;
+they have no controller trigger counts. Missing clock evidence stays
+`unavailable`, and event-to-frame association is disabled for those frames.
+The demonstration notebook accepts one camera; multi-camera timing checks use
+the streaming `summarize_recording_timing` helper.
+
 Runs recorded without serial input do not contain the RP2040 time base required
 by this workflow. For those runs, use the recording and capture reconciliation
 results in `run_status.json`.
+
+Offline replay and post-run timing reports dispatch separately for legacy
+triggered, v2 triggered, v2 free-running, and serial-disabled recordings.
+Legacy triggered recordings retain the per-edge aligner. Native-only reports
+use the camera clock without claiming controller synchronization. Offline
+replay rejects multi-camera input before loading the model and preserves source
+hashes, including the manifest and v2 timing evidence. The demonstration
+notebook remains v2-only and rejects other protocols before loading its tables.
 
 ## Demonstration Notebook
 

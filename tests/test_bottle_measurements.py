@@ -25,6 +25,16 @@ from squeakview.common.run_context import normalize_bottle_measurements
 
 
 class BottlePayloadTests(unittest.TestCase):
+    def test_close_save_discard_cancel_and_failed_save(self):
+        buttons = QtWidgets.QMessageBox.StandardButton
+        for answer, save_result, expected in ((buttons.Save, True, True), (buttons.Save, False, False),
+                                              (buttons.Discard, False, True), (buttons.Cancel, True, False)):
+            with self.subTest(answer=answer, save_result=save_result):
+                view = SimpleNamespace(_on_save_bottles=mock.Mock(return_value=save_result))
+                with mock.patch("squeakview.apps.operator.gui.main_window.QtWidgets.QMessageBox.question", return_value=answer):
+                    self.assertEqual(MainWindow._confirm_measurement_close(view), expected)
+                self.assertEqual(view._on_save_bottles.called, answer == buttons.Save)
+
     def test_normalization_preserves_supervisor_frozen_side_mappings(self) -> None:
         bottles = MappingProxyType(
             {
@@ -120,6 +130,21 @@ class BottlePayloadTests(unittest.TestCase):
 
 
 class BottleMeasurementPanelTests(unittest.TestCase):
+    def test_recovery_warning_is_visible_without_opening_bottle_history(self):
+        snapshot = {"available": True, "state": "ACTIVE", "lick_recovery": {
+            "state": "RECOVERING", "available": False, "attempts": 1}}
+        self.panel.apply_swap_snapshot(snapshot, recording=True, busy=False)
+        self.assertFalse(self.panel.lick_status_label.isHidden())
+        self.assertIn("recovering", self.panel.lick_status_label.text())
+        self.assertFalse(self.panel.swap_button.isEnabled())
+        snapshot["lick_recovery"]["state"] = "FAILED"
+        self.panel.apply_swap_snapshot(snapshot, recording=True, busy=False)
+        self.assertIn("unavailable", self.panel.lick_status_label.text())
+        self.assertTrue(self.panel.swap_button.isEnabled())
+        snapshot["lick_recovery"]["available"] = True
+        self.panel.apply_swap_snapshot(snapshot, recording=True, busy=False)
+        self.assertTrue(self.panel.lick_status_label.isHidden())
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])

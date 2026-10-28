@@ -58,6 +58,27 @@ RECORDING_HEADERS = [
 
 
 class QualificationTests(unittest.TestCase):
+    def test_compact_task_snapshot_alias_retains_hash_and_path_checks(self):
+        from squeakview.common.run_layout import initialize_layout, artifact_path
+        initialize_layout(self.run_dir)
+        original = self.run_dir / "config" / "task.yaml"
+        target = artifact_path(self.run_dir, "config/task.yaml")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        original.rename(target)
+        identity = self.manifest["task_config"]
+        for alias in ("config/task.yaml", "_metadata/config/task.yaml"):
+            identity["snapshot_path"] = alias
+            self.assertTrue(qualification._task_config_snapshot_valid(self.run_dir, self.manifest))
+        for invalid in ("../task.yaml", "config/../config/task.yaml", "/tmp/task.yaml", "task.yaml"):
+            identity["snapshot_path"] = invalid
+            self.assertFalse(qualification._task_config_snapshot_valid(self.run_dir, self.manifest))
+        identity["snapshot_path"] = "_metadata/config/task.yaml"
+        target.write_bytes(b"changed")
+        self.assertFalse(qualification._task_config_snapshot_valid(self.run_dir, self.manifest))
+        target.unlink()
+        target.symlink_to(original)
+        self.assertFalse(qualification._task_config_snapshot_valid(self.run_dir, self.manifest))
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)

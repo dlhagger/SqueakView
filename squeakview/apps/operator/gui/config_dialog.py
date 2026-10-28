@@ -529,7 +529,7 @@ class ConfigDialog(QtWidgets.QDialog):
                 value, within=self.project.paths.tasks
             ),
             validate_model=lambda path: validate_production_model(
-                path, validator=model_package.validate_model_package
+                path, validator=model_package.inspect_model_package
             ),
         )
         if collection.error is not None:

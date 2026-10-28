@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from squeakview.common import controller_protocol_v2 as protocol_v2
-from squeakview.common.bottle_control import SWAP_ID, parse_bottle_state
+from squeakview.common.bottle_control import SWAP_ID, parse_bottle_state, parse_lick_recovery
 from squeakview.common.failure_injection import FailurePlan
 from squeakview.common.controller_watchdog import (
     ControllerCapabilities,
@@ -178,6 +178,7 @@ class SerialHandle:
         self._bottle_generation = 0
         self._bottle_responses: deque[tuple[int, dict[str, object]]] = deque(maxlen=32)
         self._bottle_state: dict[str, object] | None = None
+        self._lick_recovery: dict[str, object] | None = None
         self._bottle_counts = {"left": 0, "right": 0}
         self._protocol_mode = "v1"
         self._protocol_v2_pending = False
@@ -1232,7 +1233,13 @@ class SerialHandle:
             if line.startswith(("ACK_START,", "ACK_START_BEHAVIOR,")):
                 self._bottle_counts = {"left": 0, "right": 0}
                 self._bottle_state = None
+                self._lick_recovery = None
                 self._bottle_responses.clear()
+            elif line.startswith("LICK_RECOVERY_"):
+                recovery = parse_lick_recovery(line)
+                side, count = recovery.pop("side"), recovery.pop("count")
+                self._bottle_counts[side] = max(self._bottle_counts[side], count)
+                self._lick_recovery = recovery
             elif line.startswith("BOTTLE_STATE,"):
                 state = parse_bottle_state(line)
                 self._bottle_generation += 1
@@ -1256,6 +1263,7 @@ class SerialHandle:
             return {
                 "controller": dict(self._bottle_state) if self._bottle_state else None,
                 "counts": dict(self._bottle_counts),
+                "lick_recovery": dict(self._lick_recovery) if self._lick_recovery else None,
             }
 
     def exchange_bottle_control(

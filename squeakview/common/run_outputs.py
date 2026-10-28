@@ -139,6 +139,8 @@ def append_weigh_records(run_dir, rows, *, deduplicate=False):
 
 
 def write_weigh_in(run_dir, bottles):
+    from .measurements import validate_bottle_inputs
+    validate_bottle_inputs(bottles)
     with _WEIGH_LOCK:
         _write_weigh_in(run_dir, bottles)
 
@@ -157,12 +159,12 @@ def _write_weigh_in(run_dir, bottles):
     for entry in entries:
         for phase in ("initial", "final"):
             weight = entry.get(f"{phase}_weight_g")
-            if weight is not None:
+            if f"{phase}_weight_g" in entry:
                 desired.append(dict(measurement_type="bottle", bottle_id=entry["bottle_id"],
                     side=entry["side"], fluid=entry.get("fluid", ""), phase=phase,
                     weight_g=weight, note=entry.get("note", "")))
     mouse_weight = (bottles or {}).get("mouse_weight_g")
-    if mouse_weight is not None and float(mouse_weight) > 0:
+    if "mouse_weight_g" in (bottles or {}):
         desired.append(dict(measurement_type="mouse", bottle_id="", side="", fluid="",
                             phase="weigh_in", weight_g=mouse_weight, note=""))
     latest = {}
@@ -177,7 +179,15 @@ def _write_weigh_in(run_dir, bottles):
     additions = []
     for row in desired:
         previous = latest.get(key(row))
-        if previous and all(str(previous.get(name, "")) == str(row.get(name, "")) for name in ("fluid", "note")) and float(previous["weight_g"]) == float(row["weight_g"]):
+        previous_weight = float(previous["weight_g"]) if previous and previous.get("weight_g") not in (None, "") else None
+        new_weight = float(row["weight_g"]) if row["weight_g"] not in (None, "") else None
+        # Blank weights are explicit clears only after a value existed. They
+        # remain ordinary timestamped measurement rows for older CSV readers.
+        if new_weight is None:
+            if previous_weight is None:
+                continue
+            row["event"] = "measurement_cleared"
+        if previous and all(str(previous.get(name, "")) == str(row.get(name, "")) for name in ("fluid", "note")) and previous_weight == new_weight:
             continue
         row.update(record_type="measurement", mouse_id=manifest.get("mouse_id") or _json(artifact_path(run_dir, "run_status.json")).get("mouse_id") or "", entered_at_unix_ns=now,
                    entered_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now / 1e9)),

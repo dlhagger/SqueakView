@@ -50,6 +50,33 @@ build, and the tests. Update and cleanup commands must never target
 checkout are replaceable application artifacts, while everything under the
 projects directory is durable data.
 
+Model selection reads metadata without initializing CUDA or hashing large
+engine files. Start performs authoritative artifact hash and device identity
+checks. Device probing runs in a separate process with a 45-second timeout;
+that process exits before capture starts. There is no cached validation result
+that could accept a changed model artifact.
+
+Changing the native pose parser requires rebuilding the native library and
+rebuilding the project model package through Project Setup. Schema-3 packages
+pin their packaged parser hash; rebuilding the application library alone does
+not update those copies. Keep the existing package until the replacement has
+completed its normal build checks.
+
+## Weigh-in edits
+
+Enter fluid types, initial bottle weights, and mouse weight before Start.
+After Stop, enter final bottle weights and save. Saving changes the button to
+Saved. Editing a saved value enables Save again. Closing with unsaved run
+measurements offers Save, Discard, or Cancel; a failed save keeps the window
+open.
+
+Clearing a previously saved weight appends a timestamped measurement row with
+an empty weight and `event=measurement_cleared` in `weigh_in.csv`. Readers use
+the latest value, including that clear, while earlier measurements remain in
+history. Repeating the same clear adds no duplicate row. GUI and backend
+inputs share the existing 100,000 g upper bound, reject nonfinite/negative
+values, allow zero bottle weight, and require positive mouse weight.
+
 ## Launch and project selection
 
 Start SqueakView from the application checkout:

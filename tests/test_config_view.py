@@ -235,7 +235,7 @@ class ConfigDialogCompatibilityTest(unittest.TestCase):
             with (
                 mock.patch.object(
                     model_package,
-                    "validate_model_package",
+                    "inspect_model_package",
                     side_effect=model_package.ModelPackageError("schema mismatch"),
                 ),
                 mock.patch.object(QtWidgets.QMessageBox, "warning") as warning,

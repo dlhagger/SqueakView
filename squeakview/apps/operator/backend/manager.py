@@ -545,6 +545,8 @@ class OperatorBackend:
     def _save_bottle_measurements(
         self, bottles: dict[str, Any] | None, run_dir: Path | None = None,
     ) -> dict[str, Any]:
+        from squeakview.common.measurements import validate_bottle_inputs
+        validate_bottle_inputs(bottles)
         target = Path(run_dir) if run_dir is not None else self.state.run_dir
         if target is None:
             raise RuntimeError("no active run directory for bottle metadata")
@@ -598,6 +600,7 @@ class OperatorBackend:
             return
         for side, count in observed.get("counts", {}).items():
             service.observe_lick(side, count)
+        service.observe_lick_recovery(observed.get("lick_recovery"))
         controller = observed.get("controller")
         if controller and controller != self._bottle_last_controller:
             service.observe_controller(controller)

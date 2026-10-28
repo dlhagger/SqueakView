@@ -58,6 +58,19 @@ def _lifecycle_view() -> SimpleNamespace:
 
 
 class RunPresenterTests(unittest.TestCase):
+    def test_dirty_measurements_must_be_resolved_before_shutdown(self):
+        for confirmed in (False, True):
+            with self.subTest(confirmed=confirmed):
+                view = _lifecycle_view()
+                view.bottle_panel = SimpleNamespace(has_unsaved_measurements=lambda: True)
+                view._confirm_measurement_close = mock.Mock(return_value=confirmed)
+                controller = RunLifecycleController(view)
+                event = mock.Mock()
+                self.assertEqual(controller.request_window_close(event), confirmed)
+                view._confirm_measurement_close.assert_called_once()
+                self.assertEqual(view.backend.shutdown.called, confirmed)
+                self.assertEqual(event.ignore.called, not confirmed)
+
     def test_clock_preflight_event_populates_operator_evidence(self) -> None:
         view = _lifecycle_view()
         view.clock_labels = {

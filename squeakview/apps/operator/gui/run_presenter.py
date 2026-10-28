@@ -606,6 +606,13 @@ class RunLifecycleController(QtCore.QObject):
             event.ignore()
             return False
 
+        panel = getattr(view, "bottle_panel", None)
+        if panel is not None and panel.has_unsaved_measurements():
+            confirm = getattr(view, "_confirm_measurement_close", None)
+            if confirm is None or not confirm():
+                event.ignore()
+                return False
+
         try:
             view.backend.shutdown()
             snapshot = view.backend.current_snapshot

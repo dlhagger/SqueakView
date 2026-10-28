@@ -9,7 +9,6 @@ from squeakview.common.run_layout import artifact_path, is_primary_layout
 
 from copy import deepcopy
 import json
-import math
 import os
 import time
 from datetime import datetime, timezone
@@ -18,6 +17,7 @@ from typing import Any, Callable, Mapping
 import uuid
 
 from squeakview.common.run_context import atomic_write_json
+from squeakview.common.measurements import weight_value
 
 Controller = Callable[[str, str], Mapping[str, Any]]
 SIDES = ("left", "right")
@@ -124,6 +124,14 @@ class BottleSwapService:
             raise ValueError("Invalid side or cumulative lick count")
         self._data["global_counts"][side] = max(self._data["global_counts"][side], int(count))
 
+    def observe_lick_recovery(self, recovery):
+        if self._data["state"] == "STOPPED" or not isinstance(recovery, Mapping):
+            return
+        snapshot = dict(recovery)
+        if snapshot != self._data.get("lick_recovery"):
+            self._data["lick_recovery"] = snapshot
+            self._save()
+
     def snapshot(self):
         result = deepcopy({key: value for key, value in self._data.items()
                            if key not in ("history", "gaps", "pending_replacements")})
@@ -182,6 +190,8 @@ class BottleSwapService:
         return self.snapshot()
 
     def begin(self, sides, controller: Controller):
+        if (self._data.get("lick_recovery") or {}).get("state") == "RECOVERING":
+            raise ValueError("Lick sensors are recovering. Wait for calibration to finish before swapping bottles.")
         if isinstance(sides, str):
             sides = SIDES if sides.lower() == "both" else (sides.lower(),)
         selected = [s for s in SIDES if s in sides]
@@ -212,10 +222,7 @@ class BottleSwapService:
             if required:
                 raise ValueError("Replacement initial weight is required")
             return None
-        number = float(value)
-        if not math.isfinite(number) or number < 0:
-            raise ValueError("Bottle weights must be finite and nonnegative")
-        return number
+        return weight_value(value, "Bottle weight")
 
     def resume(self, replacements, controller: Controller):
         if self._data["state"] == "ACTIVE" and self._data["pending_replacements"] is None:

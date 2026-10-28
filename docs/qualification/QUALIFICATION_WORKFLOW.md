@@ -51,6 +51,16 @@ using the command. The generated environment requires
 `SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE=1`; routine structural validation is
 valid for ordinary scientific runs but cannot satisfy the qualification gate.
 
+Task snapshot checks accept the historical `config/task.yaml` and compact
+`_metadata/config/task.yaml` locations with the same size, hash, and direct-file
+requirements. Legacy triggered sessions require the legacy alignment summary.
+V2 sessions instead verify CRC-backed journal records, boot/session identity,
+contiguous sequences, and frame timing mappings. Triggered v2 also requires
+ordered camera anchors and matching per-camera counts; free-running v2 requires
+behavior start/stop boundaries and labelled clock estimates or unavailable
+values. These protocol checks do not replace full recording evidence or the
+measurement-approved qualification limits.
+
 ## Acquire and assign a cell
 
 The production matrix requires the specified FLIR camera for every cell. A

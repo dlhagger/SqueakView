@@ -356,6 +356,8 @@ def _same_bottle_measurement(existing: dict[str, str] | None, row: dict[str, str
 
 
 def write_bottle_artifacts(run_dir: Path, bottles: dict[str, Any] | None) -> dict[str, Any]:
+    from .measurements import validate_bottle_inputs
+    validate_bottle_inputs(bottles)
     artifacts = run_artifacts(run_dir)
     updated_at = _now_iso()
     updated_at_ns = time.time_ns()

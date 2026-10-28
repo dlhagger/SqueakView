@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.16)
+project(squeakview_pose_parser_tests LANGUAGES CXX)
+enable_testing()
+set(DEEPSTREAM_INCLUDES "/opt/nvidia/deepstream/deepstream/sources/includes" CACHE PATH "DeepStream headers")
+set(CUDA_INCLUDES "/usr/local/cuda/include" CACHE PATH "CUDA headers (no runtime execution)")
+add_executable(test_pose_parser test_pose_parser.cpp)
+target_compile_features(test_pose_parser PRIVATE cxx_std_17)
+target_include_directories(test_pose_parser PRIVATE "${DEEPSTREAM_INCLUDES}" "${CUDA_INCLUDES}")
+# Assertions are the test oracle, including when configured with Release flags.
+target_compile_options(test_pose_parser PRIVATE -UNDEBUG)
+add_test(NAME pose_parser_boundary COMMAND test_pose_parser)

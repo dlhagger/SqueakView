@@ -834,6 +834,19 @@ def align_run(
     run_dir = Path(run_dir).resolve()
     temp_dir = Path(tempfile.mkdtemp(prefix=".analysis.", dir=run_dir))
     try:
+        manifest_path = artifact_path(run_dir, "run_manifest.json")
+        manifest = run_context.read_json_required(manifest_path) if manifest_path.exists() else {}
+        serial = manifest.get("serial", {})
+        if (serial.get("controller_protocol") == "v2" or serial.get("enabled") is False
+            or manifest.get("capture", {}).get("trigger_on") is False):
+            from squeakview.common.analysis_timing import summarize_recording_timing
+            summary = summarize_recording_timing(run_dir, temp_dir, video_validation=video_validation)
+            run_context.atomic_write_json(artifact_path(run_dir, "alignment_summary.json"), summary)
+            run_context.write_status(run_dir, "analysis_complete", stage="complete", error=None,
+                                     analysis_complete=True, alignment_summary="alignment_summary.json",
+                                     alignment_validated=False, controller_timing_validated=True)
+            _update_progress(run_dir, stage="complete", overall_validation_passed=True)
+            return summary
         run_context.write_status(run_dir, "analyzing", stage="streaming_alignment")
         qualification_barrier.wait_at_barrier(
             run_dir, "finalizer:streaming_alignment"
@@ -953,6 +966,14 @@ def main() -> int:
     except Exception as exc:
         print(f"[{_timestamp()}] [POST-RUN] ERROR: {exc}", flush=True)
         return 1
+    if result.validation_passed:
+        try:
+            from squeakview.common.run_outputs import finalize_primary_tables
+            finalize_primary_tables(args.run_dir, max(1, int(args.camera_count)))
+        except Exception as exc:
+            run_context.write_status(args.run_dir, "finalization_failed", error=str(exc), overall_validation_passed=False)
+            print(f"[{_timestamp()}] [POST-RUN] primary-table finalization failed: {exc}", flush=True)
+            return 1
     if args.align and result.validation_passed:
         try:
             summary = align_run(
@@ -965,6 +986,8 @@ def main() -> int:
                 flush=True,
             )
         except Exception as exc:
+            run_context.write_status(args.run_dir, "analysis_failed", stage="failed",
+                                     error=str(exc), overall_validation_passed=False)
             print(f"[{_timestamp()}] [POST-RUN] alignment failed: {exc}", flush=True)
             return 3
     elif result.validation_passed:
@@ -975,8 +998,6 @@ def main() -> int:
         )
     if result.validation_passed:
         try:
-            from squeakview.common.run_outputs import finalize_primary_tables
-            finalize_primary_tables(args.run_dir, max(1, int(args.camera_count)))
             cleanup_successful_run(args.run_dir, max(1, int(args.camera_count)))
         except Exception as exc:
             run_context.write_status(args.run_dir, "finalization_failed", error=str(exc),

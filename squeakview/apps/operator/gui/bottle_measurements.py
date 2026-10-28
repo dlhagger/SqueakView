@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -8,6 +7,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .dialog_style import DARK_DIALOG_STYLE, apply_dark_combo_popups, center_window, fit_window_to_available_area
 from .main_theme import BOTTLE_HISTORY_HEADER_STYLE
+from squeakview.common.measurements import MAX_WEIGHT_G, weight_value
 
 
 BOTTLE_FLUID_PRESETS = [
@@ -53,24 +53,12 @@ def parse_weight(text: str, label: str, *, strict: bool) -> float | None:
     silently omitting an operator's measurement. Empty fields remain optional.
     """
 
-    cleaned = text.strip()
-    if not cleaned:
-        return None
     try:
-        value = float(cleaned)
+        return weight_value(text, label)
     except ValueError:
         if strict:
-            raise ValueError(f"{label} must be a number.") from None
+            raise
         return None
-    if not math.isfinite(value):
-        if strict:
-            raise ValueError(f"{label} must be a finite number.")
-        return None
-    if value < 0:
-        if strict:
-            raise ValueError(f"{label} cannot be negative.")
-        return None
-    return round(value, 6)
 
 
 def build_bottle_payload(
@@ -261,6 +249,7 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         self._bottle_history_locked = False
         self._current_bottle_ids = {}
         self._swap_recording = False
+        self._lick_recovery_warning = False
         self._run_state = None
         self._completion_pending = True
         self._save_acknowledged = False
@@ -292,7 +281,7 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
 
     def _update_history_visibility(self) -> None:
         expanded = self.history_toggle.isChecked()
-        self.lick_status_label.setVisible(expanded)
+        self.lick_status_label.setVisible(expanded or self._lick_recovery_warning)
         self.swap_button.setVisible(expanded and self._swap_recording)
         self.check_status_button.setVisible(expanded and self._swap_recording)
         has_rows = self.history_table.rowCount() > 0
@@ -311,6 +300,16 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         totals = snapshot.get("global_counts", {})
         current = snapshot.get("current", {})
         text = f"Lick channels: {state.lower()}" if recording else "Recording stopped"
+        recovery = snapshot.get("lick_recovery") or {}
+        self._lick_recovery_warning = bool(recording and recovery and not recovery.get("available"))
+        if self._lick_recovery_warning:
+            failed = recovery.get("state") == "FAILED"
+            text = "Lick channels: unavailable" if failed else "Lick channels: recovering"
+            text += " · recording continues"
+            if recovery.get("attempts"):
+                text += f"\nCalibration attempt {recovery['attempts']}/3"
+            if not failed:
+                self.swap_button.setEnabled(False)
         if recording and not available:
             text += "\nBottle swapping is unavailable."
         if totals:
@@ -399,7 +398,7 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         edit.setPlaceholderText(phase)
         edit.setMinimumWidth(88)
         edit.setMaximumWidth(120)
-        validator = QtGui.QDoubleValidator(0.0, 100000.0, 4, edit)
+        validator = QtGui.QDoubleValidator(0.0, MAX_WEIGHT_G, 4, edit)
         validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
         edit.setValidator(validator)
         return edit
@@ -502,6 +501,11 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
         return bool(self._current_bottle_ids) and any(
             getattr(self, f"{side}_final_weight_edit").text().strip() != self._saved_final_weights[side].strip()
             for side in ("left", "right")
+        )
+
+    def has_unsaved_measurements(self) -> bool:
+        return bool(self._form_edits) and (
+            bool(self._current_bottle_ids) or self._run_state in {"complete", "failed"}
         )
 
     def set_status(self, text: str) -> None:

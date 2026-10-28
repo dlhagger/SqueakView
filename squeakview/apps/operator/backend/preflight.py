@@ -17,6 +17,7 @@ from squeakview.apps.inference import debug_instrumentation
 GENERIC_FAILURE = "System preflight failed. Open Operator Events for the failed check."
 PREFLIGHT_EVIDENCE_SCHEMA_VERSION = "3.0"
 MAX_PREFLIGHT_OUTPUT_BYTES = 256 * 1024
+MAX_PREFLIGHT_LINE_BYTES = 64 * 1024
 PREFLIGHT_TERMINATE_GRACE_S = 2.0
 _DECODER_PASS_PREFIX = "[PASS] Jetson H.264 full-decode validation path works"
 
@@ -53,24 +54,34 @@ def _run_bounded_preflight(
     def drain() -> None:
         assert process.stdout is not None
         pending = bytearray()
+        discarding_line = False
+
+        def forward(raw: bytes) -> None:
+            if on_line is not None:
+                try:
+                    on_line(raw.decode("utf-8", errors="replace"))
+                except Exception:
+                    pass
 
         def publish(*, final: bool = False) -> None:
+            nonlocal discarding_line
             while True:
                 newline = pending.find(b"\n")
                 if newline < 0:
                     break
-                raw = bytes(pending[:newline])
+                raw = bytes(pending[:min(newline, MAX_PREFLIGHT_LINE_BYTES)])
                 del pending[: newline + 1]
-                if on_line is not None:
-                    try:
-                        on_line(raw.decode("utf-8", errors="replace"))
-                    except Exception:
-                        pass
-            if final and pending and on_line is not None:
-                try:
-                    on_line(bytes(pending).decode("utf-8", errors="replace"))
-                except Exception:
-                    pass
+                if newline > MAX_PREFLIGHT_LINE_BYTES:
+                    truncated.set()
+                    raw += b" ... [line truncated]"
+                forward(raw)
+            if len(pending) > MAX_PREFLIGHT_LINE_BYTES:
+                truncated.set()
+                forward(bytes(pending[:MAX_PREFLIGHT_LINE_BYTES]) + b" ... [line truncated]")
+                pending.clear()
+                discarding_line = True
+            if final and pending:
+                forward(bytes(pending))
                 pending.clear()
 
         while True:
@@ -90,6 +101,11 @@ def _run_bounded_preflight(
                 retained.extend(chunk[:available])
             if len(chunk) > available:
                 truncated.set()
+            if discarding_line:
+                _prefix, separator, chunk = chunk.partition(b"\n")
+                if not separator:
+                    continue
+                discarding_line = False
             pending.extend(chunk)
             publish()
 

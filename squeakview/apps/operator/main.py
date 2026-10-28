@@ -54,7 +54,7 @@ def _launch_main_window(
     if app_icon is not None and not app_icon.isNull():
         window.setWindowIcon(app_icon)
     window_holder["win"] = window
-    window.showMaximized()
+    window.showFullScreen()
     return True
 
 

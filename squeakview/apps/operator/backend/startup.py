@@ -176,6 +176,8 @@ def validate_startup_policy(config: RunRequest) -> None:
     useful presentation, while the capture subprocess repeats graph-specific
     checks as defence in depth.
     """
+    from squeakview.common.measurements import validate_bottle_inputs
+    validate_bottle_inputs(config.bottles)
 
     bool_fields = (
         "trigger_on",

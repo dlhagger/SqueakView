@@ -44,7 +44,7 @@ def present_config(
     model_name = "Inference off"
     if ds_cfg is not None:
         try:
-            model_name = model_package.validate_model_package(ds_cfg).name
+            model_name = model_package.inspect_model_package(ds_cfg).name
         except model_package.ModelPackageError:
             model_name = f"Invalid: {ds_cfg.name}"
 

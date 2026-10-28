@@ -10,6 +10,10 @@ import math
 import os
 import re
 import stat
+import signal
+import subprocess
+import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -26,6 +30,15 @@ _MAX_MODEL_ARTIFACT_BYTES = 4 * 1024 * 1024 * 1024
 
 class ModelPackageError(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class ModelPackagePreview:
+    """Metadata for selection; never evidence of runtime/content validation."""
+    name: str
+    config: Path
+    model_manifest_schema: int
+    declared_engine_identity: dict[str, object] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +119,7 @@ def _load_json_object(path: Path, label: str) -> dict[str, object]:
     return value
 
 
-def _runtime_engine_identity() -> dict[str, object]:
+def _probe_runtime_engine_identity() -> dict[str, object]:
     """Return the runtime identity that constrains a generated TensorRT plan."""
 
     try:
@@ -136,6 +149,45 @@ def _runtime_engine_identity() -> dict[str, object]:
         "device_model": read_optional(Path("/proc/device-tree/model")),
         "jetson_linux_release": read_optional(Path("/etc/nv_tegra_release")),
     }
+
+
+def _runtime_engine_identity() -> dict[str, object]:
+    """Query CUDA only in a bounded, short-lived process, then release it."""
+    with tempfile.TemporaryDirectory(prefix="squeakview-runtime-probe-") as directory:
+        output = Path(directory) / "identity.json"
+        try:
+            worker = subprocess.Popen(
+                [sys.executable, "-m", "squeakview.tools.runtime_identity", "--output", str(output),
+                 "--expected-parent-pid", str(os.getpid())],
+                cwd=Path(__file__).resolve().parent.parent,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise ModelPackageError(f"Could not start runtime identity probe: {exc}") from exc
+        try:
+            code = worker.wait(timeout=45)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(worker.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            worker.wait()
+            raise ModelPackageError("TensorRT runtime identity probe timed out") from exc
+        except BaseException:
+            try:
+                os.killpg(worker.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            worker.wait()
+            raise
+        try:
+            result = read_json_object(output, max_bytes=64 * 1024, label="runtime identity probe")
+        except (OSError, ValueError) as exc:
+            raise ModelPackageError(f"Runtime identity probe failed (exit {code}): {exc}") from exc
+        if code or "identity" not in result or not isinstance(result["identity"], dict):
+            raise ModelPackageError(str(result.get("error") or f"Runtime identity probe exited {code}"))
+        return result["identity"]
 
 
 def _validate_engine_build_identity(
@@ -175,6 +227,7 @@ def _validate_schema_three_artifacts(
     recorded: object,
     root: Path,
     expected: dict[str, Path],
+    *, verify_hashes: bool = True,
 ) -> None:
     """Bind every runtime package artifact to its path and digest."""
 
@@ -205,7 +258,7 @@ def _validate_schema_three_artifacts(
             )
         if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise ModelPackageError(f"Schema-3 artifact {name!r} SHA-256 is invalid")
-        if _sha256(
+        if verify_hashes and _sha256(
             resolved, max_bytes=limits[name], label=f"Schema-3 artifact {name}"
         ) != digest:
             raise ModelPackageError(
@@ -336,6 +389,15 @@ def _validate_pose_schema(
 
 
 def validate_model_package(config_path: str | Path) -> ModelPackageInfo:
+    return _read_model_package(config_path, metadata_only=False)
+
+
+def inspect_model_package(config_path: str | Path) -> ModelPackagePreview:
+    """Inspect bounded metadata without importing CUDA or hashing model blobs."""
+    return _read_model_package(config_path, metadata_only=True)
+
+
+def _read_model_package(config_path: str | Path, *, metadata_only: bool):
     config = Path(config_path).expanduser().resolve()
     if not config.is_file():
         raise ModelPackageError(f"DeepStream model config does not exist: {config}")
@@ -520,10 +582,15 @@ def validate_model_package(config_path: str | Path) -> ModelPackageInfo:
                 "custom_parser": parser_library,
                 "import_report": import_report,
             },
+            verify_hashes=not metadata_only,
         )
         engine_build_identity = _validate_engine_build_identity(
-            report.get("build_environment"), _runtime_engine_identity()
+            report.get("build_environment"),
+            report.get("build_environment") if metadata_only else _runtime_engine_identity()
         )
+
+    if metadata_only:
+        return ModelPackagePreview(root.name, config, manifest_schema, engine_build_identity)
 
     return ModelPackageInfo(
         name=root.name,

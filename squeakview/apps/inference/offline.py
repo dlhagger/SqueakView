@@ -326,8 +326,28 @@ class OfflineInferenceApp:
         self.frames_path = artifact_path(self.run_dir, "frames.csv")
         self.serial_path = artifact_path(self.run_dir, "serial.csv")
         self.errors_path = artifact_path(self.run_dir, "diagnostics") / "errors.csv"
-        for path in (self.video_path, self.frames_path, self.serial_path):
+        manifest_path = artifact_path(self.run_dir, "run_manifest.json")
+        manifest = _read_json(manifest_path) if manifest_path.exists() else {}
+        serial = manifest.get("serial", {})
+        capture = manifest.get("capture", {})
+        if capture.get("num_cameras", 1) != 1:
+            raise ValueError("offline replay currently supports one camera per run")
+        if serial.get("enabled", True) and serial.get("controller_protocol", "legacy") not in {"legacy", "watchdog_v1_experimental", "v2"}:
+            raise ValueError("unsupported controller protocol for offline replay")
+        self.timing_inputs = {"run_manifest": manifest_path}
+        if serial.get("enabled", True) and serial.get("controller_protocol") == "v2":
+            for name in ("controller_v2.jsonl", "controller_v2_summary.json", "clock_validation.json"):
+                self.timing_inputs[name] = artifact_path(self.run_dir, "diagnostics/" + name)
+            from squeakview.common.v2_timing import verify_v2_frame_timing
+            verify_v2_frame_timing(self.run_dir, triggered=capture.get("trigger_on", True), camera_count=1)
+        required = [self.video_path, self.frames_path]
+        if self.serial_path.exists() or serial.get("enabled", True):
+            required.append(self.serial_path)
+        for path in required:
             _assert_direct_run_file(self.run_dir, path)
+        for path in self.timing_inputs.values():
+            if path.exists():
+                _assert_direct_run_file(self.run_dir, path)
         if self.errors_path.exists():
             _assert_direct_run_file(self.run_dir, self.errors_path)
         self.cfg_path = (
@@ -386,6 +406,7 @@ class OfflineInferenceApp:
                 "errors": str(self.errors_path),
                 "errors_sha256": self.source_hashes["errors_sha256"],
                 "expected_frames": len(self.ledger),
+                "timing_sha256": {name: digest for name, digest in self.source_hashes.items() if name.startswith("timing_")},
             },
             "model_package": self.model.manifest_snapshot(),
             "runtime_artifacts": {
@@ -413,13 +434,15 @@ class OfflineInferenceApp:
         hashes: dict[str, str | None] = {
             "video_sha256": _sha256(self.video_path),
             "frames_sha256": _sha256(self.frames_path),
-            "serial_sha256": _sha256(self.serial_path),
+            "serial_sha256": _sha256(self.serial_path) if self.serial_path.exists() else None,
             "errors_sha256": (
                 _sha256(self.errors_path) if self.errors_path.is_file() else None
             ),
             "parser_sha256": _sha256(self.model.parser_library),
             "tracker_sha256": _sha256(self.tracker_path),
         }
+        for name, path in self.timing_inputs.items():
+            hashes[f"timing_{name}_sha256"] = _sha256(path) if path.exists() else None
         for name in (
             "config", "manifest", "pose_sidecar", "onnx", "engine", "classes",
             "keypoint_labels", "import_report",
@@ -567,8 +590,8 @@ class OfflineInferenceApp:
                         "offline replay inputs changed during processing: "
                         + ", ".join(changed)
                     )
-                from squeakview.apps.inference.legacy_alignment import build_alignment
-                build_alignment(
+                from squeakview.common.analysis_timing import summarize_recording_timing
+                summarize_recording_timing(
                     self.run_dir, self.out_dir,
                     objects_path=self.out_dir / "objects.csv",
                     video_validation={

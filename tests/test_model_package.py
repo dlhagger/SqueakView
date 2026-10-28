@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,39 @@ from squeakview.model_package import ModelPackageError, validate_model_package
 
 
 class ModelPackageTests(unittest.TestCase):
+    def test_metadata_inspection_never_hashes_blobs_or_queries_cuda(self):
+        identity = {"tensorrt_version": "10", "cuda_version": "13", "gpu_name": "Orin",
+                    "compute_capability": [8, 7], "device_model": "Orin", "jetson_linux_release": "R39"}
+        self.upgrade_to_schema_three(identity)
+        with mock.patch.object(model_package, "_sha256", side_effect=AssertionError("blob read")), \
+             mock.patch.object(model_package, "_runtime_engine_identity", side_effect=AssertionError("CUDA queried")):
+            preview = model_package.inspect_model_package(self.config)
+        self.assertEqual(preview.declared_engine_identity, identity)
+        # A preview is never accepted as authoritative validation after mutation.
+        (self.package / "engines" / "model.engine").write_bytes(b"changed engine")
+        with mock.patch.object(model_package, "_runtime_engine_identity", return_value=identity):
+            with self.assertRaisesRegex(ModelPackageError, "hash|SHA|sha|mismatch"):
+                validate_model_package(self.config)
+
+    def test_runtime_probe_releases_process_before_returning_identity(self):
+        worker = mock.Mock(pid=123, wait=mock.Mock(return_value=0))
+        def start(args, **kwargs):
+            Path(args[args.index("--output") + 1]).write_text(json.dumps({"identity": {"gpu_name": "Orin"}}))
+            self.assertTrue(kwargs["start_new_session"])
+            return worker
+        with mock.patch.object(model_package.subprocess, "Popen", side_effect=start):
+            self.assertEqual(model_package._runtime_engine_identity(), {"gpu_name": "Orin"})
+        worker.wait.assert_called_once_with(timeout=45)
+
+    def test_runtime_probe_timeout_kills_and_reaps_worker(self):
+        worker = mock.Mock(pid=123, wait=mock.Mock(side_effect=[subprocess.TimeoutExpired("probe", 45), 0]))
+        with mock.patch.object(model_package.subprocess, "Popen", return_value=worker), \
+             mock.patch.object(model_package.os, "killpg") as kill:
+            with self.assertRaisesRegex(ModelPackageError, "timed out"):
+                model_package._runtime_engine_identity()
+        kill.assert_called_once_with(123, model_package.signal.SIGKILL)
+        self.assertEqual(worker.wait.call_count, 2)
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)

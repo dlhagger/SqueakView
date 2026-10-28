@@ -39,7 +39,7 @@ class ConfigPresentationTest(unittest.TestCase):
         model.name = "MouseDetector"
         with mock.patch(
             "squeakview.apps.operator.gui.config_presentation."
-            "model_package.validate_model_package",
+            "model_package.inspect_model_package",
             return_value=model,
         ):
             result = present_config(
@@ -63,7 +63,7 @@ class ConfigPresentationTest(unittest.TestCase):
 
         with mock.patch(
             "squeakview.apps.operator.gui.config_presentation."
-            "model_package.validate_model_package",
+            "model_package.inspect_model_package",
             side_effect=model_package.ModelPackageError("bad package"),
         ):
             invalid = present_config(

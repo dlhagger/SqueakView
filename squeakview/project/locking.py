@@ -36,7 +36,11 @@ class OwnershipLock:
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(self.path, flags, 0o600)
-        handle = os.fdopen(descriptor, "r+", encoding="utf-8")
+        try:
+            handle = os.fdopen(descriptor, "r+", encoding="utf-8")
+        except BaseException:
+            os.close(descriptor)
+            raise
         try:
             info = os.fstat(handle.fileno())
             if not stat.S_ISREG(info.st_mode):
@@ -47,24 +51,30 @@ class OwnershipLock:
         except BlockingIOError:
             handle.close()
             return False
-        except Exception:
+        except BaseException:
             handle.close()
             raise
-        payload = {
-            "schema_version": 1,
-            "purpose": self.purpose,
-            "token": self.token,
-            "pid": os.getpid(),
-            "uid": os.getuid(),
-            "hostname": socket.gethostname(),
-            "acquired_at_unix_ns": time.time_ns(),
-        }
-        handle.seek(0)
-        handle.truncate()
-        json.dump(payload, handle, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+        try:
+            payload = {
+                "schema_version": 1,
+                "purpose": self.purpose,
+                "token": self.token,
+                "pid": os.getpid(),
+                "uid": os.getuid(),
+                "hostname": socket.gethostname(),
+                "acquired_at_unix_ns": time.time_ns(),
+            }
+            handle.seek(0)
+            handle.truncate()
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            # Until publication below, release() cannot see this handle.
+            # Close it even when the caller retains the exception traceback.
+            handle.close()
+            raise
         self._handle = handle
         return True
 

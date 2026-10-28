@@ -24,9 +24,9 @@ class ModelChoice:
 def validate_production_model(
     config: Path,
     *,
-    validator: Callable[[Path], object] = model_package.validate_model_package,
+    validator: Callable[[Path], object] = model_package.inspect_model_package,
 ) -> object:
-    """Require the schema-3, runtime-matched package used for acquisition."""
+    """Check selection metadata; the backend verifies content/runtime at Start."""
 
     info = validator(Path(config))
     if getattr(info, "model_manifest_schema", None) != 3:
@@ -34,7 +34,7 @@ def validate_production_model(
             "Model package uses migration-only schema 2; rebuild it on this device "
             "before scientific acquisition"
         )
-    if getattr(info, "engine_build_identity", None) is None:
+    if getattr(info, "declared_engine_identity", getattr(info, "engine_build_identity", None)) is None:
         raise model_package.ModelPackageError(
             "Schema-3 model package has no verified device-local engine identity"
         )
@@ -44,7 +44,7 @@ def validate_production_model(
 def enumerate_model_configs(
     models_root: Path,
     *,
-    validator: Callable[[Path], object] = model_package.validate_model_package,
+    validator: Callable[[Path], object] = model_package.inspect_model_package,
 ) -> tuple[ModelChoice, ...]:
     """Enumerate bounded, direct, non-hidden package/config children."""
 
@@ -85,7 +85,7 @@ def enumerate_model_configs(
                         str(getattr(info, "name", package.name)),
                         config.resolve(),
                         True,
-                        "Schema 3; engine identity matches this device",
+                        "Schema 3; content and device identity verified at Start",
                     )
                 )
             except (model_package.ModelPackageError, OSError, ValueError) as exc:
