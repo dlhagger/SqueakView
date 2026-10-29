@@ -9,6 +9,7 @@ scripts/
   setup_jetson.sh          # Initial OS/device setup
   build_native.sh          # Rebuild native components
   preflight.sh             # Readiness checks
+  test.py                  # Python and camera-free native software checks
   qualify_run.py           # Check a completed run
   qualification/           # Campaign, overhead, and failure-injection tools
   legacy/                  # Older controller alignment command
@@ -21,6 +22,7 @@ Start the operator with `bash squeakview.sh`. The unused
 | --- | --- | --- |
 | `setup_jetson.sh` | Install OS packages, configure serial permissions and the project parent, then build native components as the desktop user. | Initial machine setup; it requests a reboot afterward. |
 | `build_native.sh` | Build and check the FLIR source and pose parser. | After native source changes or SDK updates. It does not install OS packages. |
+| `test.py` | Check dependencies, run nonempty unittest discovery, and build/run native EOS and pose-parser CTests. | Software changes or dependency upgrades; run with `.venv/bin/python scripts/test.py`. `--python-only` explicitly omits native checks. |
 | `preflight.sh` | Check system, model, controller access, and recording prerequisites. | The operator runs it before acquisition; it can also be run manually with the selected project/model environment. |
 | `qualify_run.py` | Evaluate a completed run against qualification limits. | Verify a run after acquisition. |
 | `qualification/qualify_matrix.py` | Create a qualification checklist, assign completed runs, and evaluate coverage. | Hardware/software qualification campaigns. |
@@ -44,9 +46,10 @@ New runs have `frames.csv`, `raw.mp4`, `sensors.csv`, `detections.csv`, and
 `weigh_in.csv`. Configuration, validation, logs, and capture recovery ledgers
 are under `_metadata/`. Bottle swaps and their recovery state are in
 `weigh_in.csv`. Status and validation share `_metadata/run_manifest.json`.
-After successful validation, ordinary runs compress recovery ledgers into
-`_metadata/recovery/`; readers support both plain and gzip files. Existing
-recordings retain their historical layout.
+Stop leaves recovery ledgers plain. Explicit `post_run --compact-metadata`
+maintenance compresses and verifies them under `_metadata/recovery/`; readers
+support both formats. Run maintenance with the app closed. Existing recordings
+retain their historical layout.
 
 Qualification tools resolve both layouts. Their default per-run summaries go
 under `_metadata/` for new runs. Explicit analysis output directories remain
@@ -60,8 +63,8 @@ data files are not rewritten by this validator.
 
 Production protocol v2 uses `CAMERA_EPOCH`, `CAMERA_CHECKPOINT`, and
 `CAMERA_STOP` anchors rather than one `CAMERA_HIGH` record per frame. The normal
-Stop/finalization workflow validates recording counts and adds controller times
-to the primary tables. `data_viz.v2_alignment.load_v2_run` reconstructs the
+Stop validates final counts and live integrity evidence without rewriting primary
+tables. Controller mappings are derived on read from native clocks and anchors. `data_viz.v2_alignment.load_v2_run` reconstructs the
 v2 analysis timeline for finalized runs; the teaching notebook uses it.
 
 Python command-line scripts provide `--help`. The shell setup/build scripts

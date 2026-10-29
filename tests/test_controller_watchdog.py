@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from tests.support.threads import CheckedThread
 
 from squeakview.common.controller_watchdog import (
     REQUIRED_FEATURES,
@@ -339,7 +340,7 @@ class ControllerWatchdogProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not received"):
                 session._wait_ack("HEARTBEAT", 1, 20.0)
 
-        thread = threading.Thread(target=pending_heartbeat)
+        thread = CheckedThread(target=pending_heartbeat)
         session._heartbeat_thread = thread
         thread.start()
         self.assertTrue(heartbeat_waiting.wait(0.1))

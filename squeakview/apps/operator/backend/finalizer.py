@@ -48,7 +48,8 @@ def run_capture_finalizer(
     ffprobe and any other descendants as well as the Python coordinator.
     """
 
-    emit("[POST-RUN] starting independent bounded-memory finalizer")
+    started = time.monotonic()
+    emit("[POST-RUN] starting independent capture validator")
     worker = process.spawn_post_run(
         run_dir,
         camera_count=int(camera_count),
@@ -65,7 +66,7 @@ def run_capture_finalizer(
         "SQUEAKVIEW_POST_RUN_KILL_GRACE_S", 10.0, 60.0
     )
 
-    deadline = time.monotonic() + timeout_s
+    deadline = started + timeout_s
     last_reported = -1
     while force_timeout or worker.poll() is None:
         if force_timeout or time.monotonic() >= deadline:
@@ -122,4 +123,7 @@ def run_capture_finalizer(
             )
             last_reported = processed
         time.sleep(0.2)
+    elapsed = time.monotonic() - started
+    run_context.update_status(run_dir, stop_validation_elapsed_s=round(elapsed, 3))
+    emit(f"[POST-RUN] capture validation finished in {elapsed:.2f}s")
     return int(worker.returncode or 0)

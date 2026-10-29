@@ -9,9 +9,11 @@ from pathlib import Path
 
 from . import controller_protocol_v2 as protocol
 from .bounded_csv import bounded_csv_lines
-from .run_layout import artifact_path, is_primary_layout
+from .run_layout import artifact_path, is_primary_layout, uses_native_timing
 
-MAX_ANCHORS = 65_536
+# More than eleven days at the firmware's one-second checkpoint cadence.
+# Retain an explicit memory bound rather than rejecting ordinary 24-hour runs.
+MAX_ANCHORS = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -155,6 +157,8 @@ def verify_v2_frame_timing(run_dir: Path, *, triggered: bool, camera_count: int)
     # Collapse repeated equal anchors (e.g. epoch/stop for a one-frame run).
     anchors = list({anchor["count"]: anchor for anchor in timing.anchors}.values())
     counts = [anchor["count"] for anchor in anchors]
+    native_contract = uses_native_timing(run_dir)
+    require_exported = is_primary_layout(run_dir) and not native_contract
     for stream in range(camera_count):
         path = artifact_path(run_dir, "frames.csv" if stream == 0 else f"frames_cam{stream}.csv")
         count = 0
@@ -168,7 +172,10 @@ def verify_v2_frame_timing(run_dir: Path, *, triggered: bool, camera_count: int)
             if previous_camera is not None and native <= previous_camera:
                 raise ValueError("camera clock is not strictly increasing")
             previous_camera = native
-            if is_primary_layout(run_dir) or "controller_time_method" in row:
+            if native_contract and 'controller_time_method' not in row:
+                _uint(row.get('host_unix_ns'), 'native host UTC timestamp')
+                _uint(row.get('host_monotonic_ns'), 'native host monotonic timestamp')
+            if "controller_time_method" in row or require_exported:
                 if triggered:
                     value, method = camera_time(anchors, anchors[0]["count"] + count, counts=counts)
                 else:

@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from tests.support.threads import CheckedThread
 from pathlib import Path
 from unittest import mock
 
@@ -150,7 +151,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
                 },
             )
 
-        thread = threading.Thread(target=serve)
+        thread = CheckedThread(target=serve)
         thread.start()
         self.assertTrue(proxy.start_run(config))
         thread.join()
@@ -168,7 +169,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
             self.assertEqual(command.payload, {})
             self.fake.respond(command, {"response": "ACK_CLEAR_JAM"})
 
-        thread = threading.Thread(target=serve)
+        thread = CheckedThread(target=serve)
         thread.start()
         try:
             self.assertEqual(proxy.clear_feeder_jam(), "ACK_CLEAR_JAM")
@@ -196,7 +197,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
                 },
             )
 
-        thread = threading.Thread(target=serve)
+        thread = CheckedThread(target=serve)
         thread.start()
         with self.assertRaisesRegex(ValueError, "capture_running must be boolean"):
             proxy.start_run(LaunchConfig())
@@ -221,7 +222,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
                 "started_at": "2026-10-23T14:54:36",
                 "dashboard_events": [DashboardEvent.parse("FEED_JAM,100,200,nan,3,69420,69420,69420,Feeding,Jam").to_payload()],
             })
-        thread = threading.Thread(target=serve)
+        thread = CheckedThread(target=serve)
         thread.start()
         restored = proxy.recover_runtime_state()
         thread.join()
@@ -249,7 +250,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
                     "error":None, "capture_running":True, "finalization_in_progress":False}})
             self.fake.event('backend_event', {"schema_version":"1.0", "type":"phase_changed",
                 "phase":"finalized", "run_dir":"/tmp/run", "message":None, "payload":{}, "host_unix_ns":123})
-        thread=threading.Thread(target=serve)
+        thread=CheckedThread(target=serve)
         thread.start()
         with mock.patch.object(proxy,'_command',side_effect=delayed_command):
             restored=proxy.recover_runtime_state()
@@ -459,7 +460,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
                 },
             )
 
-        thread = threading.Thread(target=serve)
+        thread = CheckedThread(target=serve)
         thread.start()
         snapshot = proxy.snapshot()
         thread.join()
@@ -504,7 +505,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
                 },
             )
 
-        thread = threading.Thread(target=serve)
+        thread = CheckedThread(target=serve)
         thread.start()
         started = time.monotonic()
         proxy.stop_run()
@@ -538,7 +539,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
             )
             self.fake.close()
 
-        thread = threading.Thread(target=serve)
+        thread = CheckedThread(target=serve)
         thread.start()
         proxy.shutdown()
         thread.join()

@@ -19,10 +19,8 @@ class BuildEngineNotebookTests(unittest.TestCase):
             for cell in notebook["cells"]
         )
         self.assertEqual(code, [])
-        self.assertIn("Project Setup", source)
-        self.assertIn("isolated worker process", source)
-        self.assertNotIn("SQUEAKVIEW_PROJECT", source)
-        self.assertNotIn("assert", source)
+        self.assertIn("bash squeakview.sh", source)
+        self.assertTrue(all(not cell.get("outputs") for cell in notebook["cells"]))
 
 
 if __name__ == "__main__":

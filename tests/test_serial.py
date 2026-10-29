@@ -766,9 +766,10 @@ class SerialCsvTests(unittest.TestCase):
         started = threading.Event()
         release = threading.Event()
 
+        releases = []
         def blocked_delivery(_line: str) -> None:
             started.set()
-            self.assertTrue(release.wait(timeout=2.0))
+            releases.append(release.wait(timeout=2.0))
 
         with mock.patch.object(
             self.handle, "_send_email_alert", side_effect=blocked_delivery
@@ -784,6 +785,7 @@ class SerialCsvTests(unittest.TestCase):
             while self.handle._alert_inflight and time.monotonic() < deadline:
                 time.sleep(0.01)
 
+        self.assertEqual(releases, [True])
         self.assertFalse(self.handle._alert_inflight)
         self.assertEqual(self.handle._alert_suppressed, 0)
         self.assertTrue(any("coalesced 20" in line for line in self.logs))

@@ -130,13 +130,21 @@ def _chunk_count(
         raise ValueError("MP4 chunk-offset table length is invalid")
     offset = box.payload_start + 8
     format_code = ">Q" if width == 8 else ">I"
-    for _ in range(count):
-        chunk_offset = struct.unpack(
-            format_code, _read_exact(handle, offset, width)
-        )[0]
-        if not any(start <= chunk_offset < end for start, end in media_ranges):
-            raise ValueError("MP4 chunk offset points outside every media-data box")
-        offset += width
+    # Read bounded blocks rather than seeking/reading once for every chunk
+    # in a day-long movie. All offsets still receive the same extent check.
+    block_entries = 65_536 // width
+    for first in range(0, count, block_entries):
+        size = min(block_entries, count - first) * width
+        data = _read_exact(handle, offset, size)
+        for (chunk_offset,) in struct.iter_unpack(format_code, data):
+            if len(media_ranges) == 1:
+                start, end = media_ranges[0]
+                valid = start <= chunk_offset < end
+            else:
+                valid = any(start <= chunk_offset < end for start, end in media_ranges)
+            if not valid:
+                raise ValueError("MP4 chunk offset points outside every media-data box")
+        offset += size
     return count
 
 

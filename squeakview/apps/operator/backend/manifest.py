@@ -686,7 +686,8 @@ class RunManifestService:
                 manifest["expected_outputs"].pop("bottle_summary", None)
                 manifest["expected_outputs"].pop("status", None)
             manifest["output_layout"] = {"version": 1, "compact_metadata": uses_compact_metadata(run_dir), "metadata_directory": "_metadata",
-                "timing": "native timestamps and explicitly labelled controller mappings on each primary CSV row"}
+                "timing": "native clocks per row; controller mappings resolved from synchronization evidence",
+                "controller_mapping_reader": "squeakview.common.row_timing.iter_timestamped_rows"}
         return manifest
 
     def write(

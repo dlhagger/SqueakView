@@ -202,6 +202,22 @@ def _write_weigh_in(run_dir, bottles):
         writer.writerows(additions)
 
 
+def ensure_primary_tables(run_dir):
+    """Create absent empty tables only; recording owns all existing rows."""
+    run_dir = Path(run_dir)
+    if not is_primary_layout(run_dir):
+        return
+    from squeakview.common.serial import SERIAL_HEADER
+    from squeakview.apps.inference.pose_persistence import OBJECT_HEADERS
+    for name, header in (("sensors.csv", SERIAL_HEADER), ("detections.csv", OBJECT_HEADERS + TIMING_FIELDS), ("weigh_in.csv", WEIGH_FIELDS)):
+        path = artifact_path(run_dir, name)
+        if not path.exists():
+            with path.open('x', newline='') as handle:
+                csv.writer(handle).writerow(list(dict.fromkeys(header)))
+                handle.flush()
+                os.fsync(handle.fileno())
+
+
 def finalize_primary_tables(run_dir, camera_count=1):
     """Publish controller times on every primary row after capture closes.
 
@@ -214,13 +230,7 @@ def finalize_primary_tables(run_dir, camera_count=1):
     mapping = ClockMapping(run_dir)
     diagnostics = artifact_path(run_dir, "diagnostics")
     diagnostics.mkdir(parents=True, exist_ok=True)
-    from squeakview.common.serial import SERIAL_HEADER
-    from squeakview.apps.inference.pose_persistence import OBJECT_HEADERS
-    for name, header in (("sensors.csv", SERIAL_HEADER), ("detections.csv", OBJECT_HEADERS + TIMING_FIELDS), ("weigh_in.csv", WEIGH_FIELDS)):
-        path = artifact_path(run_dir, name)
-        if not path.exists():
-            with _replacement(path) as handle:
-                csv.writer(handle).writerow(list(dict.fromkeys(header)))
+    ensure_primary_tables(run_dir)
     with tempfile.TemporaryDirectory(prefix=".timestamps.", dir=artifact_path(run_dir, "diagnostics")) as directory:
         with sqlite3.connect(str(Path(directory) / "frames.sqlite3")) as index:
             index.execute("PRAGMA cache_size=-1024")

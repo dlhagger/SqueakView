@@ -91,8 +91,11 @@ def compact_successful_run(run_dir: Path, camera_count: int):
     for name in names:
         path = artifact_path(run_dir, name)
         if path.is_file() and path.suffix != ".gz":
+            from .ledger_tail import last_complete_line, retain_final_record
+            tail = last_complete_line(path)
             destination = run_dir / "_metadata" / "recovery" / (name + ".gz")
             retained[name] = _compress(path, destination)
+            retain_final_record(run_dir, destination, tail or '')
             run_context.update_status(run_dir, metadata_retention={"policy":"compact_verified_gzip", "complete":False, "artifacts":retained})
         elif path.is_file() and path.suffix == ".gz" and name not in retained:
             decoded, size = _digest(path, compressed=True)

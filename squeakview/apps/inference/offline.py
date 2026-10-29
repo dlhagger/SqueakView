@@ -536,10 +536,42 @@ class OfflineInferenceApp:
     def _run_impl(self) -> int:
         if self.pipeline is None:
             self.build()
+        self._force_process_exit = False
+        ended = threading.Event()
+        wait_errors: list[Exception] = []
+        stop_errors: list[Exception] = []
+        stopped = threading.Event()
+
+        def wait_for_pipeline() -> None:
+            try:
+                self.pipeline.wait()
+            except Exception as exc:
+                wait_errors.append(exc)
+            finally:
+                ended.set()
+                self.stop_event.set()
+
+        def stop_pipeline() -> None:
+            try:
+                self.pipeline.stop()
+            except Exception as exc:
+                stop_errors.append(exc)
+            finally:
+                stopped.set()
+
+        waiter = None
         try:
             self.pipeline.start(self._on_message)
+            # Service Maker can return from start() after a bus/startup error
+            # without emitting EOS or raising. One thread owns wait() for the
+            # entire replay, including teardown.
+            waiter = threading.Thread(target=wait_for_pipeline, name="offline-pipeline-wait", daemon=True)
+            waiter.start()
             while not self.stop_event.wait(0.2):
                 pass
+            if ended.is_set() and not self.eos_received:
+                detail = str(wait_errors[0]) if wait_errors else "pipeline ended without decoder EOS (startup or stream failure)"
+                raise RuntimeError(detail)
         except KeyboardInterrupt:
             self.exit_code = 130
             self._write_manifest("failed", "offline replay interrupted")
@@ -550,15 +582,28 @@ class OfflineInferenceApp:
         finally:
             if self.pipeline is not None:
                 try:
-                    if self.eos_received:
-                        self.pipeline.wait()
-                    else:
-                        self.pipeline.stop()
-                        self.pipeline.wait()
+                    deadline = time.monotonic() + OFFLINE_SHUTDOWN_TIMEOUT_S
+                    if waiter is None:
+                        # start() may raise after partially creating native
+                        # resources. Confirm wait() completion before closing
+                        # callback-owned files on this path as well.
+                        waiter = threading.Thread(target=wait_for_pipeline, name="offline-pipeline-wait", daemon=True)
+                        waiter.start()
+                    if waiter.ident is None:
+                        raise RuntimeError("offline pipeline waiter could not start")
+                    if not self.eos_received and not ended.is_set():
+                        threading.Thread(target=stop_pipeline, name="offline-pipeline-stop", daemon=True).start()
+                        if not stopped.wait(max(0, deadline - time.monotonic())):
+                            raise TimeoutError("offline pipeline stop timed out")
+                    if not ended.wait(max(0, deadline - time.monotonic())):
+                        raise TimeoutError("offline pipeline wait timed out")
+                    if stop_errors or wait_errors:
+                        raise (stop_errors or wait_errors)[0]
                 except Exception as exc:
                     self.exit_code = self.exit_code or 1
                     self._write_manifest("failed", str(exc))
-            if self.observations is not None:
+                    self._force_process_exit = not ended.is_set()
+            if self.observations is not None and not self._force_process_exit:
                 try:
                     self.observations.close()
                 except Exception as exc:
@@ -625,7 +670,10 @@ class OfflineInferenceApp:
         try:
             return self._run_impl()
         finally:
-            self.ledger.close()
+            # A native callback may still own these writers/locks after a
+            # timeout. The worker exits immediately rather than racing close.
+            if not getattr(self, "_force_process_exit", False):
+                self.ledger.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -739,7 +787,12 @@ def _run_worker(config: OfflineConfig) -> int:
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
-    return app.run()
+    code = app.run()
+    if getattr(app, "_force_process_exit", False):
+        # The failure manifest is already persisted. Avoid any further I/O or
+        # Python/native destructors while callbacks may still own resources.
+        os._exit(code or 1)
+    return code
 
 
 def main() -> int:

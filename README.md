@@ -729,19 +729,23 @@ controller time as `direct_boundary`. Changed measurements append new records;
 unchanged values keep their original entry timestamps. Manual entry time does
 not claim to be the physical time the weighing happened.
 
-After capture and serial close, finalization streams through the tables to add
-`controller_time_us`, `controller_time_method`, `controller_boot_id`, and
-`controller_session_id` to each row. Camera-trigger anchors are `exact_anchor`;
-intervening frame times are `piecewise_interpolated`. Sensor event times are
-`direct_event`; other controller records use `direct_record`. Host-only entries
-use the verified preflight clock midpoint as a `host_clock_estimate`, rather than
-claiming direct controller measurement. This estimate does not compensate for
-subsequent host wall-clock steps or clock drift. Without a usable synchronization
-anchor, the native timestamp remains present and controller time is explicitly
-`unavailable`. Live files have native timing; calculated controller columns are
-completed at finalization. Every MP4 frame retains video presentation timing and
-maps by frame index to the corresponding camera/controller timestamps in
-`frames.csv`; controller timestamps are not embedded as MP4 metadata.
+Every row is recorded with its native clocks. Camera and detection rows retain
+camera timestamps and host UTC/monotonic timestamps; sensor records retain their
+direct controller timestamps. Stop does not rewrite these CSVs.
+
+Controller-time mappings are resolved from retained synchronization evidence by
+`squeakview.common.row_timing.iter_timestamped_rows(run_dir, "frames.csv")`
+(or `detections.csv`, `sensors.csv`, `weigh_in.csv`). Camera-trigger anchors are
+`exact_anchor`; intervening frame times are `piecewise_interpolated`. Host-only
+entries use the preflight midpoint as a labelled `host_clock_estimate`, which
+does not correct subsequent host wall-clock steps or clock drift. Without a
+usable anchor the mapping is `unavailable`; native timestamps remain intact.
+The v2 analysis loader and pose-table reader handle both native tables and
+historical CSVs with materialized controller columns. The run layout declares
+`timing_contract: native_with_sync_anchors_v1`.
+
+Every MP4 frame retains video presentation timing and maps by frame index to
+`frames.csv`; controller timestamps are not embedded in the MP4.
 
 `_metadata/run_manifest.json` contains acquisition provenance, lifecycle status,
 and validation results. Bottle setup, measurements, and swap recovery state live
@@ -751,22 +755,31 @@ recording validation, and crash recovery. New runs no longer create separate
 `objects.csv`, `keypoints.csv`, `serial.csv`, or `bottle_measurements.csv` streams.
 Older runs retain their existing paths and remain readable without migration.
 
-`frames.csv` is written live by the FLIR source and remains the source of truth
-for captured frame identity. Shutdown validates its final index against the
-recording-admission ledger and MP4 sample count before adding controller timing.
-The timing pass uses streaming CSV rewrites and a disposable disk index, so it
-scales with run length without loading the run into memory. It adds a sequential
-pass at Stop; it does not decode or re-encode the movie.
+`frames.csv` is written live by the FLIR source. Native timestamps are checked
+while recording; invalid/regressed camera times fail acquisition. Shutdown
+compares final source, frame-manifest, admission and MP4 sample counts, checks
+cumulative camera faults, and persists the result. It does not create a timing
+SQLite index, scan primary CSVs, or archive recovery ledgers. The preflight check
+rejects an older FLIR plugin lacking live timestamp validation: rebuild with
+`bash scripts/build_native.sh` before using this version. No firmware update is
+required for this change.
 
-Terminal acquisition, model, Git, and storage provenance remains immutable.
-Later weigh-ins update measurement records, bottle metadata, and artifact
-inventory. The durable controller journal and capture/admission/inference
-ledgers remain in `_metadata/`. After successful validation, ordinary new runs
-retain capture/admission/inference ledgers as gzip files in `_metadata/recovery/`.
-Each compressed file is read back and verified before its plain original is
-removed; the manifest records byte counts and SHA-256 hashes. Recovery readers
-accept both formats. Debug, qualification, and validation-failed runs retain
-plain ledgers. Transient finalizer progress is cleaned up.
+Acquisition provenance remains immutable. Later weigh-ins update measurement
+records and bottle metadata after the bounded Stop operation releases ownership.
+Recovery ledgers remain plain under `_metadata/` by default. With SqueakView
+closed and exclusive ownership of a completed run, optional maintenance is:
+
+```bash
+.venv/bin/python -m squeakview.apps.inference.post_run /path/to/run --compact-metadata
+```
+
+This verifies gzip round trips before removing originals. Small retained final
+records allow subsequent fast checks without decompressing entire ledgers.
+A failed archive is reported separately from capture validity. Historical
+archives lacking those summaries require explicit `--full-analysis` for a
+recovery audit. Full analysis and `--materialize-timestamps` intentionally scan
+or rewrite data and require exclusive ownership; they are never automatic Stop
+work. `--align` requests detailed analysis explicitly, including legacy runs.
 
 Routine finalization reads the bounded MP4 sample tables without parsing or
 decoding the complete H.264 stream. It requires the sample-size, timing, and
@@ -1147,11 +1160,28 @@ headlessly:
 SQUEAKVIEW_DISABLE_PREVIEW=1 bash squeakview.sh
 ```
 
-Run the test suite without changing the environment:
+Run the software checks without changing the environment (Python tests plus
+camera-free native EOS and pose-parser tests):
 
 ```bash
-.venv/bin/python -m pytest -q
+.venv/bin/python scripts/test.py
 ```
+
+The command uses standard-library `unittest`; pytest is not required. An SDK
+build environment with CMake and the native headers is required. Use
+`--python-only` for an explicitly partial check, or `--pattern test_name.py` to
+focus Python discovery. Empty discovery and uncaught worker-thread exceptions
+fail the command. No recording, firmware flashing, CUDA inference, or hardware
+qualification is performed.
+
+The upgraded NVIDIA cuSPARSELt 0.8.1 ARM64 wheel has a platform-tag mismatch
+inside its `WHEEL` metadata. The test command reports this as a warning only
+when it is the sole `uv pip check` error, Torch requires that exact version,
+and the installed library, header and metadata match the reviewed upstream
+hashes in `squeakview/common/dependency_health.py`. It does not rewrite the
+wheel, environment or lockfile. A changed payload or any other dependency error
+fails. Plain `uv pip check` and `uv sync --check` can still report the upstream
+metadata issue; this exception supplies no evidence of GPU compatibility.
 
 ## Git policy
 

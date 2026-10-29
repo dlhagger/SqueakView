@@ -58,6 +58,20 @@ def _lifecycle_view() -> SimpleNamespace:
 
 
 class RunPresenterTests(unittest.TestCase):
+    def test_only_confirmed_capture_exit_unlocks_weight_entry_during_stop(self):
+        view = _lifecycle_view()
+        view.bottle_panel = mock.Mock()
+        controller = RunLifecycleController(view)
+        controller.stop_in_progress = True
+        for phase in (RunPhase.STOPPING, RunPhase.DRAINING, RunPhase.CAPTURE_CLOSED):
+            controller.handle_backend_event(SimpleNamespace(phase=phase))
+        view._hide_stop_overlay.assert_not_called()
+        view.bottle_panel.set_run_state.assert_not_called()
+        controller.handle_backend_event(SimpleNamespace(phase=RunPhase.VALIDATING))
+        view._hide_stop_overlay.assert_called_once()
+        view.bottle_panel.set_run_state.assert_called_once_with('validating')
+        view.run_btn.setEnabled.assert_called_with(False)
+
     def test_dirty_measurements_must_be_resolved_before_shutdown(self):
         for confirmed in (False, True):
             with self.subTest(confirmed=confirmed):

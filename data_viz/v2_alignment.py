@@ -45,6 +45,13 @@ class V2RunData:
     anchors: pd.DataFrame
     frames: pd.DataFrame
     events: pd.DataFrame
+    lick_observation_gaps: tuple[dict, ...] = ()
+
+    @property
+    def lick_observation_complete(self) -> bool:
+        return not any(gap['resumed_monotonic_us'] is None or
+                       gap['resumed_monotonic_us'] > gap['paused_monotonic_us']
+                       for gap in self.lick_observation_gaps)
 
 
 def find_latest_run(
@@ -506,9 +513,38 @@ def load_v2_run(run_dir: Path) -> V2RunData:
     if summary_session is not None and int(summary_session) != timing.session_id:
         raise ValueError("controller summary/camera session IDs disagree")
     source_frames = pd.read_csv(artifact_path(run_dir, "frames.csv"), low_memory=False)
+    if not triggered and "controller_time_method" not in source_frames:
+        from squeakview.common.run_outputs import ClockMapping
+        mapping = ClockMapping(run_dir)
+        source_frames['controller_time_us'] = pd.Series(pd.NA, index=source_frames.index, dtype='Int64')
+        source_frames['controller_time_method'] = 'unavailable'
+        source_frames['controller_boot_id'] = ''
+        source_frames['controller_session_id'] = ''
+        if mapping.sample is not None and mapping.valid_boot:
+            sample = mapping.sample
+            controller = (int(sample['rp2040_receive_us']) + int(sample['rp2040_send_us'])) // 2
+            host = (int(sample['jetson_send_ns']) + int(sample['jetson_receive_ns'])) // 2
+            estimates = controller + (pd.to_numeric(source_frames.host_unix_ns, errors='raise').astype('int64') - host) // 1000
+            valid = estimates.ge(0)
+            source_frames.loc[valid, 'controller_time_us'] = estimates.loc[valid]
+            source_frames.loc[valid, 'controller_time_method'] = 'host_clock_estimate'
+            source_frames.loc[valid, 'controller_boot_id'] = str(mapping.boot)
+            source_frames.loc[valid, 'controller_session_id'] = str(mapping.session)
     frames = (align_frames_v2(source_frames, anchors) if triggered else
               align_free_running_frames(source_frames, epoch_us=timing.start_us))
     events = controller_events(journal, anchors, timing=timing)
+    from squeakview.common.lick_recovery import load_lick_recovery_gaps, observation_valid
+    gaps = load_lick_recovery_gaps(run_dir)
+    for gap in gaps:
+        if (str(gap['controller_boot_id']), str(gap['controller_session_id'])) != (str(timing.boot_id), str(timing.session_id)):
+            raise ValueError('lick recovery clock does not match the recording controller clock')
+    events['lick_observation_valid'] = pd.array([
+        observation_valid(gaps, int(row.rp2040Time)) if str(row.eventType).startswith('DRINK_')
+        and pd.notna(row.rp2040Time) else pd.NA for row in events.itertuples()
+    ], dtype='boolean')
+    gaps = tuple(dict(gap, start_time_s=(gap['paused_monotonic_us'] - timing.start_us) / 1e6,
+                      end_time_s=None if gap['resumed_monotonic_us'] is None else
+                      (gap['resumed_monotonic_us'] - timing.start_us) / 1e6) for gap in gaps)
     return V2RunData(
         status=status,
         manifest=manifest,
@@ -517,4 +553,5 @@ def load_v2_run(run_dir: Path) -> V2RunData:
         anchors=anchors,
         frames=frames,
         events=events,
+        lick_observation_gaps=gaps,
     )

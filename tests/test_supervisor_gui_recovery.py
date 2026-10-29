@@ -14,7 +14,7 @@ import time
 import unittest
 from unittest import mock
 
-from test_supervisor_server import FakeBackend, _runtime_context
+from tests.test_supervisor_server import FakeBackend, _runtime_context
 from squeakview.apps.operator.backend.events import RunPhase
 from squeakview.apps.operator.backend.supervisor.protocol import CommandEnvelope
 from squeakview.apps.operator.backend.supervisor.server import SupervisorServer

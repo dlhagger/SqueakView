@@ -751,11 +751,9 @@ class OperatorBackend:
             self._observe_bottle_runtime()
             self._bottle_swap.finalize()
             self._persist_bottle_swap_summary()
-        alignment_required = bool(
-            getattr(self.launch_cfg, "serial_enabled", False)
-            and getattr(self.launch_cfg, "trigger_on", False)
-            and getattr(self.launch_cfg, "controller_protocol", "v2") != "v2"
-        )
+        # Detailed legacy alignment is an explicit analysis operation. Stop
+        # validates capture closure, counts and live integrity evidence only.
+        alignment_required = False
         return finalizer.run_capture_finalizer(
             run_dir,
             camera_count=int(getattr(self.launch_cfg, "num_cameras", 1)),
@@ -800,12 +798,7 @@ class OperatorBackend:
                         controller_protocol=getattr(
                             self.launch_cfg, "controller_protocol", "v2"
                         ),
-                        alignment_required=bool(
-                            getattr(self.launch_cfg, "serial_enabled", False)
-                            and getattr(self.launch_cfg, "trigger_on", False)
-                            and getattr(self.launch_cfg, "controller_protocol", "v2")
-                            != "v2"
-                        ),
+                        alignment_required=False,
                         failure_plan=self._failure_plan,
                     ),
                     lifecycle.FinalizationHooks(

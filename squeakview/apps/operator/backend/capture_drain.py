@@ -67,27 +67,11 @@ def ledger_size_snapshot(run_dir: Path, camera_count: int) -> tuple[int, ...]:
 
 
 def last_complete_ledger_line(path: Path) -> str | None:
-    """Read the last complete nonempty line without scanning a long ledger."""
-
+    from squeakview.common.ledger_tail import last_complete_line
     try:
-        with open_artifact(Path(path), "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            end = handle.tell()
-            if end <= 0:
-                return None
-            read_size = min(end, 65_536)
-            handle.seek(end - read_size)
-            data = handle.read(read_size)
-    except OSError:
+        return last_complete_line(path)
+    except (OSError, ValueError):
         return None
-    lines = data.splitlines()
-    if data and not data.endswith((b"\n", b"\r")):
-        lines = lines[:-1]
-    for line in reversed(lines):
-        decoded = line.decode(errors="replace").strip()
-        if decoded:
-            return decoded
-    return None
 
 
 def ledger_frame_counts(

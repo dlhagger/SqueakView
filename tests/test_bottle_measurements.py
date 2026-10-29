@@ -130,6 +130,23 @@ class BottlePayloadTests(unittest.TestCase):
 
 
 class BottleMeasurementPanelTests(unittest.TestCase):
+    def test_final_weights_can_be_entered_during_validation_and_survive_completion(self):
+        self.panel.set_run_state('recording')
+        self.assertFalse(self.panel.left_final_weight_edit.isEnabled())
+        self.panel.set_run_state('validating')
+        self.assertTrue(self.panel.left_final_weight_edit.isEnabled())
+        self.assertTrue(self.panel.right_final_weight_edit.isEnabled())
+        self.assertFalse(self.panel.left_initial_weight_edit.isEnabled())
+        self.assertFalse(self.panel.save_button.isEnabled())
+        self.assertFalse(self.panel.save_button.isHidden())
+        self.assertEqual(self.panel.phase_label.text(), 'Final weights')
+        self.panel.left_final_weight_edit.setText('29')
+        self.panel.right_final_weight_edit.setText('31')
+        self.panel.set_run_state('complete')
+        self.assertEqual(self.panel.left_final_weight_edit.text(), '29')
+        self.assertEqual(self.panel.right_final_weight_edit.text(), '31')
+        self.assertTrue(self.panel.save_button.isEnabled())
+
     def test_recovery_warning_is_visible_without_opening_bottle_history(self):
         snapshot = {"available": True, "state": "ACTIVE", "lick_recovery": {
             "state": "RECOVERING", "available": False, "attempts": 1}}

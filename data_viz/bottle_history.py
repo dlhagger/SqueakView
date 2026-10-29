@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from squeakview.common.run_layout import artifact_path, is_primary_layout
 from typing import Any
+from squeakview.common.lick_recovery import load_lick_recovery_gaps, observation_valid
 
 
 @dataclass(frozen=True)
@@ -19,12 +20,13 @@ class BottleHistory:
     gaps: tuple[dict[str, Any], ...]
 
     def observation_valid(self, monotonic_us: int) -> bool:
-        stamp = int(monotonic_us)
-        for gap in self.gaps:
-            start, end = gap['paused_monotonic_us'], gap['resumed_monotonic_us']
-            if start is not None and stamp >= start and (end is None or stamp < end):
-                return False
-        return True
+        return observation_valid(self.gaps, int(monotonic_us))
+
+    @property
+    def lick_observation_complete(self) -> bool:
+        return not any(gap['resumed_monotonic_us'] is None or
+                       (gap['paused_monotonic_us'] is not None and
+                        gap['resumed_monotonic_us'] > gap['paused_monotonic_us']) for gap in self.gaps)
 
     def bottle_for_event(self, side: str, monotonic_us: int, *, count: int | None = None):
         """Return the installed bottle, excluding the shared pause/calibration gap.
@@ -54,6 +56,9 @@ class BottleHistory:
 
 def load_bottle_history(run_dir: str | Path) -> BottleHistory | None:
     path = Path(run_dir)
+    root = path if path.is_dir() else path.parent
+    if root.name == '_metadata' and is_primary_layout(root.parent):
+        root = root.parent
     payload = None
     if (path.is_dir() and is_primary_layout(path)) or path.name == 'weigh_in.csv':
         from squeakview.common.bottle_csv import load_swap_state
@@ -79,7 +84,8 @@ def load_bottle_history(run_dir: str | Path) -> BottleHistory | None:
         bottle['lick_count'] = max(0, end - bottle['start_count'])
         initial, final = bottle['initial_weight_g'], bottle['final_weight_g']
         bottle['intake_g'] = None if initial is None or final is None else initial - final
-    return BottleHistory(tuple(bottles), tuple(payload['gaps']))
+    gaps = [*payload['gaps'], *load_lick_recovery_gaps(root)]
+    return BottleHistory(tuple(bottles), tuple(sorted(gaps, key=lambda gap: gap['paused_monotonic_us'] or 0)))
 
 
 def annotate_bottle_events(events, history: BottleHistory):

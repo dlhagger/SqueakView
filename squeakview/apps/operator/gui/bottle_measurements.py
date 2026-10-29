@@ -446,13 +446,15 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
                 "starting": "Saving starting measurements with this run…",
                 "recording": "Starting measurements saved. Enter final weights after Stop Recording.",
                 "finalizing": "Wait for recording to finish before entering final weights.",
+                "validating": "Capture stopped. Enter final bottle weights now; Save becomes available when validation finishes.",
                 "complete": "Enter final bottle weights, then save.",
                 "failed": "Recording stopped. Measurements can still be saved; check Events for the run error.",
             }.get(state, ""))
         self._update_form_controls()
 
     def _update_form_controls(self) -> None:
-        active = self._run_state in {"starting", "recording", "finalizing"}
+        validating = self._run_state == "validating"
+        active = self._run_state in {"starting", "recording", "finalizing", "validating"}
         if self._run_state is None:
             active = self._swap_recording
         for side in ("left", "right"):
@@ -461,18 +463,19 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
                 widget.setEnabled(not active)
                 widget.setToolTip("Use Swap Bottles to preserve bottle history." if active else "")
             getattr(self, f"{side}_final_weight_edit").setEnabled(
-                not active and self._run_state != "ready")
+                (not active or validating) and self._run_state != "ready")
             getattr(self, f"{side}_final_weight_edit").setPlaceholderText(
-                "After Stop" if active or self._run_state == "ready" else "final")
+                "After Stop" if (active and not validating) or self._run_state == "ready" else "final")
         self.mouse_weight_edit.setEnabled(not active)
         self.save_button.setText("Saved" if self._save_acknowledged else "Save weights")
         self.save_button.setEnabled(not active and self._run_state != "ready" and not self._save_acknowledged)
-        self.save_button.setVisible(not active and self._run_state != "ready")
+        self.save_button.setVisible((not active or validating) and self._run_state != "ready")
         self.history_toggle.setVisible(self._run_state != "ready")
         self._update_phase_heading()
         self.save_button.setToolTip(
             "Initial measurements are saved automatically when recording starts."
             if self._run_state == "ready" else
+            "Save becomes available when validation finishes." if validating else
             "Stop recording before saving final measurements." if active else "")
 
     def clear_final_fields(self) -> None:
@@ -521,6 +524,7 @@ class BottleMeasurementPanel(QtWidgets.QGroupBox):
             "starting": "Starting recording",
             "recording": "Recording",
             "finalizing": "Finishing recording",
+            "validating": "Final weights",
             "complete": "Final weights",
             "failed": "Recording stopped",
         }.get(self._run_state, "Before recording"))

@@ -366,7 +366,7 @@ class ObservationOperator(BatchMetadataOperator):
         self.source_name = str(source_name)
         self._lock = threading.Lock()
         self._closed = False
-        self.persistence = PoseCsvWriter(run_dir, schema.keypoint_names)
+        self.persistence = PoseCsvWriter(run_dir, schema.keypoint_names, require_native_timing=True)
         # Retain these implementation attributes for compatibility with local
         # diagnostics that inspected the former inline writer.
         self._files = self.persistence._files
@@ -458,6 +458,9 @@ class ObservationOperator(BatchMetadataOperator):
                     else None
                 ) or self.frame_ledger.get(frame_number, {})
                 source_sequence = flir.get("source_sequence_index")
+                native_stream = flir.get('camera_index', flir.get('stream_id'))
+                if self.persistence._require_native_timing and native_stream is not None and int(native_stream) != stream_id:
+                    raise ValueError('detection source disagrees with native camera identity')
                 if source_sequence in (None, ""):
                     source_sequence = flir.get("raw_frame_index")
                 camera_frame_id = flir.get("camera_frame_id")

@@ -3,8 +3,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from squeakview.apps.operator.backend.run_lock import AcquisitionLock
+from squeakview.project.locking import OwnershipLock
 
 
 class AcquisitionLockTests(unittest.TestCase):
@@ -44,6 +46,26 @@ class AcquisitionLockTests(unittest.TestCase):
                 AcquisitionLock(link).acquire()
 
             self.assertEqual(target.read_text(), "preserve")
+
+
+class OwnershipLockPersistenceTests(unittest.TestCase):
+
+    def test_lock_failure_releases_unpublished_handle_with_traceback_retained(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "owner.lock"
+            for target in ("os.fsync", "json.dump", "socket.gethostname"):
+                lock = OwnershipLock(path, purpose="first")
+                retained = []
+                with mock.patch("squeakview.project.locking." + target, side_effect=OSError("write failed")):
+                    try:
+                        lock.acquire()
+                    except OSError as error:
+                        retained.append(error)
+                self.assertTrue(retained)
+                self.assertFalse(lock.held)
+                other = OwnershipLock(path, purpose="second")
+                self.assertTrue(other.acquire())
+                other.release()
 
 
 if __name__ == "__main__":

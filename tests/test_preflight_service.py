@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import sys
+import tracemalloc
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +13,25 @@ from squeakview.apps.operator.backend import preflight
 
 
 class PreflightServiceTests(unittest.TestCase):
+    def test_pending_line_memory_is_bounded_independently_from_forwarded_text(self):
+        for byte_count in (2 * 1024 * 1024, 8 * 1024 * 1024):
+            with self.subTest(bytes=byte_count):
+                lines = []
+                tracemalloc.start()
+                try:
+                    result = preflight._run_bounded_preflight(
+                        [sys.executable, "-c", f"import sys;sys.stdout.buffer.write(b'x'*{byte_count}+b'\\nrecovered \\xc3\\xa9\\n')"],
+                        cwd="/tmp", env=dict(os.environ), timeout_s=5, on_line=lines.append,
+                    )
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                self.assertTrue(result.truncated)
+                self.assertEqual(lines[-1], "recovered é")
+                self.assertLessEqual(max(len(line.encode()) for line in lines), preflight.MAX_PREFLIGHT_LINE_BYTES + 30)
+                self.assertEqual(sum("line truncated" in line for line in lines), 1)
+                self.assertLess(peak, 24 * preflight.MAX_PREFLIGHT_LINE_BYTES)
+
     def test_missing_preflight_script_fails_closed(self) -> None:
         result = preflight.run_preflight(
             preflight.PreflightRequest(),

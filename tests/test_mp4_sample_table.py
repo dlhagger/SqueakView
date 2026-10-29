@@ -3,6 +3,8 @@ from __future__ import annotations
 import struct
 import tempfile
 import unittest
+import io
+from unittest import mock
 from pathlib import Path
 
 from squeakview.apps.inference.mp4_sample_table import read_video_sample_table
@@ -44,6 +46,20 @@ def _fixture(*, samples: int = 3, timing_samples: int | None = None, bad_offset:
 
 
 class Mp4SampleTableTests(unittest.TestCase):
+    def test_large_chunk_table_uses_bounded_reads_and_checks_late_offsets(self):
+        from squeakview.apps.inference import mp4_sample_table as module
+        count = 100_000
+        header = b'\0'*4 + struct.pack('>I', count)
+        offsets = b''.join(struct.pack('>I', 1000+index) for index in range(count))
+        payload = header + offsets
+        box = module.Box(b'stco', 0, 0, len(payload))
+        with mock.patch.object(module, '_read_exact', wraps=module._read_exact) as read:
+            self.assertEqual(module._chunk_count(io.BytesIO(payload), box, ((1000, 1000+count),)), count)
+        self.assertLess(len(read.call_args_list), 12)
+        self.assertLessEqual(max(call.args[2] for call in read.call_args_list), 65_536)
+        broken = payload[:-4] + struct.pack('>I', 1000+count)
+        with self.assertRaisesRegex(ValueError, 'outside every media-data box'):
+            module._chunk_count(io.BytesIO(broken), box, ((1000, 1000+count),))
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.path = Path(self.temp_dir.name) / "raw.mp4"

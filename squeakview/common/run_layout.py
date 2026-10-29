@@ -8,6 +8,27 @@ from pathlib import Path
 PRIMARY_FILES = ("frames.csv", "raw.mp4", "sensors.csv", "detections.csv", "weigh_in.csv")
 ALIASES = {"serial.csv": "sensors.csv", "objects.csv": "detections.csv",
            "bottle_measurements.csv": "weigh_in.csv"}
+NATIVE_TIMING_CONTRACT = "native_with_sync_anchors_v1"
+
+
+def uses_native_timing(run_dir: Path) -> bool:
+    marker = Path(run_dir) / "_metadata" / "layout.json"
+    if not marker.exists():
+        return False
+    from .run_context import read_json_required
+    return read_json_required(marker, max_bytes=4096).get("timing_contract") == NATIVE_TIMING_CONTRACT
+
+
+def publish_native_timing(run_dir: Path) -> None:
+    """Declare native CSV clocks plus read-time mapping; never alter CSV rows."""
+    if not is_primary_layout(run_dir):
+        return
+    from .run_context import read_json_required, atomic_write_json
+    marker = Path(run_dir) / "_metadata" / "layout.json"
+    payload = read_json_required(marker, max_bytes=4096)
+    payload.update(timing_contract=NATIVE_TIMING_CONTRACT,
+                   timestamps="native timestamps on every row; controller mappings resolved from synchronization evidence")
+    atomic_write_json(marker, payload)
 
 
 def is_primary_layout(run_dir: Path) -> bool:
@@ -29,7 +50,8 @@ def initialize_layout(run_dir: Path, *, compact_metadata: bool = False) -> None:
     directory.mkdir()
     with (directory / "layout.json").open("x") as handle:
         handle.write(json.dumps({"schema_version": 1, "compact_metadata": compact_metadata, "primary_files": PRIMARY_FILES,
-            "timestamps": "native plus labelled controller mapping"}) + "\n")
+            "timing_contract": NATIVE_TIMING_CONTRACT,
+            "timestamps": "native timestamps on every row; controller mappings resolved from synchronization evidence"}) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
     for path in (directory, Path(run_dir)):

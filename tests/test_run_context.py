@@ -8,7 +8,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from squeakview.apps.operator.backend.contracts import RunRequest
+from squeakview.apps.operator.backend.startup import validate_startup_policy
 from squeakview.common import run_context
+from squeakview.common.measurements import MAX_WEIGHT_G, weight_value
+from squeakview.common.run_layout import initialize_layout
 
 
 class RunContextTests(unittest.TestCase):
@@ -208,6 +212,45 @@ class RunContextTests(unittest.TestCase):
         self.assertTrue(summary["complete"])
         self.assertEqual({row["entered_at_iso"] for row in rows}, {"first"})
         self.assertEqual({row["entered_at_unix_ns"] for row in rows}, {"100"})
+
+
+class MeasurementPersistenceTests(unittest.TestCase):
+
+    def test_bottle_weight_clear_is_visible_after_reopening(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            initialize_layout(root, compact_metadata=True)
+            for final in (20, None, None, 19):
+                run_context.write_bottle_artifacts(root, {'left': {'fluid': 'water', 'initial_weight_g': 25, 'final_weight_g': final}})
+                self.assertEqual(run_context.bottle_setup(root)['sides']['left']['final_weight_g'], final)
+            with (root / 'weigh_in.csv').open(newline='') as handle:
+                rows = [row for row in csv.DictReader(handle) if row['side'] == 'left' and row['phase'] == 'final']
+            self.assertEqual([row['weight_g'] for row in rows], ['20.0', '', '19.0'])
+
+    def test_weight_limits_are_enforced_before_start_and_before_writing(self):
+        self.assertEqual(weight_value(MAX_WEIGHT_G, 'Bottle'), MAX_WEIGHT_G)
+        self.assertEqual(weight_value(0, 'Bottle'), 0)
+        for value in (454251, float('nan'), float('inf'), -1, True):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    validate_startup_policy(RunRequest(bottles={'mouse_weight_g': value}))
+                with tempfile.TemporaryDirectory() as temp:
+                    with self.assertRaises(ValueError):
+                        run_context.write_bottle_artifacts(Path(temp), {'mouse_weight_g': value})
+                    self.assertFalse(list(Path(temp).iterdir()))
+
+    def test_clear_and_correct_mouse_weight_preserves_timestamped_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            initialize_layout(root, compact_metadata=True)
+            for value in (25, None, None, 26):
+                run_context.write_bottle_artifacts(root, {'mouse_weight_g': value})
+                self.assertEqual(run_context.bottle_summary(root)['mouse_weight_g'], value)
+            with (root / 'weigh_in.csv').open(newline='') as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row['weight_g'] for row in rows], ['25.0', '', '26.0'])
+            self.assertEqual(rows[1]['event'], 'measurement_cleared')
+            self.assertTrue(all((row['host_unix_ns'] and row['host_monotonic_ns'] for row in rows)))
 
 
 if __name__ == "__main__":

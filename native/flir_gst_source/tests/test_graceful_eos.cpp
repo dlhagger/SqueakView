@@ -174,9 +174,23 @@ static void production_eos_boundary() {
   gst_object_unref(src);
 }
 
+static void native_timestamp_contract() {
+  g_assert_false(native_timestamp_is_valid(std::nullopt, 0, 0));
+  g_assert_true(native_timestamp_is_valid(0, 0, 0));
+  g_assert_true(native_timestamp_is_valid(101, 1, 100));
+  g_assert_false(native_timestamp_is_valid(100, 1, 100));
+  g_assert_false(native_timestamp_is_valid(99, 1, 100));
+  auto* src = GST_FLIR_SPIN_SRC(g_object_new(GST_TYPE_FLIR_SPIN_SRC, nullptr));
+  gboolean available = FALSE;
+  g_object_get(src, "native-timing-validation", &available, nullptr);
+  g_assert_true(available);
+  gst_object_unref(src);
+}
+
 int main(int argc, char** argv) {
   gst_init(&argc, &argv);
   g_test_init(&argc, &argv, nullptr);
+  g_test_add_func("/flir/timing/live-native-validation", native_timestamp_contract);
   g_test_add_func("/flir/eos/production-boundary", production_eos_boundary);
   g_test_add_func("/flir/eos/inflight-free-running", [] { assert_pipeline_drains(1, false); });
   g_test_add_func("/flir/eos/inflight-two-cameras", [] { assert_pipeline_drains(2, false); });

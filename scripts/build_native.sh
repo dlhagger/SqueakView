@@ -64,7 +64,7 @@ FLIR_INSPECT="$(
   GST_PLUGIN_PATH="$APP_ROOT/native/flir_gst_source/build:/opt/nvidia/deepstream/deepstream/lib/gst-plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
     gst-inspect-1.0 flirspinsrc
 )"
-for property in capture-log-path frame-manifest-path camera-telemetry-path error-log-path camera-runtime-path; do
+for property in capture-log-path frame-manifest-path camera-telemetry-path error-log-path camera-runtime-path native-timing-validation; do
   case "$FLIR_INSPECT" in
     *"$property"*) ;;
     *)

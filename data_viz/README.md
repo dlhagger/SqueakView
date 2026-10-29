@@ -73,7 +73,7 @@ _metadata/
   layout.json                   Run layout marker
   config/                       Configuration snapshots
   diagnostics/                  Controller journal and runtime evidence
-  recovery/                     Verified gzip capture/admission/inference ledgers
+  recovery/                     Optional, explicitly archived gzip ledgers
 ```
 
 Historical recordings retain their original files, including `run_status.json`,
@@ -241,10 +241,37 @@ returns `None` when loading an older run without bottle history.
 New recordings use `frames.csv`, `raw.mp4`, `sensors.csv`, `detections.csv`, and
 `weigh_in.csv`, with recovery and provenance artifacts under `_metadata/`.
 The Python loaders resolve both this layout and historical runs. Primary CSVs
-contain native timestamps and labelled controller-time mappings on each row
-after finalization; manual weigh-in times describe entry time.
+retain native timestamps on every row. The v2 and pose loaders derive labelled
+controller mappings on read; Stop does not rewrite CSVs. Manual weigh-in times
+describe entry time. For streaming analysis use
+`squeakview.common.row_timing.iter_timestamped_rows(run_dir, "frames.csv")`
+(or `detections.csv`, `sensors.csv`, `weigh_in.csv`).
+Synchronization anchors remain under `_metadata/diagnostics/`. The timing
+reader supports more than eleven days at the nominal one-second checkpoint
+cadence while retaining a finite one-million-anchor bound.
 
 Bottle history and observation gaps for new runs are loaded directly from
 `weigh_in.csv`, including controller-confirmed swap boundaries and cumulative
 lick counters. Separate bottle-history JSON/JSONL files are only used by older
 recordings.
+
+
+Automatic `LICK_RECOVERY_*` events in `sensors.csv` also contribute shared
+observation gaps. Repeated left/right status records are deduplicated by the
+controller boot, session and recovery ID. Failed recovery stays open until a
+READY or STOPPED boundary. Bottle identities are preserved. Both the bottle
+history and v2 loader expose `lick_observation_complete`; the v2 loader also
+returns `lick_observation_gaps` and nullable `lick_observation_valid` on drink
+events. Counts observed outside gaps remain useful, but a total spanning a gap
+is incomplete. Exclude gap durations from rates and do not interpret them as
+zero licking.
+
+The teaching notebook shades these intervals on controller-time plots. It
+supports capture-only recordings with inference explicitly disabled and no pose
+schema; pose cells skip cleanly. Missing schemas for pose-enabled runs remain
+errors. Its software tests execute all code cells with both capture-only and
+pose-bearing fixtures. Run the project checks with:
+
+```bash
+.venv/bin/python scripts/test.py
+```

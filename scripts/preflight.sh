@@ -290,10 +290,11 @@ if [ "$CAPTURE_BACKEND" = "flir_direct" ]; then
     if printf '%s' "$FLIR_PROPERTIES" | grep -q 'frame-manifest-path' \
       && printf '%s' "$FLIR_PROPERTIES" | grep -q 'camera-telemetry-path' \
       && printf '%s' "$FLIR_PROPERTIES" | grep -q 'error-log-path' \
-      && printf '%s' "$FLIR_PROPERTIES" | grep -q 'camera-runtime-path'; then
+      && printf '%s' "$FLIR_PROPERTIES" | grep -q 'camera-runtime-path' \
+      && printf '%s' "$FLIR_PROPERTIES" | grep -q 'native-timing-validation'; then
       pass "GStreamer element 'flirspinsrc' supports live scientific ledgers"
     else
-      printf '[FAIL] flirspinsrc is stale: live frame/diagnostic outputs are unavailable\n'
+      printf '[FAIL] flirspinsrc is stale: live frame/diagnostic outputs or native timestamp validation are unavailable; run bash scripts/build_native.sh\n'
       fail=1
     fi
   else

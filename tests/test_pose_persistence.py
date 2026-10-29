@@ -13,6 +13,23 @@ from squeakview.apps.inference.pose_persistence import (
 
 
 class PoseCsvWriterTests(unittest.TestCase):
+    def test_primary_live_writer_rejects_missing_and_regressed_native_clocks(self):
+        from squeakview.common.run_layout import initialize_layout
+        initialize_layout(self.root)
+        writer = PoseCsvWriter(self.root, require_native_timing=True)
+        self.addCleanup(writer.close)
+        values = dict.fromkeys(OBJECT_HEADERS, '')
+        values.update(stream_id=0, source_sequence_index=0, camera_timestamp_ns=100, gst_pts_ns=0)
+        def write(**clocks):
+            writer.write_object([values[name] for name in OBJECT_HEADERS], **clocks)
+        with self.assertRaisesRegex(ValueError, 'host_unix_ns'):
+            write()
+        write(host_unix_ns=1000, host_monotonic_ns=2000)
+        values.update(source_sequence_index=1, camera_timestamp_ns=99)
+        with self.assertRaisesRegex(ValueError, 'regressed'):
+            write(host_unix_ns=2000, host_monotonic_ns=3000)
+        values['camera_timestamp_ns'] = 101
+        write(host_unix_ns=2000, host_monotonic_ns=3000)
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

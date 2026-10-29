@@ -30,6 +30,7 @@ from squeakview.apps.operator.gui.run_presentation import (
     scan_capture_health,
 )
 from squeakview.common import run_context
+from squeakview.apps.operator.gui.finalization_overlay import present_finalization as present_stop_progress
 
 
 RUN_FAILURE_DIALOG_STYLESHEET = """
@@ -66,6 +67,7 @@ class RunLifecycleController(QtCore.QObject):
         self.close_after_start = False
         self.start_failure_reported = False
         self.stop_in_progress = False
+        self.capture_closed_for_weights = False
         self.stop_thread: threading.Thread | None = None
         self.close_after_stop = False
         self.recording_active = False
@@ -92,6 +94,14 @@ class RunLifecycleController(QtCore.QObject):
         self.view._set_run_state(presentation.badge_state)
         self.view.preview.set_status(presentation.preview_status)
         self._set_buttons(presentation)
+        # VALIDATING is published only after the capture process exit has
+        # been confirmed. CAPTURE_CLOSED alone also occurs on failure paths
+        # where an unresponsive child may still own the recording.
+        if event.phase == RunPhase.VALIDATING:
+            self.capture_closed_for_weights = True
+        if event.phase == RunPhase.VALIDATING or (self.stop_in_progress and self.capture_closed_for_weights):
+            self.view._hide_stop_overlay()
+            self.view.bottle_panel.set_run_state("validating")
 
     def _present_clock_preflight(self, event: BackendEvent) -> None:
         labels = getattr(self.view, "clock_labels", {})
@@ -208,10 +218,12 @@ class RunLifecycleController(QtCore.QObject):
         if run_dir is None:
             return
         run_path = Path(run_dir)
-        self.view.stop_overlay.update_progress(
-            run_context.read_json(artifact_path(run_path, "run_status.json")),
-            run_context.read_json(artifact_path(run_path, "post_run_progress.json")),
-        )
+        status = run_context.read_json(artifact_path(run_path, "run_status.json"))
+        progress = run_context.read_json(artifact_path(run_path, "post_run_progress.json"))
+        self.view.stop_overlay.update_progress(status, progress)
+        if self.capture_closed_for_weights:
+            presentation = present_stop_progress(status, progress)
+            self.view._set_capture_health(presentation.title, "warning")
 
     def start(self) -> None:
         if not self.active:
@@ -488,6 +500,7 @@ class RunLifecycleController(QtCore.QObject):
         if self.stop_in_progress or self.start_in_progress:
             return
         self.stop_in_progress = True
+        self.capture_closed_for_weights = False
         self.recording_active = False
         self.stop_started_monotonic = self.monotonic()
         view._set_run_state("finalizing")

@@ -186,28 +186,12 @@ def _validate_acquisition_integrity(
     return result.to_dict(), result.passed
 
 
-def _last_complete_line(path: Path) -> str | None:
-    """Read one bounded final ledger record without scanning the whole file."""
-
+def _last_complete_line(path: Path, *, run_dir=None) -> str | None:
+    from squeakview.common.ledger_tail import last_complete_line
     try:
-        with open_artifact(Path(path), "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            end = handle.tell()
-            if end <= 0:
-                return None
-            read_size = min(end, MAX_LEDGER_TAIL_BYTES)
-            handle.seek(end - read_size)
-            data = handle.read(read_size)
+        return last_complete_line(path, run_dir=run_dir)
     except OSError:
         return None
-    lines = data.splitlines()
-    if data and not data.endswith((b"\n", b"\r")):
-        lines = lines[:-1]
-    for line in reversed(lines):
-        text = line.decode("utf-8", errors="strict").strip()
-        if text:
-            return text
-    return None
 
 
 def _durable_ledger_counts(run_dir: Path, camera_count: int) -> dict[int, tuple[int, int]]:
@@ -219,8 +203,8 @@ def _durable_ledger_counts(run_dir: Path, camera_count: int) -> dict[int, tuple[
         admission_path = artifact_path(run_dir, "record_admission.csv"
             if stream_id == 0
             else f"record_admission_cam{stream_id}.csv")
-        capture_line = _last_complete_line(capture_path)
-        admission_line = _last_complete_line(admission_path)
+        capture_line = _last_complete_line(capture_path, run_dir=run_dir)
+        admission_line = _last_complete_line(admission_path, run_dir=run_dir)
         try:
             capture_payload = json.loads(capture_line or "")
             capture_index = capture_payload["source_sequence_index"]
@@ -251,7 +235,7 @@ def _durable_frame_manifest_counts(run_dir: Path, camera_count: int) -> dict[int
     counts: dict[int, int] = {}
     for stream_id in range(camera_count):
         path = artifact_path(run_dir, "frames.csv" if stream_id == 0 else f"frames_cam{stream_id}.csv")
-        line = _last_complete_line(path)
+        line = _last_complete_line(path, run_dir=run_dir)
         try:
             from squeakview.common.run_outputs import TIMING_FIELDS
             with open_artifact(path, "rb") as handle:
@@ -287,7 +271,7 @@ def _bounded_acquisition_integrity(run_dir: Path, camera_count: int) -> tuple[di
 
     cameras: list[dict[str, object]] = []
     for stream_id in range(camera_count):
-        line = _last_complete_line(artifact_path(run_dir, f"capture_cam{stream_id}.jsonl"))
+        line = _last_complete_line(artifact_path(run_dir, f"capture_cam{stream_id}.jsonl"), run_dir=run_dir)
         try:
             payload = json.loads(line or "")
         except json.JSONDecodeError as exc:
@@ -295,6 +279,9 @@ def _bounded_acquisition_integrity(run_dir: Path, camera_count: int) -> tuple[di
                 f"cannot read final acquisition counters for camera {stream_id}: {exc}"
             ) from exc
         counters: dict[str, int] = {}
+        from squeakview.common.run_layout import is_primary_layout
+        if is_primary_layout(run_dir) and payload.get('native_timing_validated') is not True:
+            raise RuntimeError('Live native timestamp validation was not confirmed; rebuild the FLIR source plugin. Use explicit --full-analysis to audit older captures.')
         for name in (
             "total_incomplete",
             "total_frame_gap_events",
@@ -311,6 +298,7 @@ def _bounded_acquisition_integrity(run_dir: Path, camera_count: int) -> tuple[di
             {
                 "stream_id": stream_id,
                 **counters,
+                "native_timing_validated": payload.get('native_timing_validated') is True,
                 "passed": not any(counters.values()),
             }
         )
@@ -471,7 +459,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
         total = sum(recorded_counts.values())
         run_context.write_status(
             run_dir,
-            "post_run_complete",
+            "capture_validated",
             stage="recording_count_validation_complete",
             error=None,
             post_run_frames=total,
@@ -485,7 +473,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
         )
         _update_progress(
             run_dir,
-            stage="complete" if passed else "failed",
+            stage="recording_count_validation_complete" if passed else "failed",
             frames_processed=total,
             recording_validation_passed=recording_passed,
             overall_validation_passed=passed,
@@ -509,7 +497,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
             },
         )
     except Exception as exc:
-        run_context.write_status(run_dir, "finalization_failed", error=str(exc))
+        run_context.write_status(run_dir, "finalization_failed", error=str(exc), overall_validation_passed=False)
         _update_progress(
             run_dir,
             stage="failed",
@@ -945,6 +933,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--enable-infer", action="store_true")
+    parser.add_argument("--materialize-timestamps", action="store_true",
+                        help="Explicitly rewrite primary CSVs with derived controller mappings; requires exclusive ownership of the completed run.")
+    parser.add_argument("--compact-metadata", action="store_true",
+                        help="Explicitly compress and verify recovery ledgers; omitted from normal Stop.")
     parser.add_argument("--align", action="store_true")
     return parser.parse_args()
 
@@ -968,8 +960,14 @@ def main() -> int:
         return 1
     if result.validation_passed:
         try:
-            from squeakview.common.run_outputs import finalize_primary_tables
-            finalize_primary_tables(args.run_dir, max(1, int(args.camera_count)))
+            from squeakview.common.run_outputs import ensure_primary_tables, finalize_primary_tables
+            from squeakview.common.run_layout import publish_native_timing
+            ensure_primary_tables(args.run_dir)
+            publish_native_timing(args.run_dir)
+            if getattr(args, 'materialize_timestamps', False) or args.full_analysis:
+                run_context.write_status(args.run_dir, 'finalizing', stage='timestamp_materialization')
+                _update_progress(args.run_dir, stage='timestamp_materialization')
+                finalize_primary_tables(args.run_dir, max(1, int(args.camera_count)))
         except Exception as exc:
             run_context.write_status(args.run_dir, "finalization_failed", error=str(exc), overall_validation_passed=False)
             print(f"[{_timestamp()}] [POST-RUN] primary-table finalization failed: {exc}", flush=True)
@@ -997,13 +995,23 @@ def main() -> int:
             overall_validation_passed=True,
         )
     if result.validation_passed:
+        run_context.write_status(args.run_dir, 'analysis_complete' if args.align else 'post_run_complete',
+                                 stage='complete', overall_validation_passed=True,
+                                 timestamp_mapping='native_with_sync_anchors_v1',
+                                 metadata_compaction='not_requested')
         try:
-            cleanup_successful_run(args.run_dir, max(1, int(args.camera_count)))
+            if getattr(args, 'compact_metadata', False):
+                run_context.update_status(args.run_dir, stage='metadata_compaction', metadata_compaction='running')
+                _update_progress(args.run_dir, stage='metadata_compaction')
+                cleanup_successful_run(args.run_dir, max(1, int(args.camera_count)))
+                run_context.update_status(args.run_dir, stage='complete', metadata_compaction='complete')
+            else:
+                artifact_path(args.run_dir, PROGRESS_FILENAME).unlink(missing_ok=True)
         except Exception as exc:
-            run_context.write_status(args.run_dir, "finalization_failed", error=str(exc),
-                                     overall_validation_passed=False)
-            print(f"[{_timestamp()}] [POST-RUN] primary-table finalization or metadata compaction failed: {exc}", flush=True)
-            return 1
+            run_context.update_status(args.run_dir, stage='complete', metadata_compaction='failed',
+                                      metadata_compaction_error=str(exc))
+            print(f"[{_timestamp()}] [POST-RUN] capture validated; metadata compaction failed: {exc}", flush=True)
+            return 4
     return 0 if result.validation_passed else 2
 
 

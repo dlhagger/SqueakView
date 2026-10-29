@@ -39,7 +39,7 @@ cd "$HOME/Documents/SqueakView"
 git pull --ff-only
 uv sync
 bash scripts/build_native.sh
-.venv/bin/python -m pytest -q
+.venv/bin/python scripts/test.py
 bash squeakview.sh
 ```
 
@@ -65,7 +65,11 @@ completed its normal build checks.
 ## Weigh-in edits
 
 Enter fluid types, initial bottle weights, and mouse weight before Start.
-After Stop, enter final bottle weights and save. Saving changes the button to
+After Stop, enter final bottle weights and save. Stop performs capture closure
+and bounded validation; it does not rewrite every row or compress recovery
+ledgers. Native per-row timestamps and controller synchronization evidence are
+retained for read-time mapping. Rebuild the FLIR plugin with
+`bash scripts/build_native.sh` when updating to this version. Saving changes the button to
 Saved. Editing a saved value enables Save again. Closing with unsaved run
 measurements offers Save, Discard, or Cancel; a failed save keeps the window
 open.

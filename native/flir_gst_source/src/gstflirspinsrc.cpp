@@ -74,6 +74,7 @@ enum {
   PROP_CAMERA_TELEMETRY_PATH,
   PROP_ERROR_LOG_PATH,
   PROP_CAMERA_RUNTIME_PATH,
+  PROP_NATIVE_TIMING_VALIDATION,
   PROP_FAULT_AFTER_FRAMES,
   PROP_FAULT_KIND,
 };
@@ -118,6 +119,7 @@ struct _GstFlirSpinSrc {
   gdouble actual_gain_db;
   guint64 frame_count;
   guint64 camera_timestamp_base;
+  guint64 last_camera_timestamp_ns;
   guint64 last_frame_id;
   guint64 last_stream_frame_id;
   gboolean have_last_stream_frame_id;
@@ -154,6 +156,11 @@ struct _GstFlirSpinSrc {
   CameraPtr* camera;
   ImageProcessor* processor;
 };
+
+static bool native_timestamp_is_valid(const std::optional<guint64>& timestamp,
+                                     guint64 frame_count, guint64 previous) {
+  return timestamp && (frame_count == 0 || *timestamp > previous);
+}
 
 struct _GstFlirSpinSrcClass {
   GstPushSrcClass parent_class;
@@ -936,6 +943,7 @@ static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
     self->frame_count = 0;
     self->fault_injected = FALSE;
     self->camera_timestamp_base = 0;
+    self->last_camera_timestamp_ns = 0;
     self->last_frame_id = 0;
     self->last_stream_frame_id = 0;
     self->have_last_stream_frame_id = FALSE;
@@ -1071,6 +1079,9 @@ static void gst_flir_spin_src_get_property(GObject* object, guint prop_id, GValu
   GstFlirSpinSrc* self = GST_FLIR_SPIN_SRC(object);
 
   switch (prop_id) {
+    case PROP_NATIVE_TIMING_VALIDATION:
+      g_value_set_boolean(value, TRUE);
+      break;
     case PROP_CAMERA_INDEX:
       g_value_set_uint(value, self->camera_index);
       break;
@@ -1380,6 +1391,18 @@ static GstFlowReturn copy_image_to_buffer(
     self->have_last_frame_id = TRUE;
   }
 
+  // Primary timestamps are validated as they are produced. Stop must not
+  // rescan a day's CSV to discover a missing or regressed camera clock.
+  if (self->frame_manifest && !native_timestamp_is_valid(
+      transport_timestamp_ns, self->frame_count, self->last_camera_timestamp_ns)) {
+    GST_ELEMENT_ERROR(self, STREAM, FAILED,
+        ("Camera native timestamp is missing or not strictly increasing"),
+        ("camera=%u source-sequence=%" G_GUINT64_FORMAT, self->camera_index, self->frame_count));
+    gst_buffer_unref(buffer);
+    return GST_FLOW_ERROR;
+  }
+  if (transport_timestamp_ns) self->last_camera_timestamp_ns = *transport_timestamp_ns;
+
   GstClockTime pts = GST_CLOCK_TIME_NONE;
   if (transport_frame_id) {
     self->last_stream_frame_id = *transport_frame_id;
@@ -1597,6 +1620,7 @@ static GstFlowReturn copy_image_to_buffer(
       << ",\"total_incomplete\":" << self->total_incomplete
       << ",\"total_frame_gap_events\":" << self->total_frame_gaps
       << ",\"total_crc_failures\":" << self->total_crc_failures
+      << ",\"native_timing_validated\":" << (self->frame_manifest ? "true" : "false")
       << ",\"telemetry_sample\":" << (telemetry_sample ? "true" : "false")
       << ",\"sensor_temperature_c\":" << (sensor_temperature_c ? std::to_string(*sensor_temperature_c) : "null")
       << ",\"mainboard_temperature_c\":" << (mainboard_temperature_c ? std::to_string(*mainboard_temperature_c) : "null")
@@ -2099,6 +2123,13 @@ static void gst_flir_spin_src_class_init(GstFlirSpinSrcClass* klass) {
           static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(
       object_class,
+      PROP_NATIVE_TIMING_VALIDATION,
+      g_param_spec_boolean(
+          "native-timing-validation", "Native timing validation",
+          "Validates native timestamps while writing the live frame manifest",
+          TRUE, static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      object_class,
       PROP_FAULT_KIND,
       g_param_spec_string(
           "fault-kind",
@@ -2160,6 +2191,7 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   self->actual_gain_db = -1.0;
   self->frame_count = 0;
   self->camera_timestamp_base = 0;
+  self->last_camera_timestamp_ns = 0;
   self->last_frame_id = 0;
   self->last_stream_frame_id = 0;
   self->have_last_stream_frame_id = FALSE;

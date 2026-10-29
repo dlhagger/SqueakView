@@ -35,13 +35,15 @@ class PoseCsvWriter:
     row is silently discarded or evicted.
     """
 
-    def __init__(self, run_dir: Path, keypoint_names: Sequence[str] = ()) -> None:
+    def __init__(self, run_dir: Path, keypoint_names: Sequence[str] = (), *, require_native_timing=False) -> None:
         run_dir = Path(run_dir)
         self._lock = threading.Lock()
         self._closed = False
         self._files: dict[str, Any] = {}
         self._writers: dict[str, csv.writer] = {}
         self._primary = is_primary_layout(run_dir)
+        self._require_native_timing = bool(require_native_timing and self._primary)
+        self._last_timing = {}
         self._pending: dict[str, object] | None = None
         self._keypoint_names = tuple(keypoint_names)
         self._detection_headers = OBJECT_HEADERS + ["host_unix_ns", "host_monotonic_ns"] + [
@@ -87,8 +89,23 @@ class PoseCsvWriter:
         with self._lock:
             if self._closed:
                 raise RuntimeError("pose CSV writer is closed")
+            values = dict(zip(OBJECT_HEADERS, row))
+            if self._require_native_timing:
+                times = dict(values, host_unix_ns=host_unix_ns, host_monotonic_ns=host_monotonic_ns)
+                for name in ('stream_id', 'source_sequence_index', 'camera_timestamp_ns', 'gst_pts_ns', 'host_unix_ns', 'host_monotonic_ns'):
+                    value = times.get(name)
+                    if isinstance(value, bool) or not str(value).isascii() or not str(value).isdecimal():
+                        raise ValueError(f'detection is missing a valid native {name}')
+                stream = int(values['stream_id'])
+                timing = (int(values['source_sequence_index']), int(values['camera_timestamp_ns']), int(host_unix_ns), int(host_monotonic_ns))
+                previous = self._last_timing.get(stream)
+                if stream >= 64 or (previous is not None and (timing[0] < previous[0] or
+                        (timing[0] == previous[0] and timing != previous) or
+                        (timing[0] > previous[0] and timing[1] <= previous[1]))):
+                    raise ValueError('detection frame identity or native clock regressed')
+                self._last_timing[stream] = timing
             self._flush_detection()
-            self._pending = dict(zip(OBJECT_HEADERS, row))
+            self._pending = values
             self._pending.update(host_unix_ns=host_unix_ns, host_monotonic_ns=host_monotonic_ns)
 
     def _flush_detection(self) -> None:
