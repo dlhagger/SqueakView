@@ -189,7 +189,7 @@ failsafe behavior is a separate hardware/firmware acceptance gate.
 ## Required evidence and pass criteria
 
 For each case retain the GUI and supervisor bounded logs, `run_status.json`,
-`run_manifest.json`, post-run progress, controller serial CSV, capture ledger,
+`run_manifest.json`, post-run progress, controller serial CSV, source health summary (historical capture ledger),
 recording telemetry, and video validation output. Record the dry-run JSON and
 the helper's signal confirmation in the qualification worksheet.
 

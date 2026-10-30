@@ -781,9 +781,18 @@ recovery audit. Full analysis and `--materialize-timestamps` intentionally scan
 or rewrite data and require exclusive ownership; they are never automatic Stop
 work. `--align` requests detailed analysis explicitly, including legacy runs.
 
+New FLIR runs write `_metadata/capture_health_cam0.json` (one small file per
+camera). This atomic snapshot contains source frame count, cumulative acquisition
+faults/timeouts, native timing validation status, recording/closed state, and
+update timestamps. It is replaced at camera telemetry checkpoints and closure;
+it never grows with run length. Per-frame timing stays in `frames.csv`, camera
+configuration in `diagnostics/camera_runtime.json`, and sampled transport health
+in `diagnostics/camera.csv`. New runs do not write `capture_cam*.jsonl`.
+Historical JSONL recordings remain readable without migration.
+
 Routine finalization reads the bounded MP4 sample tables without parsing or
 decoding the complete H.264 stream. It requires the sample-size, timing, and
-sample-to-chunk totals to agree with the live frame manifest, source ledger,
+sample-to-chunk totals to agree with the live frame manifest, source health summary,
 recording-admission ledger, and controller count. Full decode remains an
 explicit qualification option, not an automatic shutdown fallback.
 

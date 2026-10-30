@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from squeakview.common.run_layout import artifact_path, open_artifact
+from squeakview.common.capture_health import read_capture_health, health_path
 
 import argparse
 import csv
@@ -203,10 +204,10 @@ def _durable_ledger_counts(run_dir: Path, camera_count: int) -> dict[int, tuple[
         admission_path = artifact_path(run_dir, "record_admission.csv"
             if stream_id == 0
             else f"record_admission_cam{stream_id}.csv")
-        capture_line = _last_complete_line(capture_path, run_dir=run_dir)
+        capture_line = None if health_path(run_dir, stream_id).exists() else _last_complete_line(capture_path, run_dir=run_dir)
         admission_line = _last_complete_line(admission_path, run_dir=run_dir)
         try:
-            capture_payload = json.loads(capture_line or "")
+            capture_payload = read_capture_health(run_dir, stream_id) if health_path(run_dir, stream_id).exists() else json.loads(capture_line or "")
             capture_index = capture_payload["source_sequence_index"]
             if type(capture_index) is not int or capture_index < 0:
                 raise ValueError("invalid source_sequence_index")
@@ -271,10 +272,11 @@ def _bounded_acquisition_integrity(run_dir: Path, camera_count: int) -> tuple[di
 
     cameras: list[dict[str, object]] = []
     for stream_id in range(camera_count):
-        line = _last_complete_line(artifact_path(run_dir, f"capture_cam{stream_id}.jsonl"), run_dir=run_dir)
         try:
-            payload = json.loads(line or "")
-        except json.JSONDecodeError as exc:
+            payload = read_capture_health(run_dir, stream_id)
+            if health_path(run_dir, stream_id).exists() and payload["state"] != "closed":
+                raise ValueError("capture health is not closed")
+        except (OSError, ValueError) as exc:
             raise RuntimeError(
                 f"cannot read final acquisition counters for camera {stream_id}: {exc}"
             ) from exc
@@ -535,6 +537,7 @@ def finalize_run(
         artifact_path(run_dir, PROGRESS_FILENAME),
         {"stage": "capture_reconciliation", "frames_processed": 0},
     )
+    native_health = health_path(run_dir).exists()
     initial_recording_evidence = capture_recording_evidence(
         run_dir, camera_count
     )
@@ -582,7 +585,8 @@ def finalize_run(
                     ),
                 ).fetchone()
                 payload["inference_admitted"] = int(inferred is not None)
-            _write_payload(operator, payload)
+            if not native_health:
+                _write_payload(operator, payload)
             stream_id = int(payload.get("camera_index") or 0)
             sequence = int(payload.get("source_sequence_index") or 0)
             camera_frame_id = payload.get("camera_frame_id")
@@ -631,6 +635,12 @@ def finalize_run(
         recorded_counts = {
             stream_id: item.recorded_frames for stream_id, item in stats.items()
         }
+        if health_path(run_dir).exists():
+            for stream_id, (source_count, admitted_count) in _durable_ledger_counts(run_dir, camera_count).items():
+                if source_counts[stream_id] != source_count or recorded_counts[stream_id] != admitted_count:
+                    raise RuntimeError('canonical frames/admission counts disagree with capture health')
+            if not _bounded_acquisition_integrity(run_dir, camera_count)[1]:
+                raise RuntimeError("capture health reports acquisition faults")
         reconciliation = {
             "schema_version": "1.0",
             "source_frames": source_counts,
@@ -651,16 +661,17 @@ def finalize_run(
                 run_dir, "finalizer:inference_admission"
             )
             inference_summary = _summarize_inference_admission(index, recorded_counts)
-        _promote(
-            temp_dir,
-            run_dir,
-            {
-                "frames.csv": "frames.csv",
-                "diagnostics/camera_runtime.json": "diagnostics/camera_runtime.json",
-                "diagnostics/camera.csv": "diagnostics/camera.csv",
-                "diagnostics/errors.csv": "diagnostics/errors.csv",
-            },
-        )
+        if not native_health:
+            _promote(
+                temp_dir,
+                run_dir,
+                {
+                    "frames.csv": "frames.csv",
+                    "diagnostics/camera_runtime.json": "diagnostics/camera_runtime.json",
+                    "diagnostics/camera.csv": "diagnostics/camera.csv",
+                    "diagnostics/errors.csv": "diagnostics/errors.csv",
+                },
+            )
         run_context.write_status(run_dir, "finalizing", stage="recording_validation")
         qualification_barrier.wait_at_barrier(
             run_dir, "finalizer:recording_validation"

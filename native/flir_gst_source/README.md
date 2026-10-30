@@ -30,7 +30,7 @@ External EOS requests are completed by the source streaming thread. A frame
 already being acquired is logged and delivered before the next source call
 returns EOS. An idle triggered camera completes EOS at its bounded image-read
 timeout. This prevents the default external-EOS handling from discarding the
-last frame after it has entered the capture ledger. Flushes and state changes
+last frame after it has entered the canonical frame CSV. Flushes and state changes
 retain the normal cancellation behavior; acquisition errors still fail the run.
 
 ## Inspect
@@ -106,15 +106,20 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
   evidence. With the variable unset or false, no reference metadata is added.
 - Attaches `SQUEAKVIEW.FLIR.FRAME_META.v1` before `nvstreammux`. DeepStream
   transforms it to frame-level `NvDsUserMeta` for inference admission auditing.
-- Writes the same payload to `capture-log-path` as line-delimited JSON before
-  returning each source buffer. This is the verbose recovery ledger.
+- Writes a bounded health snapshot to `capture-health-path`, atomically replaced
+  at telemetry checkpoints and camera closure. It contains source count,
+  cumulative timeout/incomplete/gap/CRC counters, native timing validation status,
+  recording/closed state, and host update clocks. No per-frame JSONL is written.
+  The final snapshot is required for fast validation; its `closed` state records
+  source closure, while overall success still requires clean process exit and
+  matching canonical CSV, admission, and MP4 counts.
 - Writes canonical frame rows directly to `frame-manifest-path` during capture.
   Shutdown validates that live manifest against the non-leaky recording branch
-  and MP4 sample table instead of reconstructing it from the JSON ledger.
+  and MP4 sample table instead of reconstructing it during shutdown.
 - Writes low-rate transport telemetry to `camera-telemetry-path`, camera gap/CRC/
   incomplete-frame events to `error-log-path`, and the resolved camera identity
   and configuration to `camera-runtime-path`. These files are produced live by
-  the source; shutdown does not reconstruct them by scanning the capture ledger.
+  the source; shutdown does not reconstruct them by scanning frame records.
 - Captures immediate host receipt clocks, source image layout, actual exposure
   and gain, payload sizes, image status, CRC validation, frame gaps, and source
   health counters.
@@ -145,7 +150,7 @@ flirspinsrc camera-index=0 width=1440 height=1080 fps=30 pixel-format=Mono8 !
   fail camera startup with the camera's supported range instead of being
   silently clamped.
 - `record_admission.csv` is a temporary recovery ledger written at the
-  non-leaky recording queue. It is removed after successful finalization.
+  non-leaky recording queue. Optional explicit archival can compress it after validation.
 - `frames.csv` is written directly by this source; shutdown compares its final
   index with the recording-admission ledger and MP4 sample count.
 - `diagnostics/errors.csv` records camera-ID gaps, CRC failures, and incomplete

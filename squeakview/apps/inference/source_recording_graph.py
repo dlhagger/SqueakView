@@ -59,7 +59,7 @@ def camera_source_properties(
         "drop-incomplete": False,
         "buffer-handling": "OldestFirst",
         "stream-buffer-count": buffer_policy.source_transport_buffers,
-        "capture-log-path": str(artifact_path(Path(run_dir), f"capture_cam{index}.jsonl")),
+        "capture-health-path": str(artifact_path(Path(run_dir), f"capture_health_cam{index}.json")),
         "frame-manifest-path": str(
             artifact_path(Path(run_dir), "frames.csv" if index == 0 else f"frames_cam{index}.csv")
         ),

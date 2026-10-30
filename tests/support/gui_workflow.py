@@ -54,6 +54,8 @@ def main():
         wait(lambda: window._recording_active and not window._start_in_progress)
         root = window.backend.current_snapshot.run_dir
         assert root is not None
+        assert (root / '_metadata/capture_health_cam0.json').is_file()
+        assert not (root / '_metadata/capture_cam0.jsonl').exists()
         initial = run_context.bottle_setup(root)
         assert initial['mouse_weight_g'] == 25, initial
         assert initial['sides']['left']['initial_weight_g'] == 30, initial

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from squeakview.common.run_layout import artifact_path
+from squeakview.common.capture_health import health_path
 
 import os
 import hashlib
@@ -17,12 +18,30 @@ def _artifact_path(run_dir: Path, stream_id: int, kind: str) -> Path:
     if kind == "video":
         return artifact_path(run_dir, "raw.mp4" if stream_id == 0 else f"raw_cam{stream_id}.mp4")
     if kind == "capture_ledger":
+        if health_path(run_dir).exists():
+            return artifact_path(run_dir, "frames.csv" if stream_id == 0 else f"frames_cam{stream_id}.csv")
         return artifact_path(run_dir, f"capture_cam{stream_id}.jsonl")
+    if kind == "capture_health":
+        return health_path(run_dir, stream_id)
     if kind == "admission_ledger":
         return artifact_path(run_dir, "record_admission.csv"
             if stream_id == 0
             else f"record_admission_cam{stream_id}.csv")
     raise ValueError(f"unsupported recording artifact kind: {kind}")
+
+
+def _kinds(evidence):
+    kinds = ("video", "capture_ledger", "admission_ledger")
+    return kinds + ("capture_health",) if evidence.get("schema_version") == "2.0" else kinds
+
+
+def _patterns(run_dir):
+    return {
+        "video": "raw*.mp4",
+        "capture_ledger": "frames*.csv*" if health_path(run_dir).exists() else "capture_cam*.jsonl*",
+        "admission_ledger": "record_admission*.csv*",
+        **({"capture_health": "capture_health_cam*.json"} if health_path(run_dir).exists() else {}),
+    }
 
 
 def _direct_regular_identity(run_dir: Path, path: Path) -> dict[str, object]:
@@ -101,18 +120,15 @@ def capture_recording_evidence(run_dir: Path, camera_count: int) -> dict[str, ob
         )
     root = Path(run_dir).resolve()
     cameras = []
+    version = {"schema_version": "2.0" if health_path(root).exists() else "1.0"}
     expected: dict[str, set[str]] = {
         kind: {
             _artifact_path(root, stream_id, kind).name
             for stream_id in range(camera_count)
         }
-        for kind in ("video", "capture_ledger", "admission_ledger")
+        for kind in _kinds(version)
     }
-    patterns = {
-        "video": "raw*.mp4",
-        "capture_ledger": "capture_cam*.jsonl*",
-        "admission_ledger": "record_admission*.csv*",
-    }
+    patterns = _patterns(root)
     sets_valid = True
     for kind, pattern in patterns.items():
         observed, overflow = _bounded_matching_names(_artifact_path(root, 0, kind).parent, pattern, camera_count + 1)
@@ -126,12 +142,12 @@ def capture_recording_evidence(run_dir: Path, camera_count: int) -> dict[str, ob
                     kind: _direct_regular_identity(
                         root, _artifact_path(root, stream_id, kind)
                     )
-                    for kind in ("video", "capture_ledger", "admission_ledger")
+                    for kind in _kinds(version)
                 },
             }
         )
     return {
-        "schema_version": "1.0",
+        "schema_version": version["schema_version"],
         "camera_count": camera_count,
         "artifact_sets_exact": sets_valid,
         "cameras": cameras,
@@ -143,7 +159,7 @@ def recording_evidence_complete(evidence: object, camera_count: int) -> bool:
         return False
     cameras = evidence.get("cameras")
     return bool(
-        evidence.get("schema_version") == "1.0"
+        evidence.get("schema_version") in ("1.0", "2.0")
         and evidence.get("camera_count") == camera_count
         and evidence.get("artifact_sets_exact") is True
         and isinstance(cameras, list)
@@ -162,7 +178,7 @@ def recording_evidence_complete(evidence: object, camera_count: int) -> bool:
                     character in "0123456789abcdef"
                     for character in camera[kind]["sha256"]
                 )
-                for kind in ("video", "capture_ledger", "admission_ledger")
+                for kind in _kinds(evidence)
             )
             for stream_id, camera in enumerate(cameras)
         )
@@ -191,8 +207,11 @@ def recording_evidence_same_content(
         return False
     expected_cameras = expected["cameras"]
     current_cameras = current["cameras"]
+    kinds = _kinds(expected)
+    if _kinds(current) != kinds:
+        return False
     for expected, observed in zip(expected_cameras, current_cameras, strict=True):
-        for kind in ("video", "capture_ledger", "admission_ledger"):
+        for kind in kinds:
             if any(
                 expected[kind].get(field) != observed[kind].get(field)
                 for field in ("path", "available", "size_bytes", "sha256")
@@ -209,24 +228,22 @@ def recording_evidence_metadata_matches(
     if not recording_evidence_complete(evidence, camera_count):
         return False
     root = Path(run_dir).resolve()
+    if ("capture_health" in _kinds(evidence)) != health_path(root).exists():
+        return False
     expected_sets = {
         kind: {
             _artifact_path(root, stream_id, kind).name
             for stream_id in range(camera_count)
         }
-        for kind in ("video", "capture_ledger", "admission_ledger")
+        for kind in _kinds(evidence)
     }
-    patterns = {
-        "video": "raw*.mp4",
-        "capture_ledger": "capture_cam*.jsonl*",
-        "admission_ledger": "record_admission*.csv*",
-    }
+    patterns = _patterns(root)
     for kind, pattern in patterns.items():
         observed, overflow = _bounded_matching_names(_artifact_path(root, 0, kind).parent, pattern, camera_count + 1)
         if overflow or observed != expected_sets[kind]:
             return False
     for stream_id, camera in enumerate(evidence["cameras"]):
-        for kind in ("video", "capture_ledger", "admission_ledger"):
+        for kind in _kinds(evidence):
             path = _artifact_path(root, stream_id, kind)
             expected = camera[kind]
             try:

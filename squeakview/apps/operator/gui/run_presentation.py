@@ -197,17 +197,16 @@ def _nonnegative_int(value: object) -> int:
 def scan_capture_health(run_path: Path) -> CaptureHealthSnapshot:
     """Read only the latest bounded capture and admission diagnostics."""
 
-    capture: dict[str, Any] = {}
-    for raw in reversed(
-        _tail_text_lines(artifact_path(Path(run_path), "capture_cam0.jsonl"), complete_only=True)
-    ):
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            capture = payload
-            break
+    from squeakview.common.capture_health import read_capture_health
+    try:
+        capture = read_capture_health(run_path)
+    except (OSError, ValueError):
+        capture = {}
+    # Transport counters and temperature already have their own sampled CSV.
+    camera = _last_complete_csv_row(artifact_path(Path(run_path), "diagnostics/camera.csv"))
+    for key in ("sensor_temperature_c", "stream_dropped_frames", "stream_lost_frames"):
+        if camera.get(key) not in (None, ""):
+            capture[key] = camera[key]
     recording = _last_complete_csv_row(artifact_path(Path(run_path), "diagnostics") / "recording.csv")
     raw_sequence = capture.get("source_sequence_index")
     try:
@@ -215,10 +214,10 @@ def scan_capture_health(run_path: Path) -> CaptureHealthSnapshot:
     except (TypeError, ValueError, OverflowError):
         parsed_sequence = -1
     temperature = capture.get("sensor_temperature_c")
-    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+    try:
+        temperature_value = None if isinstance(temperature, bool) or temperature is None else float(temperature)
+    except (TypeError, ValueError):
         temperature_value = None
-    else:
-        temperature_value = float(temperature)
     return CaptureHealthSnapshot(
         frames=parsed_sequence + 1 if parsed_sequence >= 0 else 0,
         gaps=_nonnegative_int(capture.get("total_frame_gap_events")),

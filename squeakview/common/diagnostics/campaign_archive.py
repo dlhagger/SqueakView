@@ -152,7 +152,10 @@ def _recording_evidence_matches_inventory(
         return False
     actual = {str(item["path"]): item for item in artifacts}
     for camera in recorded["cameras"]:
-        for kind in ("video", "capture_ledger", "admission_ledger"):
+        kinds = ("video", "capture_ledger", "admission_ledger")
+        if recorded.get("schema_version") == "2.0":
+            kinds += ("capture_health",)
+        for kind in kinds:
             expected = camera[kind]
             try:
                 path = Path(str(expected["path"])).resolve()

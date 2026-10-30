@@ -187,10 +187,52 @@ static void native_timestamp_contract() {
   gst_object_unref(src);
 }
 
+static void compact_capture_health_contract() {
+  auto* src = GST_FLIR_SPIN_SRC(g_object_new(GST_TYPE_FLIR_SPIN_SRC, nullptr));
+  gchar* directory = g_dir_make_tmp("squeakview-health-XXXXXX", nullptr);
+  g_assert_nonnull(directory);
+  gchar* path = g_build_filename(directory, "capture_health_cam0.json", nullptr);
+  g_object_set(src, "capture-health-path", path, nullptr);
+  src->health_active = TRUE;
+  src->frame_manifest = std::tmpfile();
+  g_assert_nonnull(src->frame_manifest);
+  std::fputs("canonical frame row\n", src->frame_manifest);
+  g_assert_true(write_capture_health(src, false));
+  gchar* data = nullptr;
+  gsize length = 0;
+  g_assert_true(g_file_get_contents(path, &data, &length, nullptr));
+  g_assert_nonnull(std::strstr(data, "\"state\":\"recording\""));
+  g_assert_nonnull(std::strstr(data, "\"source_frames\":0"));
+  g_free(data);
+  // A whole day's count still occupies one bounded object, not a ledger.
+  src->frame_count = 2592000;
+  src->total_crc_failures = 1;
+  close_camera(src);
+  g_assert_true(g_file_get_contents(path, &data, &length, nullptr));
+  g_assert_cmpuint(length, <, 1024);
+  g_assert_nonnull(std::strstr(data, "\"state\":\"closed\""));
+  g_assert_nonnull(std::strstr(data, "\"source_frames\":2592000"));
+  g_assert_nonnull(std::strstr(data, "\"total_crc_failures\":1"));
+  g_assert_nonnull(std::strstr(data, "\"native_timing_validated\":true"));
+  g_assert_null(std::strstr(data, "camera_timestamp_ns"));
+  g_free(data);
+  // Failed checkpoint publication is reported; no partial file is published.
+  g_object_set(src, "capture-health-path", "/nonexistent-squeakview-health/health.json", nullptr);
+  src->health_active = TRUE;
+  g_assert_false(write_capture_health(src, false));
+  src->health_active = FALSE;
+  gst_object_unref(src);
+  std::remove(path);
+  std::remove(directory);
+  g_free(path);
+  g_free(directory);
+}
+
 int main(int argc, char** argv) {
   gst_init(&argc, &argv);
   g_test_init(&argc, &argv, nullptr);
   g_test_add_func("/flir/timing/live-native-validation", native_timestamp_contract);
+  g_test_add_func("/flir/health/compact-checkpoint-and-close", compact_capture_health_contract);
   g_test_add_func("/flir/eos/production-boundary", production_eos_boundary);
   g_test_add_func("/flir/eos/inflight-free-running", [] { assert_pipeline_drains(1, false); });
   g_test_add_func("/flir/eos/inflight-two-cameras", [] { assert_pipeline_drains(2, false); });

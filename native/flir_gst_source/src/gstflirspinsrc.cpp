@@ -69,7 +69,7 @@ enum {
   PROP_CAMERA_SERIAL,
   PROP_METADATA_PROFILE,
   PROP_MAX_CONSECUTIVE_TIMEOUTS,
-  PROP_CAPTURE_LOG_PATH,
+  PROP_CAPTURE_HEALTH_PATH,
   PROP_FRAME_MANIFEST_PATH,
   PROP_CAMERA_TELEMETRY_PATH,
   PROP_ERROR_LOG_PATH,
@@ -98,8 +98,8 @@ struct _GstFlirSpinSrc {
   gchar* camera_serial;
   gchar* metadata_profile;
   guint max_consecutive_timeouts;
-  gchar* capture_log_path;
-  FILE* capture_log;
+  gchar* capture_health_path;
+  gboolean health_active;
   gchar* frame_manifest_path;
   FILE* frame_manifest;
   gchar* camera_telemetry_path;
@@ -727,7 +727,44 @@ static GstCaps* make_caps(GstFlirSpinSrc* self) {
       nullptr);
 }
 
+// Checkpoints contain only acquisition health. All per-frame identity and
+// clocks remain in the source-owned canonical frame CSV.
+static bool write_capture_health(GstFlirSpinSrc* self, bool closed) {
+  if (!self->health_active || !self->capture_health_path || !*self->capture_health_path)
+    return true;
+  // Publish a count only after the corresponding CSV bytes are flushed.
+  if (self->frame_manifest && std::fflush(self->frame_manifest) != 0) {
+    GST_ELEMENT_ERROR(self, RESOURCE, WRITE, ("Failed to flush canonical frame manifest"), (nullptr));
+    return false;
+  }
+  std::ostringstream out;
+  out << "{\"schema_version\":1,\"camera_index\":" << self->camera_index
+      << ",\"state\":\"" << (closed ? "closed" : "recording") << "\""
+      << ",\"source_frames\":" << self->frame_count
+      << ",\"total_timeouts\":" << self->total_timeouts
+      << ",\"total_incomplete\":" << self->total_incomplete
+      << ",\"total_frame_gap_events\":" << self->total_frame_gaps
+      << ",\"total_crc_failures\":" << self->total_crc_failures
+      << ",\"native_timing_validated\":" << (self->frame_manifest ? "true" : "false")
+      << ",\"host_unix_ns\":" << static_cast<guint64>(g_get_real_time()) * 1000
+      << ",\"host_monotonic_ns\":" << static_cast<guint64>(g_get_monotonic_time()) * 1000
+      << "}\n";
+  const std::string data = out.str();
+  GError* error = nullptr;
+  const bool ok = g_file_set_contents_full(self->capture_health_path, data.data(),
+      data.size(), static_cast<GFileSetContentsFlags>(
+          G_FILE_SET_CONTENTS_CONSISTENT | G_FILE_SET_CONTENTS_DURABLE), 0600, &error);
+  if (!ok) {
+    GST_ELEMENT_ERROR(self, RESOURCE, WRITE, ("Failed to write capture health"),
+        ("%s", error ? error->message : "unknown error"));
+    g_clear_error(&error);
+  }
+  return ok;
+}
+
 static void close_camera(GstFlirSpinSrc* self) {
+  write_capture_health(self, true);
+  self->health_active = FALSE;
   g_atomic_int_set(&self->stopping, TRUE);
 
   try {
@@ -769,11 +806,6 @@ static void close_camera(GstFlirSpinSrc* self) {
   delete self->processor;
   self->processor = nullptr;
 
-  if (self->capture_log) {
-    std::fflush(self->capture_log);
-    std::fclose(self->capture_log);
-    self->capture_log = nullptr;
-  }
   if (self->frame_manifest) {
     std::fflush(self->frame_manifest);
     std::fclose(self->frame_manifest);
@@ -793,17 +825,6 @@ static void close_camera(GstFlirSpinSrc* self) {
 
 static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
   try {
-    if (self->capture_log_path && *self->capture_log_path) {
-      self->capture_log = std::fopen(self->capture_log_path, "w");
-      if (!self->capture_log) {
-        error = std::string("Failed to open capture log: ") + self->capture_log_path;
-        close_camera(self);
-        return FALSE;
-      }
-      // Every emitted source buffer is a scientific audit record. Line buffering
-      // preserves the ledger tail even when normal pipeline teardown is unavailable.
-      std::setvbuf(self->capture_log, nullptr, _IOLBF, 0);
-    }
     if (self->frame_manifest_path && *self->frame_manifest_path) {
       self->frame_manifest = std::fopen(self->frame_manifest_path, "w");
       if (!self->frame_manifest) {
@@ -813,7 +834,7 @@ static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
       }
       // This is the canonical, source-owned frame index.  It is written while
       // acquisition is active so shutdown never has to reconstruct millions
-      // of frame rows from the verbose JSON capture ledger.
+      // of frame rows during shutdown.
       std::setvbuf(self->frame_manifest, nullptr, _IOFBF, 1024 * 1024);
       static constexpr const char* kFrameHeader =
           "stream_id,camera_serial,deepstream_frame_number,source_sequence_index,source,raw_frame_index,pts_ns,dts_ns,duration_ns,host_monotonic_ns,host_unix_ns,status,camera_frame_id,camera_frame_id_available,stream_frame_id,chunk_frame_id,frame_id_delta_consistent,missing_frames_before,pipeline_missing_frames_before,camera_timestamp_ns,chunk_timestamp_raw,timestamp_increment_ns,gst_pts_ns,timestamp_origin,host_received_monotonic_ns,host_received_unix_ns,copy_complete_monotonic_ns,observer_monotonic_ns,exposure_us,gain_db,black_level,payload_crc_valid,image_status,source_width,source_height,source_pixel_format,metadata_status,inference_admitted\n";
@@ -955,6 +976,12 @@ static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
     self->total_frame_gaps = 0;
     self->total_crc_failures = 0;
     self->last_telemetry_frame = G_MAXUINT64;
+    self->health_active = TRUE;
+    if (!write_capture_health(self, false)) {
+      error = "Failed to initialize capture health";
+      close_camera(self);
+      return FALSE;
+    }
     self->start_time = gst_util_get_timestamp();
     self->frame_duration = !self->trigger && self->actual_fps > 0.0
         ? static_cast<GstClockTime>(static_cast<double>(GST_SECOND) / self->actual_fps)
@@ -1042,9 +1069,9 @@ static void gst_flir_spin_src_set_property(GObject* object, guint prop_id, const
     case PROP_MAX_CONSECUTIVE_TIMEOUTS:
       self->max_consecutive_timeouts = g_value_get_uint(value);
       break;
-    case PROP_CAPTURE_LOG_PATH:
-      g_free(self->capture_log_path);
-      self->capture_log_path = g_value_dup_string(value);
+    case PROP_CAPTURE_HEALTH_PATH:
+      g_free(self->capture_health_path);
+      self->capture_health_path = g_value_dup_string(value);
       break;
     case PROP_FRAME_MANIFEST_PATH:
       g_free(self->frame_manifest_path);
@@ -1130,8 +1157,8 @@ static void gst_flir_spin_src_get_property(GObject* object, guint prop_id, GValu
     case PROP_MAX_CONSECUTIVE_TIMEOUTS:
       g_value_set_uint(value, self->max_consecutive_timeouts);
       break;
-    case PROP_CAPTURE_LOG_PATH:
-      g_value_set_string(value, self->capture_log_path);
+    case PROP_CAPTURE_HEALTH_PATH:
+      g_value_set_string(value, self->capture_health_path);
       break;
     case PROP_FRAME_MANIFEST_PATH:
       g_value_set_string(value, self->frame_manifest_path);
@@ -1165,7 +1192,7 @@ static void gst_flir_spin_src_finalize(GObject* object) {
   g_free(self->buffer_handling);
   g_free(self->camera_serial);
   g_free(self->metadata_profile);
-  g_free(self->capture_log_path);
+  g_free(self->capture_health_path);
   g_free(self->frame_manifest_path);
   g_free(self->camera_telemetry_path);
   g_free(self->error_log_path);
@@ -1637,20 +1664,6 @@ static GstFlowReturn copy_image_to_buffer(
     gst_buffer_unref(buffer);
     return GST_FLOW_ERROR;
   }
-  if (self->capture_log) {
-    const std::string line = metadata.str();
-    if (std::fwrite(line.data(), 1, line.size(), self->capture_log) != line.size() ||
-        std::fputc('\n', self->capture_log) == EOF) {
-      GST_ELEMENT_ERROR(
-          self,
-          RESOURCE,
-          WRITE,
-          ("Failed to write FLIR capture ledger"),
-          ("path=%s", self->capture_log_path ? self->capture_log_path : ""));
-      gst_buffer_unref(buffer);
-      return GST_FLOW_ERROR;
-    }
-  }
   if (self->frame_manifest) {
     const auto uint_field = [](const std::optional<guint64>& value) {
       return value ? std::to_string(*value) : std::string();
@@ -1705,9 +1718,9 @@ static GstFlowReturn copy_image_to_buffer(
         << "ok,"  // metadata_status, inference_admitted
         << '\n';
     const std::string line = row.str();
-    const bool flush_due = (self->frame_count + 1) % 100 == 0;
+    // Drain/recovery must see the latest complete row, including an idle triggered tail.
     if (std::fwrite(line.data(), 1, line.size(), self->frame_manifest) != line.size() ||
-        (flush_due && std::fflush(self->frame_manifest) != 0)) {
+        std::fflush(self->frame_manifest) != 0) {
       GST_ELEMENT_ERROR(
           self,
           RESOURCE,
@@ -1719,6 +1732,10 @@ static GstFlowReturn copy_image_to_buffer(
     }
   }
   ++self->frame_count;
+  if (telemetry_sample && !write_capture_health(self, false)) {
+    gst_buffer_unref(buffer);
+    return GST_FLOW_ERROR;
+  }
 
   *out_buffer = buffer;
   return GST_FLOW_OK;
@@ -1765,7 +1782,7 @@ static GstFlowReturn gst_flir_spin_src_create(GstPushSrc* push_src, GstBuffer** 
           self,
           RESOURCE,
           WRITE,
-          ("Injected FLIR capture-ledger write failure"),
+          ("Injected FLIR capture-health write failure"),
           ("after-frames=%" G_GUINT64_FORMAT, self->fault_after_frames));
     } else {
       GST_ELEMENT_ERROR(
@@ -2067,11 +2084,11 @@ static void gst_flir_spin_src_class_init(GstFlirSpinSrcClass* klass) {
           static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(
       object_class,
-      PROP_CAPTURE_LOG_PATH,
+      PROP_CAPTURE_HEALTH_PATH,
       g_param_spec_string(
-          "capture-log-path",
-          "Capture log path",
-          "Line-delimited JSON ledger written for every source buffer before downstream delivery",
+          "capture-health-path",
+          "Capture health path",
+          "Atomic bounded acquisition health snapshot; no per-frame ledger",
           "",
           static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(
@@ -2171,8 +2188,8 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   self->camera_serial = g_strdup("");
   self->metadata_profile = g_strdup(DEFAULT_METADATA_PROFILE);
   self->max_consecutive_timeouts = DEFAULT_MAX_CONSECUTIVE_TIMEOUTS;
-  self->capture_log_path = g_strdup("");
-  self->capture_log = nullptr;
+  self->capture_health_path = g_strdup("");
+  self->health_active = FALSE;
   self->frame_manifest_path = g_strdup("");
   self->frame_manifest = nullptr;
   self->camera_telemetry_path = g_strdup("");

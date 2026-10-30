@@ -230,7 +230,7 @@ class JetsonSetupScriptTest(unittest.TestCase):
         self.assertIn("libnvdsinfer_custom_impl_Yolo.so", script)
         self.assertIn("ldd \"$output\"", script)
         self.assertIn("NvDsInferParseYolo26Pose", script)
-        self.assertIn("capture-log-path", script)
+        self.assertIn("capture-health-path", script)
 
 
 class PreflightScriptTest(unittest.TestCase):

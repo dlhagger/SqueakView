@@ -31,7 +31,7 @@ def write_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload))
 
-def create_recording(run, mode, *, recovery=False):
+def create_recording(run, mode, *, recovery=False, health=False):
     run = Path(run)
     run.mkdir(parents=True, exist_ok=True)
     initialize_layout(run, compact_metadata=True)
@@ -90,4 +90,14 @@ def create_recording(run, mode, *, recovery=False):
     table(run / 'sensors.csv', SERIAL_HEADER, sensor)
     run_context.write_bottle_artifacts(run, {'mouse_weight_g': 25, 'left': {'fluid': 'water', 'initial_weight_g': 30, 'final_weight_g': 29}, 'right': {'fluid': 'water', 'initial_weight_g': 30, 'final_weight_g': 29}})
     run_context.write_status(run, 'capture_closed', expected_ttl_count=3 if triggered else None, ledger_frame_counts=[3, 3], capture_exit_code=0)
+    if health:
+        for row in rows:
+            row.update(metadata_status='ok', host_received_unix_ns=row['host_unix_ns'],
+                       host_received_monotonic_ns=row['host_monotonic_ns'], missing_frames_before=0)
+        table(run / 'frames.csv', FrameCsvOperator.HEADERS, rows)
+        cap.unlink()
+        write_json(artifact_path(run, 'capture_health_cam0.json'), dict(schema_version=1,
+            camera_index=0, state='closed', source_frames=3, total_timeouts=0,
+            total_incomplete=0, total_frame_gap_events=0, total_crc_failures=0,
+            native_timing_validated=True, host_unix_ns=base, host_monotonic_ns=100000))
     return run

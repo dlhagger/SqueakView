@@ -3,8 +3,10 @@ from __future__ import annotations
 """Deterministic capture-ledger drain checks used before MP4 finalization."""
 
 from squeakview.common.run_layout import artifact_path, open_artifact
+from squeakview.common.capture_health import read_capture_health, source_path, health_path
 
 import json
+import csv
 import math
 import os
 import time
@@ -47,7 +49,8 @@ class CaptureDrainHooks:
 def ledger_paths(run_dir: Path, camera_count: int) -> tuple[Path, ...]:
     paths: list[Path] = []
     for index in range(max(1, int(camera_count))):
-        paths.append(artifact_path(Path(run_dir), f"capture_cam{index}.jsonl"))
+        paths.append(artifact_path(Path(run_dir), "frames.csv" if index == 0 else f"frames_cam{index}.csv")
+                     if health_path(run_dir, index).exists() else source_path(Path(run_dir), index))
         paths.append(
             artifact_path(Path(run_dir), "record_admission.csv"
                 if index == 0
@@ -79,14 +82,17 @@ def ledger_frame_counts(
 ) -> tuple[int | None, ...]:
     counts: list[int | None] = []
     for index in range(max(1, int(camera_count))):
-        capture_line = last_complete_ledger_line(
-            artifact_path(Path(run_dir), f"capture_cam{index}.jsonl")
-        )
+        native = health_path(run_dir, index).exists()
+        path = (artifact_path(Path(run_dir), "frames.csv" if index == 0 else f"frames_cam{index}.csv")
+                if native else source_path(Path(run_dir), index))
+        capture_line = last_complete_ledger_line(path)
         try:
-            capture_count = (
-                int(json.loads(capture_line or "")["source_sequence_index"]) + 1
-            )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            if native:
+                fields = next(csv.reader([capture_line or ""]))
+                capture_count = int(fields[3]) + 1
+            else:
+                capture_count = int(json.loads(capture_line or "")["source_sequence_index"]) + 1
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, IndexError, StopIteration):
             capture_count = 0 if capture_line is None else None
         admission_path = artifact_path(Path(run_dir), "record_admission.csv"
             if index == 0

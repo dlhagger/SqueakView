@@ -207,6 +207,39 @@ def iter_admission_pts(path: Path, stream_id: int) -> Iterator[int]:
         ) from exc
 
 
+def iter_native_capture_payloads(run_dir: Path, stream_id: int) -> Iterator[dict]:
+    """Audit canonical frame identities/clocks without a second per-frame ledger."""
+    from squeakview.common.bounded_csv import bounded_csv_lines
+    path = artifact_path(run_dir, "frames.csv" if stream_id == 0 else f"frames_cam{stream_id}.csv")
+    previous_id = previous_pts = previous_time = None
+    with_error = f"invalid canonical frame CSV: {path.name}"
+    reader = csv.DictReader(bounded_csv_lines(path))
+    required = {'stream_id', 'source_sequence_index', 'camera_frame_id', 'gst_pts_ns',
+                'camera_timestamp_ns', 'host_received_monotonic_ns', 'host_received_unix_ns',
+                'payload_crc_valid', 'missing_frames_before', 'metadata_status'}
+    if not required.issubset(reader.fieldnames or ()) or len(reader.fieldnames) != len(set(reader.fieldnames)):
+        raise RuntimeError(with_error + ': invalid header')
+    for sequence, row in enumerate(reader):
+        try:
+            if None in row or any(v is None for v in row.values()):
+                raise ValueError('row width mismatch')
+            values = {k: _csv_uint(row[k], k) for k in required if k not in
+                      ('payload_crc_valid', 'metadata_status')}
+            if values['stream_id'] != stream_id or values['source_sequence_index'] != sequence:
+                raise ValueError('stream/sequence mismatch')
+            if (previous_id is not None and values['camera_frame_id'] != previous_id + 1
+                    or previous_pts is not None and values['gst_pts_ns'] <= previous_pts
+                    or previous_time is not None and values['camera_timestamp_ns'] <= previous_time):
+                raise ValueError('noncontiguous identity or nonincreasing clock')
+            if (row['payload_crc_valid'] not in ('', '1', 'True')
+                    or values['missing_frames_before'] or row['metadata_status'] != 'ok'):
+                raise ValueError('camera integrity fault')
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(f'{with_error}:{sequence + 2}: {exc}') from exc
+        previous_id, previous_pts, previous_time = (values['camera_frame_id'], values['gst_pts_ns'], values['camera_timestamp_ns'])
+        yield dict(values, camera_index=stream_id)
+
+
 def recorded_payloads(
     run_dir: Path,
     stream_id: int,
@@ -220,7 +253,10 @@ def recorded_payloads(
         else f"record_admission_cam{stream_id}.csv")
     admissions = iter_admission_pts(admission_path, stream_id)
     admission = next(admissions, None)
-    for payload in iter_capture_payloads(capture_path, stream_id):
+    from squeakview.common.capture_health import health_path
+    payloads = (iter_native_capture_payloads(run_dir, stream_id) if health_path(run_dir, stream_id).exists()
+                else iter_capture_payloads(capture_path, stream_id))
+    for payload in payloads:
         stats.source_frames += 1
         pts_ns = int(payload.get("gst_pts_ns") or 0)
         while admission is not None and admission < pts_ns:

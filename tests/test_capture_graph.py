@@ -117,8 +117,8 @@ class CaptureGraphTests(ServiceMakerCase):
 
         self.assertEqual(pipeline.nodes["flirsrc0"][0], "flirspinsrc")
         self.assertEqual(
-            pipeline.nodes["flirsrc0"][1]["capture-log-path"],
-            str(app.run_dir / "capture_cam0.jsonl"),
+            pipeline.nodes["flirsrc0"][1]["capture-health-path"],
+            str(app.run_dir / "capture_health_cam0.json"),
         )
         self.assertEqual(
             pipeline.nodes["flirsrc0"][1]["frame-manifest-path"],
@@ -261,8 +261,8 @@ class CaptureGraphTests(ServiceMakerCase):
                                 "drop-incomplete": False,
                                 "buffer-handling": "OldestFirst",
                                 "stream-buffer-count": 64,
-                                "capture-log-path": str(
-                                    run_dir / f"capture_cam{index}.jsonl"
+                                "capture-health-path": str(
+                                    run_dir / f"capture_health_cam{index}.json"
                                 ),
                                 "frame-manifest-path": str(
                                     run_dir
