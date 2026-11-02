@@ -27,6 +27,7 @@ from squeakview.apps.operator.backend.events import BackendEvent, RunPhase
 from squeakview.apps.operator.backend import manifest
 from squeakview.apps.operator.backend.manager import OperatorBackend
 from squeakview.common.dashboard import DashboardEvent
+from squeakview.common.feeder_jam import FeederJamEvent, feeder_jam_event
 from squeakview.common.pellet_well import pellet_well_blocked
 from squeakview.project import PROJECT_ENV, RuntimeContext
 
@@ -290,16 +291,18 @@ class SupervisorServer:
     def _emit_dashboard(self, event: DashboardEvent) -> None:
         if not isinstance(event, DashboardEvent):
             raise TypeError("dashboard callback requires DashboardEvent")
-        if event.event_uc == "FEED_JAM" or event.event_uc.startswith("ACK_CLEAR_JAM"):
+        jam_status = feeder_jam_event(event)
+        if jam_status in {FeederJamEvent.JAMMED, FeederJamEvent.CLEAR_ACK}:
             self._feeder_dashboard_event = event
         elif event.event_uc == "SYSTEM_START" or event.event_uc.startswith("SYSTEM_START,"):
             self._feeder_dashboard_event = None
         well_status = pellet_well_blocked(event)
         if well_status is not None:
             self._pellet_well_dashboard_event = event if well_status else None
-        # Startup warnings and their clear transitions must not be shed with
-        # routine display traffic. A disconnected GUI restores current state.
-        self._enqueue("dashboard", event.to_payload(), critical=well_status is not None)
+        # Alert transitions and command rejections must not be shed with routine
+        # display traffic. A disconnected GUI restores current latch state.
+        self._enqueue("dashboard", event.to_payload(),
+                      critical=well_status is not None or jam_status is not None)
 
     def _emit_backend_event(self, event: BackendEvent) -> None:
         self._enqueue(

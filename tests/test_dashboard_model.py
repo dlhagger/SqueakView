@@ -69,6 +69,8 @@ class DashboardConfigTests(unittest.TestCase):
 
 class DashboardEventSemanticsTests(unittest.TestCase):
     def test_feeder_jam_protocol_classification_is_exact(self) -> None:
+        from squeakview.common.sensor_csv import format_controller_log
+
         cases = {
             "FEED_JAM,100,200,nan,3,69420,69420,69420,Feeding,Pellet did not trigger sensor": dashboard_model.FeederJamEvent.JAMMED,
             "NACK,FEED,JAMMED": dashboard_model.FeederJamEvent.JAMMED,
@@ -77,10 +79,12 @@ class DashboardEventSemanticsTests(unittest.TestCase):
             "NACK,CLEAR_JAM,NOT_JAMMED": dashboard_model.FeederJamEvent.CLEAR_NOT_JAMMED,
         }
         for raw, expected in cases.items():
-            with self.subTest(raw=raw):
-                event = DashboardEvent.parse(raw)
-                assert event is not None
-                self.assertEqual(dashboard_model.feeder_jam_event(event), expected)
+            formatted = format_controller_log(f"【SER】 {raw}").split("【SER】", 1)[1].strip()
+            for line in (raw, formatted):
+                with self.subTest(line=line):
+                    event = DashboardEvent.parse(line)
+                    assert event is not None
+                    self.assertEqual(dashboard_model.feeder_jam_event(event), expected)
 
     def test_unrelated_and_plain_feed_stop_events_do_not_change_jam_state(self) -> None:
         for raw in (

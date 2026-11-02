@@ -15,11 +15,20 @@ profiles/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local planning and review notes are not product documentation.
+/local-notes/
+/docs/*_PLAN.md
 
 # Native/CMake build outputs
 native/flir_gst_source/build/
 native/**/*.o
 native/**/*.so
+build/
+dist/
 
 # Virtual environments
 .venv/
@@ -35,7 +44,7 @@ DeepStream-Yolo/configs/*
 !DeepStream-Yolo/configs/inference_off.txt
 !DeepStream-Yolo/configs/yolo26s_dino_10kpts_fp16.txt
 
-#tool omit
+# Local tools; keep the packaged command-line tools tracked.
 tools/
 !squeakview/tools/
 !squeakview/tools/*.py

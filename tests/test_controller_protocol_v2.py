@@ -171,6 +171,31 @@ class ProtocolV2JournalTests(unittest.TestCase):
 
 
 class SerialProtocolV2BoundaryTests(unittest.TestCase):
+    def test_well_presentation_orders_only_status_and_resets_for_new_boot(self) -> None:
+        messages = []
+        handle = serial_util.SerialHandle("/dev/not-opened", 115200, messages.append)
+        handle._protocol_mode = "v2"
+        inputs = (
+            (9, 10, "WELL_SENSOR_CLEAR,1,1,nan,69420,69420,69420,0,Startup,Clear"),
+            (9, 12, "POKE_END,1,1,L,1,10,69420,69420,Eligible,nan"),
+            (9, 11, "WELL_SENSOR_BLOCKED,1,1,nan,69420,69420,69420,1,Watchdog,Check well"),
+            (10, 1, "SYSTEM_START,1,1"),
+            (10, 2, "WELL_SENSOR_CLEAR,1,1,nan,69420,69420,69420,0,Startup,Clear"),
+        )
+        try:
+            for boot, sequence, payload in inputs:
+                frame = v2.decode_frame(v2.encode_frame(
+                    message_type=1, flags=v2.FLAG_RELIABLE, boot_id=boot,
+                    session_id=0, sequence=sequence, monotonic_us=sequence,
+                    payload=payload.encode(),
+                )[:-1])
+                handle._publish_v2_frame(frame, sequence)
+            received = [line.split("【SER】", 1)[1].split(",", 1)[0].strip()
+                        for line in messages if "【SER】" in line]
+            self.assertEqual(received, [payload.split(",", 1)[0] for _, _, payload in inputs])
+        finally:
+            handle.close()
+
     def test_negotiation_preserves_binary_bytes_after_ack_newline(self) -> None:
         handle = serial_util.SerialHandle("/dev/test", 115200, lambda _line: None)
         handle._protocol_v2_pending = True

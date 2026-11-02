@@ -5,7 +5,7 @@ import threading
 
 from PySide6 import QtCore
 
-from .dashboard_model import feeder_jam_event
+from squeakview.common.feeder_jam import feeder_jam_event
 from squeakview.common.pellet_well import pellet_well_blocked
 
 

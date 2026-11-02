@@ -513,6 +513,8 @@ class SupervisorServerTests(unittest.TestCase):
         self.server._emit_dashboard(blocked)
         queued = self.server._critical_events.get_nowait()
         self.assertEqual(queued.name, "dashboard")
+        self.assertEqual(queued.payload["event_uc"], "FEED_JAM")
+        queued = self.server._critical_events.get_nowait()
         self.assertEqual(queued.payload["event_uc"], "WELL_SENSOR_BLOCKED")
         self.server._signal_client_loss("GUI disappeared")
         result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "restore-both"))
@@ -525,6 +527,85 @@ class SupervisorServerTests(unittest.TestCase):
         self.server._emit_dashboard(DashboardEvent.parse("SYSTEM_START,7,8"))
         result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "reboot"))
         self.assertEqual(result["dashboard_events"], [])
+
+    def test_feeder_jam_and_command_replies_survive_full_display_queue(self) -> None:
+        from squeakview.common.feeder_jam import FeederJamEvent, feeder_jam_event
+        from squeakview.common.sensor_csv import format_controller_log
+
+        for i in range(self.server._presentation_events.maxsize):
+            self.server._emit_log(str(i))
+        messages = (
+            "FEED_JAM,1,2,nan,1,0,0,0,Feeding,Jam",
+            "NACK,FEED,JAMMED",
+            "NACK,CLEAR_JAM,FEED_ACTIVE",
+            "NACK,CLEAR_JAM,NOT_JAMMED",
+            "ACK_CLEAR_JAM",
+            "FEED_STOP,1,2,nan,1,0,0,0,Feeding,Feeder jam",
+        )
+        for raw in messages:
+            # Follow the real normalized serial-to-dashboard path as well.
+            formatted = format_controller_log(f"【SER】 {raw}").split("【SER】", 1)[1].strip()
+            for line in (raw, formatted):
+                with self.subTest(line=line):
+                    event = DashboardEvent.parse(line)
+                    self.server._emit_dashboard(event)
+                    queued = self.server._critical_events.get_nowait()
+                    self.assertEqual(DashboardEvent.from_payload(queued.payload), event)
+                    if feeder_jam_event(event) in {FeederJamEvent.JAMMED, FeederJamEvent.CLEAR_ACK}:
+                        state, _ = self.server._dispatch(CommandEnvelope("runtime_state", "jam-state"))
+                        self.assertEqual(state["dashboard_events"], [event.to_payload()])
+        self.assertEqual(self.server._dropped_presentation, 0)
+
+    def test_replayed_well_status_preserves_current_live_and_reconnect_state(self) -> None:
+        import csv
+        import json
+        from squeakview.common import controller_protocol_v2 as v2
+        from squeakview.common.serial import SerialHandle
+
+        for older, newer in (("BLOCKED", "CLEAR"), ("CLEAR", "BLOCKED"),
+                             ("SYSTEM_START", "BLOCKED")):
+            with self.subTest(older=older, newer=newer), tempfile.TemporaryDirectory() as directory:
+                bridge = SimpleNamespace(_emit_presentation=lambda _message: None,
+                                         ingest=self.server._emit_dashboard)
+                handle = SerialHandle("/dev/not-opened", 115200,
+                    lambda message: OperatorBackend._serial_emit(bridge, message))
+                run_dir = Path(directory)
+                self.assertTrue(handle.set_csv_path(run_dir))
+                handle._protocol_mode = "v2"
+                handle._emit_serial_logs = False
+                payloads = {
+                    1: "SYSTEM_START,1,1",
+                    2: ("SYSTEM_START,2,2" if older == "SYSTEM_START" else
+                        f"WELL_SENSOR_{older},2,2,nan,69420,69420,69420,0,Recovery,Clear"),
+                    3: f"WELL_SENSOR_{newer},3,3,nan,69420,69420,69420,1,Watchdog,Check well",
+                }
+                try:
+                    with mock.patch.object(handle, "_queue_line"):
+                        for sequence in (1, 3, 2):
+                            frame = v2.decode_frame(v2.encode_frame(
+                                message_type=1, flags=v2.FLAG_RELIABLE, boot_id=9,
+                                session_id=1, sequence=sequence, monotonic_us=sequence,
+                                payload=payloads[sequence].encode(),
+                            )[:-1])
+                            handle._persist_v2_frame(frame, 100 + sequence, 200 + sequence)
+                    state, _ = self.server._dispatch(CommandEnvelope("runtime_state", "well-state"))
+                    alerts = state["dashboard_events"]
+                    self.assertEqual([event["event_uc"] for event in alerts],
+                                     ["WELL_SENSOR_BLOCKED"] if newer == "BLOCKED" else [])
+                    events = []
+                    while not self.server._critical_events.empty():
+                        events.append(self.server._critical_events.get_nowait().payload["event_uc"])
+                    self.assertEqual(events, ["SYSTEM_START", f"WELL_SENSOR_{newer}"])
+                finally:
+                    handle.close()
+                rows = [json.loads(line) for line in
+                        (run_dir / "diagnostics/controller_v2.jsonl").read_text().splitlines()]
+                self.assertEqual([row["sequence"] for row in rows], [1, 3, 2])
+                with (run_dir / "serial.csv").open() as source:
+                    rows = list(csv.DictReader(source))
+                self.assertEqual([row["rawLine"] for row in rows],
+                                 [payloads[sequence] for sequence in (1, 3, 2)])
+                self.assertEqual([row["controller_sequence"] for row in rows], ["1", "3", "2"])
 
     def test_default_heartbeat_lease_allows_thirty_seconds(self) -> None:
         clock = [0.0]

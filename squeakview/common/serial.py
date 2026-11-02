@@ -199,6 +199,7 @@ class SerialHandle:
         self._v2_journal: protocol_v2.DurableJournal | None = None
         self._v2_boot_id: int | None = None
         self._v2_session_id: int | None = None
+        self._v2_pellet_well_cursor: tuple[int, int] | None = None
         self._v2_last_ack_queued: dict[int, int] = {}
         self._v2_last_resend_requested: dict[int, int] = {}
         self._v2_integrity_latched = False
@@ -451,6 +452,7 @@ class SerialHandle:
             self._protocol_v2_probe = None
             self._protocol_v2_proof = None
             self._v2_startup_handshake = None
+            self._v2_pellet_well_cursor = None
             self._protocol_v2_seen.clear()
             self._v1_input.clear()
             self._v2_decoder.reset()
@@ -762,6 +764,20 @@ class SerialHandle:
                     f"protocol-v2 persistence queue reached {MAX_BUFFERED_V2_RECORDS} records"
                 ) from exc
 
+    def _should_present_pellet_well_status(self, line: str) -> bool:
+        if not is_pellet_well_status_line(line):
+            return True
+        context = getattr(self, "_csv_context", None)
+        frame = getattr(context, "frame", None)
+        if frame is None:
+            return True  # Legacy serial input is already ordered.
+        previous = self._v2_pellet_well_cursor
+        if (previous is not None and previous[0] == frame.boot_id
+                and frame.sequence <= previous[1]):
+            return False
+        self._v2_pellet_well_cursor = (frame.boot_id, frame.sequence)
+        return True
+
     def _handle_semantic_line(
         self, line: str, *, received_ns: int, count_read: bool = True
     ) -> None:
@@ -789,8 +805,11 @@ class SerialHandle:
             self._protocol_v2_error = line
             self._protocol_v2_pending = False
             self._protocol_v2_seen.set()
-        if (self._emit_serial_logs or _is_feeder_jam_protocol_line(line)
-                or is_pellet_well_status_line(line)):
+        # Replayed status must not reverse a newer live warning. Every record
+        # still reaches the durable journal and CSV in its original receipt order.
+        if (self._should_present_pellet_well_status(line)
+                and (self._emit_serial_logs or _is_feeder_jam_protocol_line(line)
+                     or is_pellet_well_status_line(line))):
             self.emit(f"[{timestamp()}] 【SER】 {line}")
         if line == "CAMERA_HIGH" or line.startswith("CAMERA_HIGH,"):
             with self._ttl_lock:
@@ -1358,6 +1377,7 @@ class SerialHandle:
                 raise RuntimeError("an existing run must reconnect from its durable watermark")
             self._v2_boot_id = None
             self._v2_session_id = None
+            self._v2_pellet_well_cursor = None
             self._v2_integrity_latched = False
             self._v2_last_ack_queued.clear()
             self._v2_last_resend_requested.clear()

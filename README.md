@@ -352,8 +352,9 @@ diagnosis. NVIDIA documents its LFB field as an allocator statistic whose larges
 normal block is at most 4 MB, so LFB is not treated as a standalone readiness
 threshold.
 
-See [`docs/REFACTOR_PLAN.md`](docs/REFACTOR_PLAN.md) for the staged JetPack 7.2.1
-and DeepStream 9.1 modernization plan and the scientific recording invariants.
+See [`docs/PROJECT_WORKFLOW.md`](docs/PROJECT_WORKFLOW.md) for installation,
+project ownership, and operational acceptance checks, and
+[`docs/BOUNDED_INPUT_POLICY.md`](docs/BOUNDED_INPUT_POLICY.md) for input limits.
 
 Note: clearing memory cache and setting the jetson to "cool" thermal profiles are
 easily achieved by installing jtop.
@@ -1202,6 +1203,9 @@ metadata issue; this exception supplies no evidence of GPU compatibility.
 
 Commit source code, tests, documentation, notebooks without saved outputs,
 configuration, native build recipes, and shipped project-template model inputs.
+Keep refactor plans, implementation checklists, and review scratch notes outside
+the checkout or in ignored `local-notes/`. Tracked documentation describes
+supported behavior, setup, protocol contracts, and validation procedures.
 Do not commit device-local or generated state:
 
 ```text
