@@ -6,6 +6,8 @@ import csv
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import sqlite3
+import tempfile
 
 from . import controller_protocol_v2 as protocol
 from .bounded_csv import bounded_csv_lines
@@ -34,9 +36,9 @@ def _uint(value, label):
     return int(value)
 
 
-def journal_records(path: Path):
-    """Verify both encoded CRC bytes and the corresponding JSON projection."""
-    previous = boot = None
+def _verified_receipts(path: Path):
+    """Verify individual records without mistaking receipt order for sequence."""
+    boot = None
     for line in bounded_csv_lines(path):
         row = json.loads(line)
         frame = protocol.decode_frame(protocol.cobs_encode(bytes.fromhex(row["decoded_hex"]))[:-1])
@@ -47,14 +49,44 @@ def journal_records(path: Path):
             raise ValueError("journal payload disagrees with encoded frame")
         if not frame.reliable or frame.sequence == 0:
             raise ValueError("journal record is not a reliable positive sequence")
-        if previous is not None and frame.sequence != previous + 1:
-            raise ValueError("protocol-v2 journal contains a durable sequence gap")
         if boot is not None and frame.boot_id != boot:
             raise ValueError("protocol-v2 journal crosses a controller boot boundary")
         if frame.integrity_latched or frame.message_type == protocol.MessageType.INTEGRITY_FAULT:
             raise ValueError("controller integrity fault in journal")
-        previous, boot = frame.sequence, frame.boot_id
+        boot = frame.boot_id
         yield row
+
+
+def journal_records(path: Path):
+    """Yield CRC-verified records in reliable sequence order, with bounded RAM.
+
+    Replay may fill an earlier hole after later records are already durable.
+    Never rewrite the canonical arrival journal or its original host clocks.
+    The temporary B-tree is disposable and supports the full uint64 range.
+    """
+    with tempfile.TemporaryDirectory(prefix="squeakview-v2-order-") as temporary:
+        connection = sqlite3.connect(Path(temporary) / "records.sqlite")
+        try:
+            connection.execute("PRAGMA cache_size=-512")
+            connection.execute("PRAGMA temp_store=FILE")
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("CREATE TABLE records (sequence TEXT PRIMARY KEY, payload TEXT) WITHOUT ROWID")
+            for row in _verified_receipts(path):
+                try:
+                    connection.execute("INSERT INTO records VALUES (?, ?)",
+                                       (f"{int(row['sequence']):020d}", json.dumps(row)))
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError("protocol-v2 journal contains duplicate stored sequences") from exc
+            previous = None
+            for sequence, payload in connection.execute("SELECT sequence, payload FROM records ORDER BY sequence"):
+                sequence = int(sequence)
+                if previous is not None and sequence != previous + 1:
+                    raise ValueError("protocol-v2 journal contains a durable sequence gap")
+                previous = sequence
+                yield json.loads(payload)
+        finally:
+            connection.close()
 
 
 def read_v2_timing(run_dir: Path, *, triggered: bool) -> V2Timing:

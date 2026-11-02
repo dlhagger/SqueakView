@@ -23,6 +23,7 @@ from typing import Any, Callable, Mapping
 
 from squeakview.apps.operator.backend.contracts import RunRequest
 from squeakview.common import run_context
+from squeakview.common.bounded_input import read_atomic_json_snapshot
 from squeakview.common.capture_policy import capture_buffer_policy
 from squeakview.common.device_context import device_context_snapshot, file_identity
 from squeakview.common.storage_policy import resolve_storage_reserve_policy
@@ -372,7 +373,11 @@ class RunManifestService:
             disqualifiers = (*disqualifiers, "controller_protocol_not_v2")
         v2_summary_path = artifact_path(run_dir, "diagnostics") / "controller_v2_summary.json"
         v2_transport = (
-            run_context.read_json_required(v2_summary_path)
+            read_atomic_json_snapshot(
+                v2_summary_path,
+                max_bytes=run_context.MAX_RUN_METADATA_BYTES,
+                label=v2_summary_path.name,
+            )
             if cfg.serial_enabled
             and cfg.controller_protocol == "v2"
             and v2_summary_path.exists()

@@ -27,6 +27,7 @@ from squeakview.apps.operator.backend.events import BackendEvent, RunPhase
 from squeakview.apps.operator.backend import manifest
 from squeakview.apps.operator.backend.manager import OperatorBackend
 from squeakview.common.dashboard import DashboardEvent
+from squeakview.common.pellet_well import pellet_well_blocked
 from squeakview.project import PROJECT_ENV, RuntimeContext
 
 from .protocol import (
@@ -230,6 +231,7 @@ class SupervisorServer:
         self._socket_identity: tuple[int, int, int] | None = None
         self._presentation_loss_count = 0
         self._feeder_dashboard_event: DashboardEvent | None = None
+        self._pellet_well_dashboard_event: DashboardEvent | None = None
         self._diagnostic_events: queue.Queue[dict[str, object]] = queue.Queue(64)
         self._diagnostic_lock = threading.Lock()
         self._diagnostic_thread: threading.Thread | None = None
@@ -292,7 +294,12 @@ class SupervisorServer:
             self._feeder_dashboard_event = event
         elif event.event_uc == "SYSTEM_START" or event.event_uc.startswith("SYSTEM_START,"):
             self._feeder_dashboard_event = None
-        self._enqueue("dashboard", event.to_payload(), critical=False)
+        well_status = pellet_well_blocked(event)
+        if well_status is not None:
+            self._pellet_well_dashboard_event = event if well_status else None
+        # Startup warnings and their clear transitions must not be shed with
+        # routine display traffic. A disconnected GUI restores current state.
+        self._enqueue("dashboard", event.to_payload(), critical=well_status is not None)
 
     def _emit_backend_event(self, event: BackendEvent) -> None:
         self._enqueue(
@@ -446,10 +453,10 @@ class SupervisorServer:
         if command.name == "snapshot":
             return self._snapshot(), False
         if command.name == "runtime_state":
-            feeder_event = self._feeder_dashboard_event
+            alerts = (self._feeder_dashboard_event, self._pellet_well_dashboard_event)
             return {"snapshot": self._snapshot(), "config": _json_value(self.backend.launch_cfg),
                     "started_at": getattr(self.backend, "_run_started_at", None),
-                    "dashboard_events": [feeder_event.to_payload()] if feeder_event is not None else []}, False
+                    "dashboard_events": [event.to_payload() for event in alerts if event is not None]}, False
         if command.name == "start_run":
             config_payload = payload.get("config", payload)
             if not isinstance(config_payload, Mapping):

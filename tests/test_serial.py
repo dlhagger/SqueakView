@@ -374,6 +374,20 @@ class SerialCsvTests(unittest.TestCase):
         self.assertFalse(any("CAMERA_HIGH" in line for line in self.logs))
         self.assertTrue(any("FEED_JAM" in line for line in self.logs))
 
+    def test_pellet_well_status_is_visible_with_routine_serial_logs_disabled(self) -> None:
+        self.handle._emit_serial_logs = False
+        lines = (
+            "WELL_SENSOR_BLOCKED,10,20,nan,69420,69420,69420,1,Startup,Check pellet well for blockage or cleaning",
+            "WELL_SENSOR_CLEAR,11,21,nan,69420,69420,69420,0,Startup,Pellet well sensor clear",
+            "SYSTEM_START,12,22",
+        )
+        for line in lines:
+            self.handle._handle_semantic_line(line, received_ns=100)
+        self.handle._handle_semantic_line("POKE_START,12,22,L,1", received_ns=100)
+        for line in lines:
+            self.assertTrue(any(line in message for message in self.logs))
+        self.assertFalse(any("POKE_START" in message for message in self.logs))
+
     def test_only_camera_high_confirms_trigger_readiness(self) -> None:
         self.handle.set_csv_path(self.run_dir)
 

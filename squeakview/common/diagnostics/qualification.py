@@ -1385,6 +1385,65 @@ def _limit_checks(
     return checks, incomplete
 
 
+def _audit_fast_recording(
+    run_dir: Path, status: dict[str, Any], manifest: dict[str, Any], evidence: object
+) -> dict[str, Any] | None:
+    """Complete deferred recording/preview evidence during explicit qualification.
+
+    Return derived evidence only: never rewrite capture status, primary tables,
+    or acquisition provenance. The full decode binds this audit to the bytes
+    hashed now, rather than attaching new hashes to an earlier count check.
+    """
+    import copy
+    from squeakview.apps.inference.video_probe import probe_video_frames
+    from squeakview.apps.inference.preview_attribution import reconcile_preview
+
+    original = status.get("recording_validation")
+    capture = manifest.get("capture")
+    camera_count = capture.get("num_cameras") if isinstance(capture, dict) else None
+    if (not isinstance(original, dict)
+            or original.get("schema_version") != "3.0"
+            or original.get("validation_tier") != "shutdown_fast_count"
+            or status.get("state") not in {"finalized", "post_run_complete"}
+            or original.get("passed") is not True
+            or type(camera_count) is not int
+            or not 1 <= camera_count <= MAX_QUALIFICATION_CAMERA_COUNT):
+        return None
+    report = copy.deepcopy(original)
+    cameras = report.get("cameras")
+    if (not isinstance(cameras, list) or len(cameras) != camera_count
+            or any(not isinstance(camera, dict) or camera.get("stream_id") != i
+                   or type(camera.get("record_admitted_frames")) is not int
+                   or camera["record_admitted_frames"] <= 0
+                   for i, camera in enumerate(cameras))):
+        return None
+    valid = recording_evidence_complete(evidence, camera_count)
+    for i, camera in enumerate(cameras):
+        probe = probe_video_frames(
+            artifact_path(run_dir, "raw.mp4" if i == 0 else f"raw_cam{i}.mp4"),
+            expected_frames=camera["record_admitted_frames"], force_full_decode=True,
+        )
+        matches = (type(probe.get("count")) is int
+                   and probe["count"] == camera["record_admitted_frames"])
+        valid = (valid and matches and probe.get("error") is None
+                 and probe.get("method") in {"full_decode_gstreamer_nvv4l2decoder",
+                                             "full_decode_ffmpeg_h264_nvv4l2dec"})
+        camera.update(video_frames=probe.get("count"), frame_count_matches=matches,
+                      frame_count_method=probe.get("method"),
+                      frame_count_error=probe.get("error"),
+                      frame_count_warning=probe.get("warning"))
+    unchanged = recording_evidence_matches(run_dir, evidence, camera_count)
+    report.update(evidence=evidence, evidence_unchanged_during_validation=unchanged,
+                  passed=bool(valid and unchanged), validation_tier="qualification_full_decode")
+    inference = manifest.get("inference")
+    preview = reconcile_preview(
+        run_dir, camera_count,
+        required=isinstance(inference, dict) and inference.get("preview_enabled") is True,
+    )
+    return {"schema_version": "1.0", "recording_validation": report,
+            "preview_attribution": preview, "capture_validity_unchanged": True}
+
+
 def qualify_run(
     run_dir: Path,
     *,
@@ -1392,7 +1451,7 @@ def qualify_run(
     output_path: Path | None = None,
     allow_debug_profile: bool = False,
 ) -> dict[str, Any]:
-    """Evaluate existing evidence and atomically write a derived summary only."""
+    """Audit completed recordings and atomically write a derived summary only."""
 
     run_dir = Path(run_dir).resolve()
     manifest, manifest_identity = run_context.read_json_required_with_identity(
@@ -1445,12 +1504,18 @@ def qualify_run(
         if camera_count is not None and 1 <= camera_count <= MAX_QUALIFICATION_CAMERA_COUNT
         else None
     )
+    recording_audit = _audit_fast_recording(run_dir, status, manifest, current_recording_evidence)
+    qualification_status = status if recording_audit is None else {
+        **status,
+        "recording_validation": recording_audit["recording_validation"],
+        "preview_attribution": recording_audit["preview_attribution"],
+    }
     recording = _scan_recording(
         run_dir,
         expected_camera_count=camera_count,
     )
     gates = _integrity_gates(
-        status,
+        qualification_status,
         manifest,
         run_dir,
         current_recording_evidence=current_recording_evidence,
@@ -1626,6 +1691,7 @@ def qualify_run(
         "failed_reasons": failed_reasons,
         "incomplete_reasons": incomplete_reasons,
         "capture_validity_unchanged": True,
+        "recording_audit": recording_audit,
         "source_evidence": source_evidence,
     }
     destination = output_path or (artifact_path(run_dir, "qualification_summary.json"))

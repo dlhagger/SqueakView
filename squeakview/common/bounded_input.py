@@ -114,6 +114,36 @@ def read_json_object(path: Path, *, max_bytes: int, label: str) -> dict[str, Any
     )
 
 
+def read_atomic_json_snapshot(path: Path, *, max_bytes: int, label: str) -> dict[str, Any]:
+    """Read a bounded snapshot published exclusively by atomic replacement.
+
+    The open descriptor pins one complete published version even if the writer
+    replaces its pathname. Unlinking that version changes ctime, so only content
+    metadata is compared here. Configuration/provenance inputs must continue to
+    use read_json_object, which also requires a stable pathname and ctime.
+    """
+    try:
+        # Nonblocking open lets fstat reject a FIFO without waiting for a writer.
+        descriptor = os.open(Path(path), os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"{label} must be a regular file")
+            if before.st_size > max_bytes:
+                raise ValueError(f"{label} exceeds {max_bytes} byte limit")
+            data = handle.read(before.st_size)
+            grew = bool(handle.read(1))
+            after = os.fstat(handle.fileno())
+    except OSError as exc:
+        raise ValueError(f"{label} could not be read: {exc}") from exc
+    if len(data) != before.st_size or grew or any(
+        getattr(before, key) != getattr(after, key)
+        for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    ):
+        raise ValueError(f"{label} changed in place while being read")
+    return decode_json_object(data, label=label)
+
+
 def read_json_object_with_identity(
     path: Path, *, max_bytes: int, label: str
 ) -> tuple[dict[str, Any], dict[str, object]]:
@@ -168,6 +198,7 @@ def read_yaml_mapping(path: Path, *, max_bytes: int, label: str) -> dict[str, An
 
 
 __all__ = [
+    "read_atomic_json_snapshot",
     "decode_json_object",
     "decode_yaml_mapping",
     "read_json_object",

@@ -83,7 +83,7 @@ def _next_case_worksheet(
                 "0" if next_case["preview_enabled"] else "1"
             ),
             "SQUEAKVIEW_DEEPSTREAM_DEBUG_PROFILE": "0",
-            "SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE": "1",
+            "SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE": "0",
         }
         worksheet["required_environment"] = environment
         worksheet["launch_command"] = shlex.join(

@@ -152,6 +152,27 @@ class GuiCrashIsolationTests(unittest.TestCase):
         self.app.processEvents()
         self.assertNotIn('closed', logs)
 
+    def test_pellet_well_warning_and_clear_survive_display_flood_separately_from_jam(self):
+        events = []
+        buffer = GuiPresentationBuffer(lambda _: None, events.append, console=False)
+        self.buffers.append(buffer)
+        blocked = DashboardEvent.parse('WELL_SENSOR_BLOCKED,1,2,nan,69420,69420,69420,1,Startup,Check pellet well')
+        clear = DashboardEvent.parse('WELL_SENSOR_CLEAR,3,4,nan,69420,69420,69420,0,Startup,Clear')
+        for _ in range(buffer.MAX_ITEMS + 10):
+            buffer.post_log('flood')
+        buffer.post_dashboard(blocked)
+        buffer.post_dashboard(DashboardEvent.parse('FEED_JAM,1,2,nan,1,0,0,0,Feeding,Jam'))
+        buffer._drain()
+        self.assertEqual([e.event_uc for e in events], ['FEED_JAM', 'WELL_SENSOR_BLOCKED'])
+        buffer.post_dashboard(blocked)
+        buffer.post_dashboard(clear)
+        buffer._drain()
+        self.assertEqual(events[-1].event_uc, 'WELL_SENSOR_CLEAR')
+        buffer.post_dashboard(blocked)
+        buffer.post_dashboard(DashboardEvent.parse('SYSTEM_START,5,6'))
+        buffer._drain()
+        self.assertEqual(events[-1].raw_line, 'SYSTEM_START,5,6')
+
     def test_real_renderer_process_death_leaves_qt_event_loop_running(self):
         import sys
         controller = self.make_controller(lambda _message: None)

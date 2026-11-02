@@ -58,6 +58,66 @@ RECORDING_HEADERS = [
 
 
 class QualificationTests(unittest.TestCase):
+    def _fast_status(self, *, preview=False):
+        report = self.status["recording_validation"]
+        report.pop("evidence")
+        report.pop("evidence_unchanged_during_validation")
+        report.update(schema_version="3.0", validation_tier="shutdown_fast_count")
+        report["cameras"][0].update(frame_manifest_count_matches=True,
+                                    frame_count_method="mp4_sample_table")
+        self.manifest["inference"]["preview_enabled"] = preview
+        self.status_path.write_text(json.dumps(self.status))
+        (self.run_dir / "run_manifest.json").write_text(json.dumps(self.manifest))
+
+    def test_explicit_qualification_audits_fast_run_without_mutating_capture(self):
+        self._fast_status(preview=True)
+        for boundary in ("admission", "delivery"):
+            with (self.run_dir / "diagnostics" / f"preview_{boundary}.csv").open("w") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(PREVIEW_HEADERS)
+                writer.writerow([boundary, 0, 1, 41, 1000, 2000])
+        sources = [self.status_path, self.run_dir / "run_manifest.json", self.run_dir / "raw.mp4"]
+        originals = {path: path.read_bytes() for path in sources}
+        with mock.patch("squeakview.apps.inference.video_probe.probe_video_frames", return_value={
+                "count": 1, "method": "full_decode_gstreamer_nvv4l2decoder", "error": None}) as probe:
+            summary = qualify_run(self.run_dir, limits_path=self._limits(validated=True))
+        self.assertEqual(summary["result"], "passed")
+        probe.assert_called_once_with(self.run_dir / "raw.mp4", expected_frames=1, force_full_decode=True)
+        self.assertTrue(summary["frame_integrity_gates"]["recording_evidence_unchanged"])
+        self.assertTrue(summary["frame_integrity_gates"]["preview_attribution_complete_when_required"])
+        self.assertEqual(summary["recording_audit"]["recording_validation"]["validation_tier"], "qualification_full_decode")
+        self.assertEqual({path: path.read_bytes() for path in sources}, originals)
+
+    def test_fast_audit_still_fails_decode_errors_and_missing_preview(self):
+        self._fast_status(preview=True)
+        with mock.patch("squeakview.apps.inference.video_probe.probe_video_frames", return_value={
+                "count": 1, "method": "full_decode_gstreamer_nvv4l2decoder", "error": "decode failure"}):
+            summary = qualify_run(self.run_dir, limits_path=self._limits(validated=True))
+        self.assertEqual(summary["result"], "failed")
+        self.assertFalse(summary["frame_integrity_gates"]["recording_validation_passed"])
+        self.assertFalse(summary["frame_integrity_gates"]["preview_attribution_complete_when_required"])
+
+    def test_fast_audit_rejects_video_changed_during_decode(self):
+        self._fast_status()
+        def mutate(*args, **kwargs):
+            (self.run_dir / "raw.mp4").write_bytes(b"changed recording")
+            return {"count": 1, "method": "full_decode_gstreamer_nvv4l2decoder", "error": None}
+        with mock.patch("squeakview.apps.inference.video_probe.probe_video_frames", side_effect=mutate):
+            with self.assertRaisesRegex(ValueError, "changed|stale"):
+                qualify_run(self.run_dir, limits_path=self._limits(validated=True))
+        self.assertFalse((self.run_dir / "qualification_summary.json").exists())
+
+    def test_fast_audit_skips_malformed_capture_and_active_runs(self):
+        self._fast_status()
+        with mock.patch("squeakview.apps.inference.video_probe.probe_video_frames") as probe:
+            for capture in ([], "invalid", 1, None):
+                self.assertIsNone(qualification._audit_fast_recording(
+                    self.run_dir, self.status, {**self.manifest, "capture": capture}, None))
+            for state in ("recording", "starting", "stopping", "failed"):
+                self.assertIsNone(qualification._audit_fast_recording(
+                    self.run_dir, {**self.status, "state": state}, self.manifest, None))
+        probe.assert_not_called()
+
     def test_compact_task_snapshot_alias_retains_hash_and_path_checks(self):
         from squeakview.common.run_layout import initialize_layout, artifact_path
         initialize_layout(self.run_dir)

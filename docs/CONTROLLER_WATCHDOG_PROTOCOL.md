@@ -4,8 +4,10 @@ Status: **specification only; firmware and hardware qualification are not presen
 
 This document defines the controller safety boundary required before triggered
 SqueakView acquisition can be called resilient to total Jetson, supervisor, USB,
-or host-power failure. The current deployed host protocol is legacy `START,<fps>`
-and `STOP`, with `CAMERA_*` telemetry and `ACK_STOP`. It has no negotiated lease.
+or host-power failure. The current deployed host uses protocol v2 with ASCII
+`START,<fps>`/`STOP` commands and reliable, CRC-framed replies and sparse camera
+anchors. It has no negotiated host-loss lease. Queue-overflow shutdown does not
+provide a bounded host-loss timeout: optional checkpoints may be suppressed.
 The Python host therefore must not claim that an independently powered controller
 will stop pulses after the Jetson dies.
 
@@ -67,7 +69,7 @@ production-fatal.
 The host now contains an opt-in, unit-tested experimental v1 implementation. It
 sends nonce-bound `HELLO`, validates the complete required feature set, waits for
 nonce/sequence-bound arm/disarm acknowledgements, and renews the lease from the
-Qt-free supervisor. Legacy `START`/`STOP` remains the default. The experimental
+Qt-free supervisor. Reliable protocol v2 remains the default. The experimental
 path is selected only by launching with
 `SQUEAKVIEW_CONTROLLER_PROTOCOL=watchdog_v1_experimental`; its requested lease
 may be set with `SQUEAKVIEW_CONTROLLER_WATCHDOG_LEASE_MS` (default 1500). It is
@@ -133,8 +135,8 @@ experimental implementation has passed bench qualification, MUST:
    controllers for watchdog-required triggered runs.
 2. Generate a cryptographically random nonce per run and never reuse it.
 3. Start heartbeat renewal from the durable Qt-free supervisor, not the GUI and
-   not the capture child. GUI loss still initiates normal ordered shutdown; total
-   supervisor/Jetson loss is covered by lease expiry.
+   not the capture child. GUI loss preserves acquisition and triggers GUI
+   replacement; total supervisor/Jetson loss is covered by lease expiry.
 4. Use a bounded nonblocking heartbeat queue of capacity one. A missed write is a
    fault, never an invitation to accumulate pending heartbeats.
 5. Confirm `ACK_ARM` and the first camera TTL before publishing `RECORDING`.

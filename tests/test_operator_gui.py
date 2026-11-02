@@ -341,6 +341,82 @@ class BehaviorDashboardTests(unittest.TestCase):
         self.assertEqual(dashboard._observed_pellet_mode, "both")
         self.assertEqual(dashboard.counters.get("PELLET"), 2)
 
+    def test_startup_well_warning_is_visible_independent_of_jam_and_event_counts(self) -> None:
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        try:
+            blocked = "WELL_SENSOR_BLOCKED,100,200,nan,69420,69420,69420,1,Startup,Check pellet well"
+            clear = "WELL_SENSOR_CLEAR,101,201,nan,69420,69420,69420,0,Startup,Clear"
+            dashboard.ingest(blocked)
+            self.assertTrue(dashboard.pellet_well_blocked)
+            self.assertFalse(dashboard._pellet_well_banner.isHidden())
+            self.assertIn("clean", dashboard._pellet_well_banner.text())
+            self.assertIn("startup", dashboard._pellet_well_banner.text())
+            self.assertNotIn("5 minutes", dashboard._pellet_well_banner.text())
+            self.assertFalse(dashboard.feeder_jammed)
+            self.assertFalse(dashboard._clear_jam_btn.isEnabled())
+            self.assertTrue(all(value == 0 for value in dashboard.counters.values()))
+            dashboard.reset_run_data()
+            self.assertTrue(dashboard.pellet_well_blocked)
+            dashboard.ingest("FEED_JAM,100,200,nan,1,0,0,0,Feeding,Jam")
+            dashboard.ingest(clear)
+            self.assertFalse(dashboard.pellet_well_blocked)
+            self.assertTrue(dashboard._pellet_well_banner.isHidden())
+            self.assertTrue(dashboard.feeder_jammed)
+            dashboard.ingest(blocked)
+            dashboard.ingest("ACK_CLEAR_JAM")
+            self.assertTrue(dashboard.pellet_well_blocked)
+            self.assertFalse(dashboard.feeder_jammed)
+            dashboard.ingest("SYSTEM_START,100,200")
+            self.assertFalse(dashboard.pellet_well_blocked)
+        finally:
+            dashboard.close()
+
+    def test_watchdog_well_warning_explains_duration_and_clears_on_recovery(self) -> None:
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+        from squeakview.common.dashboard import DashboardEvent
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        try:
+            # The same structured event is used for live display and GUI recovery.
+            event = DashboardEvent.parse(
+                "WELL_SENSOR_BLOCKED,100,300000000,nan,69420,69420,69420,1,Watchdog,"
+                "Blocked for 5 minutes; check blockage or cleaning"
+            )
+            dashboard.ingest_event(event)
+            self.assertTrue(dashboard.pellet_well_blocked)
+            self.assertFalse(dashboard._pellet_well_banner.isHidden())
+            self.assertIn("OCCLUDED", dashboard._pellet_well_banner.text())
+            self.assertIn("continuously for 5 minutes", dashboard._pellet_well_banner.text())
+            self.assertNotIn("startup", dashboard._pellet_well_banner.text())
+            self.assertFalse(dashboard.feeder_jammed)
+            self.assertTrue(all(value == 0 for value in dashboard.counters.values()))
+            dashboard.reset_run_data()
+            dashboard.ingest_event(event)
+            self.assertIn("5 minutes", dashboard._pellet_well_banner.text())
+            dashboard.ingest("WELL_SENSOR_CLEAR,101,300000001,nan,69420,69420,69420,0,Recovery,Clear")
+            self.assertFalse(dashboard.pellet_well_blocked)
+            self.assertTrue(dashboard._pellet_well_banner.isHidden())
+        finally:
+            dashboard.close()
+
+    def test_well_warning_raises_behavior_panel(self) -> None:
+        from types import SimpleNamespace
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+        from squeakview.common.dashboard import DashboardEvent
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        dock = mock.Mock()
+        window = SimpleNamespace(dashboard=dashboard, workspace=SimpleNamespace(cards={"behavior": dock}))
+        try:
+            dashboard.ingest("FEED_JAM,1,2,nan,1,0,0,0,Feeding,Jam")
+            MainWindow._on_dashboard_event(window, DashboardEvent.parse("WELL_SENSOR_BLOCKED,1,2,nan,69420,69420,69420,1,Startup,Check pellet well"))
+            dock.show.assert_called_once_with()
+            dock.raise_.assert_called_once_with()
+        finally:
+            dashboard.close()
+
     def test_feed_jam_persists_until_authoritative_clear_ack(self) -> None:
         from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
 

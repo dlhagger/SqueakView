@@ -36,6 +36,13 @@ and JSON writers reject NaN and Infinity.
 
 ## Intentional streaming and pseudo-file exceptions
 
+The live `controller_v2_summary.json` embedded in manifest updates is published
+exclusively by atomic replacement. Its dedicated `read_atomic_json_snapshot`
+reader pins one complete version through an open descriptor, tolerating a newer
+version at the pathname. It retains the regular-file, size, strict UTF-8,
+duplicate-key, finite-number and in-place-content-change checks. This exception
+does not apply to configuration, acquisition provenance, or qualification reads.
+
 The following are not whole-file configuration reads and must not be converted
 to the small-document helper:
 
@@ -53,6 +60,9 @@ to the small-document helper:
 - offline replay reads `frames.csv` through 64 KiB-bounded strict UTF-8 records
   into a temporary disk-backed SQLite ordinal index. Full-duration replay lookup
   therefore remains bounded in memory without weakening source-frame identity.
+- reliable controller timing verifies CRC-backed records and orders them by
+  sequence through a temporary SQLite index with a 512 KiB page cache. Receipt
+  order and host timestamps in the canonical journal are never rewritten.
 
 Callers that make scientific acceptance or lifecycle decisions must use strict
 read APIs and propagate failure. The tolerant `run_context.read_json` function

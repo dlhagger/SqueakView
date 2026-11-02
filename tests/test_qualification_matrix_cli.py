@@ -198,7 +198,7 @@ class QualificationMatrixCliTests(unittest.TestCase):
             worksheet["required_environment"][
                 "SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE"
             ],
-            "1",
+            "0",
         )
         self.assertIn("SQUEAKVIEW_QUALIFICATION_CASE_ID=", worksheet["launch_command"])
         self.assertIn("squeakview.sh", worksheet["launch_command"])

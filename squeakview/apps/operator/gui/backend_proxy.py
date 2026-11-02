@@ -366,7 +366,7 @@ class SupervisorBackendProxy:
         # A later phase event may already have advanced beyond its snapshot.
         snapshot = self.current_snapshot
         raw_events = result.get("dashboard_events", [])
-        if not isinstance(raw_events, (list, tuple)) or len(raw_events) > 1:
+        if not isinstance(raw_events, (list, tuple)) or len(raw_events) > 2:
             raise RuntimeError("supervisor returned invalid sticky dashboard state")
         events = tuple(DashboardEvent.from_payload(payload) for payload in raw_events)
         self.launch_cfg = config

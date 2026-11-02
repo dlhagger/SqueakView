@@ -55,6 +55,12 @@ Qualification tools resolve both layouts. Their default per-run summaries go
 under `_metadata/` for new runs. Explicit analysis output directories remain
 available when supported by a command.
 
+Qualification of fast-finalized runs performs a full decode, hashes recording
+evidence and reconciles preview. These results live in the derived summary's
+`recording_audit`; scientific tables and capture status are unchanged. Run it
+after acquisition and allow time for the full video scan. Each re-evaluation
+repeats this audit. Normal Stop still uses the bounded count validator.
+
 The legacy alignment CLI reads `sensors.csv` and `detections.csv` in the new
 layout, or `serial.csv` and `objects.csv` in historical recordings. Its default
 `alignment_summary.json` goes under `_metadata/` in new runs. `--detections`

@@ -254,8 +254,9 @@ and the GUI waits for terminal lifecycle events while continuing its main-loop
 lease. Accelerated blocked-finalizer tests verify stop acknowledgement and
 progress snapshots without requiring an hours-long acquisition.
 
-A bounded lease emitted by a Qt-main-loop timer also makes a frozen GUI fail
-closed; a proxy background thread cannot renew that lease by itself. The
+A bounded lease emitted by a Qt-main-loop timer identifies a frozen GUI for
+replacement while preserving acquisition; a proxy background thread cannot
+renew that lease by itself. The
 supervisor validates renewals inline so long startup/finalization commands do
 not create false expiry. The acquisition child additionally arms Linux
 `PR_SET_PDEATHSIG` before executing DeepStream and verifies its expected parent
@@ -504,7 +505,7 @@ green unit-test suite:
    explicitly opt-in, production-disqualified experimental v1 state machine:
    nonce-bound negotiation and ACKs, bounded startup/disarm waits, monotonic
    heartbeat renewal from the supervisor, and fatal shutdown after two missed
-   acknowledgements. Legacy behavior remains the default. The current repository
+   acknowledgements. Reliable protocol v2 remains the default. The current repository
    has no firmware package or qualified watchdog, so host parent-death containment
    alone cannot guarantee
    that an independently powered controller stops pulses after Jetson failure.

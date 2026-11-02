@@ -220,7 +220,10 @@ class SupervisorBackendProxyTest(unittest.TestCase):
                              "run_dir": "/tmp/existing", "error": None,
                              "capture_running": True, "finalization_in_progress": False},
                 "started_at": "2026-10-23T14:54:36",
-                "dashboard_events": [DashboardEvent.parse("FEED_JAM,100,200,nan,3,69420,69420,69420,Feeding,Jam").to_payload()],
+                "dashboard_events": [
+                    DashboardEvent.parse("FEED_JAM,100,200,nan,3,69420,69420,69420,Feeding,Jam").to_payload(),
+                    DashboardEvent.parse("WELL_SENSOR_BLOCKED,101,201,nan,69420,69420,69420,1,Startup,Check pellet well").to_payload(),
+                ],
             })
         thread = CheckedThread(target=serve)
         thread.start()
@@ -231,6 +234,7 @@ class SupervisorBackendProxyTest(unittest.TestCase):
         self.assertEqual(proxy.current_snapshot.run_dir, Path("/tmp/existing"))
         self.assertEqual(restored["config"].bottles["mouse_weight_g"], 23.4)
         self.assertEqual(restored["dashboard_events"][0].event_uc, "FEED_JAM")
+        self.assertEqual(restored["dashboard_events"][1].event_uc, "WELL_SENSOR_BLOCKED")
         self.assertTrue(self.fake.commands.empty())
 
     def test_recovery_caller_cannot_regress_a_newer_terminal_phase(self) -> None:

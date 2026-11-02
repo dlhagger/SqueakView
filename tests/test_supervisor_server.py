@@ -504,6 +504,28 @@ class SupervisorServerTests(unittest.TestCase):
         result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "new-controller"))
         self.assertEqual(result["dashboard_events"], [])
 
+    def test_startup_well_warning_survives_display_flood_and_gui_reconnection(self) -> None:
+        for i in range(self.server._presentation_events.maxsize):
+            self.server._emit_log(str(i))
+        jam = DashboardEvent.parse("FEED_JAM,1,2,nan,1,0,0,0,Feeding,Jam")
+        blocked = DashboardEvent.parse("WELL_SENSOR_BLOCKED,3,4,nan,69420,69420,69420,1,Startup,Check pellet well")
+        self.server._emit_dashboard(jam)
+        self.server._emit_dashboard(blocked)
+        queued = self.server._critical_events.get_nowait()
+        self.assertEqual(queued.name, "dashboard")
+        self.assertEqual(queued.payload["event_uc"], "WELL_SENSOR_BLOCKED")
+        self.server._signal_client_loss("GUI disappeared")
+        result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "restore-both"))
+        self.assertEqual([e["event_uc"] for e in result["dashboard_events"]],
+                         ["FEED_JAM", "WELL_SENSOR_BLOCKED"])
+        self.server._emit_dashboard(DashboardEvent.parse("WELL_SENSOR_CLEAR,5,6,nan,69420,69420,69420,0,Startup,Clear"))
+        result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "well-clear"))
+        self.assertEqual([e["event_uc"] for e in result["dashboard_events"]], ["FEED_JAM"])
+        self.server._emit_dashboard(blocked)
+        self.server._emit_dashboard(DashboardEvent.parse("SYSTEM_START,7,8"))
+        result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "reboot"))
+        self.assertEqual(result["dashboard_events"], [])
+
     def test_default_heartbeat_lease_allows_thirty_seconds(self) -> None:
         clock = [0.0]
         server = SupervisorServer(

@@ -6,6 +6,7 @@ import threading
 from PySide6 import QtCore
 
 from .dashboard_model import feeder_jam_event
+from squeakview.common.pellet_well import pellet_well_blocked
 
 
 class GuiPresentationBuffer(QtCore.QObject):
@@ -19,6 +20,7 @@ class GuiPresentationBuffer(QtCore.QObject):
         self._dashboard = deliver_dashboard
         self._items = deque(maxlen=self.MAX_ITEMS)
         self._feeder = None
+        self._pellet_well = None
         self._lock = threading.Lock()
         self._scheduled = False
         self._closed = False
@@ -50,7 +52,9 @@ class GuiPresentationBuffer(QtCore.QObject):
         with self._lock:
             if self._closed:
                 return
-            if kind == "dashboard" and feeder_jam_event(value) is not None:
+            if kind == "dashboard" and pellet_well_blocked(value) is not None:
+                self._pellet_well = value
+            elif kind == "dashboard" and feeder_jam_event(value) is not None:
                 # Preserve the latest authoritative latch state even under
                 # display shedding. Scientific records remain in the journal.
                 self._feeder = value
@@ -72,6 +76,7 @@ class GuiPresentationBuffer(QtCore.QObject):
             batch = [self._items.popleft() for _ in range(min(len(self._items), self.BATCH_ITEMS))]
             feeder, dropped = self._feeder, self._dropped
             self._feeder, self._dropped = None, 0
+            pellet_well, self._pellet_well = self._pellet_well, None
             more = bool(self._items)
             if not more:
                 self._scheduled = False
@@ -81,6 +86,8 @@ class GuiPresentationBuffer(QtCore.QObject):
             (self._log if kind == "log" else self._dashboard)(value)
         if feeder is not None:
             self._dashboard(feeder)
+        if pellet_well is not None:
+            self._dashboard(pellet_well)
         if more:
             self._drain_timer.start(0)
 
@@ -107,6 +114,7 @@ class GuiPresentationBuffer(QtCore.QObject):
             self._closed = True
             self._items.clear()
             self._feeder = None
+            self._pellet_well = None
             self._log = self._dashboard = lambda _value: None
         if self._console is not None:
             while True:

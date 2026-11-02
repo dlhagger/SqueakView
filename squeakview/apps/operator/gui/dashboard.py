@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover - optional dependency
     yaml = None
 
 from squeakview.common import dashboard as dash_util
+from squeakview.common.pellet_well import pellet_well_blocked
 from squeakview.apps.operator.gui import dashboard_model, dashboard_presentation
 from squeakview.apps.operator.gui.dashboard_matrix import MatrixWidget
 from squeakview.apps.operator.gui.system_meters import JetsonMeters, MetersBar
@@ -50,6 +51,7 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self._task_cfg_path: Path | None = None
         self._first_event_at: float | None = None
         self._jam_active = False
+        self._pellet_well_blocked = False
         self._jam_reason = ""
         self._jam_detected_at = ""
         self._clear_jam_pending = False
@@ -74,6 +76,14 @@ class BehaviorDashboard(QtWidgets.QWidget):
         layout.addWidget(self.counts_label)
         self._jam_banner = self._build_jam_banner()
         layout.addWidget(self._jam_banner)
+        self._pellet_well_banner = QtWidgets.QLabel()
+        self._pellet_well_banner.setWordWrap(True)
+        self._pellet_well_banner.setStyleSheet(
+            "background-color: #382c12; color: #ffe2a3; border: 1px solid #a57828; "
+            "border-radius: 6px; padding: 10px; font-weight: 600;"
+        )
+        self._pellet_well_banner.hide()
+        layout.addWidget(self._pellet_well_banner)
         self._settings_widget = self._build_settings_panel()
 
         pg.setConfigOptions(antialias=True, useOpenGL=False)
@@ -145,6 +155,10 @@ class BehaviorDashboard(QtWidgets.QWidget):
     @property
     def feeder_jammed(self) -> bool:
         return self._jam_active
+
+    @property
+    def pellet_well_blocked(self) -> bool:
+        return self._pellet_well_blocked
 
     @property
     def clear_jam_pending(self) -> bool:
@@ -411,6 +425,23 @@ class BehaviorDashboard(QtWidgets.QWidget):
 
     @QtCore.Slot(object)
     def ingest_event(self, event: dash_util.DashboardEvent) -> None:
+        well_status = pellet_well_blocked(event)
+        if well_status is not None:
+            self._pellet_well_blocked = well_status
+            if well_status:
+                cause = (
+                    "The sensor has stayed blocked continuously for 5 minutes."
+                    if event.context.strip().upper() == "WATCHDOG"
+                    else "The sensor was blocked at task startup."
+                )
+                self._pellet_well_banner.setText(
+                    "PELLET WELL BLOCKED / OCCLUDED\n"
+                    f"{cause} Check the pellet well for a pellet or obstruction, "
+                    "and clean it if needed. This warning clears when the "
+                    "running task detects a clear sensor."
+                )
+            self._pellet_well_banner.setVisible(well_status)
+            return
         data = dashboard_model.event_data(event)
         if not data:
             return

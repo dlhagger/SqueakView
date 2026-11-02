@@ -207,13 +207,26 @@ Do this before an overnight or weekend acquisition:
 7. Stop normally. Wait for finalization and confirm `run_status.json` is
    terminal, `run_manifest.json` identifies the project, `raw.mp4` plays, and
    the recording/camera/controller counts pass.
-8. On a safe bench setup, trigger a feeder jam. Confirm the persistent warning,
+8. With updated fixed-ratio firmware in **transient-delivery mode**, start once
+   with the pellet-well beam blocked and once clear. A blocked start must show
+   **PELLET WELL BLOCKED / OCCLUDED** immediately with guidance to inspect/clean
+   the well. After a clear start, hold the beam blocked: the warning must appear
+   after five continuous minutes, once per blockage. Clearing the beam while
+   running must dismiss either warning without a `CLEAR_JAM` command and reset
+   the timer. Brief pellet passages must not accumulate toward the threshold;
+   stopped time must not count. Neither check may warn in **latched-presence
+   mode**, even if a pellet remains in the well for more than five minutes.
+   The warning must survive GUI reconnection and busy display traffic; it is
+   separate from the feeder's jam latch.
+9. On a safe bench setup, trigger a feeder jam. Confirm the persistent warning,
    disabled feeding, exact `CLEAR_JAM` acknowledgement behavior, and successful
    later shutdown.
-9. In a separate disposable run, close the GUI during acquisition. Confirm the
-   supervisor stops acquisition and produces a failed, terminal run rather than
-   continuing headlessly.
-10. Open a second project and verify the first project's profiles, models, and
+10. In a separate disposable run, terminate or disconnect the GUI during
+   acquisition. Confirm the durable supervisor preserves the same recording
+   and replaces the GUI. Then use explicit **Stop** to finalize the run. Follow
+   `SUPERVISOR_FAILURE_PROTOCOL.md`; GUI loss and supervisor loss are different
+   failure boundaries.
+11. Open a second project and verify the first project's profiles, models, and
    runs are not offered as the second project's assets.
 
 Keep the short-run directories as acceptance evidence until their manifests and

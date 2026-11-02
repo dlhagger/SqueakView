@@ -3,6 +3,7 @@ from __future__ import annotations
 """Serial helpers shared across capture/operator layers."""
 
 from squeakview.common.run_layout import artifact_path, is_primary_layout
+from squeakview.common.pellet_well import is_pellet_well_status_line
 from squeakview.common.sensor_csv import (
     EVENT_FIELDS,
     make_event_record,
@@ -788,7 +789,8 @@ class SerialHandle:
             self._protocol_v2_error = line
             self._protocol_v2_pending = False
             self._protocol_v2_seen.set()
-        if self._emit_serial_logs or _is_feeder_jam_protocol_line(line):
+        if (self._emit_serial_logs or _is_feeder_jam_protocol_line(line)
+                or is_pellet_well_status_line(line)):
             self.emit(f"[{timestamp()}] 【SER】 {line}")
         if line == "CAMERA_HIGH" or line.startswith("CAMERA_HIGH,"):
             with self._ttl_lock:

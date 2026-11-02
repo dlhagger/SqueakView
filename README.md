@@ -803,6 +803,12 @@ export SQUEAKVIEW_PROJECT="/absolute/path/to/My Project"
 .venv/bin/python scripts/qualify_run.py "$SQUEAKVIEW_PROJECT/runs/<experiment>/<subject>/<run>"
 ```
 
+For fast-finalized runs, this explicit command also performs the deferred full
+video decode, content hashing and preview reconciliation. Its `recording_audit`
+is saved only in the derived qualification summary; capture status and primary
+tables are unchanged. Run it after acquisition and allow time to decode the
+complete video. Re-evaluation repeats this audit against the current files.
+
 The checked-in JetPack 7.2.1 limits profile is intentionally marked
 measurement-only. Results remain `incomplete` until sustained baseline runs are
 used to approve explicit thermal, resource, telemetry-coverage, and recording

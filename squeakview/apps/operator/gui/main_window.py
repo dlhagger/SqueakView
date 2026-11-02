@@ -671,8 +671,10 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(object)
     def _on_dashboard_event(self, event: DashboardEvent) -> None:
         was_jammed = self.dashboard.feeder_jammed
+        was_well_blocked = self.dashboard.pellet_well_blocked
         self.dashboard.ingest_event(event)
-        if self.dashboard.feeder_jammed and not was_jammed:
+        if ((self.dashboard.feeder_jammed and not was_jammed)
+                or (self.dashboard.pellet_well_blocked and not was_well_blocked)):
             behavior_dock = self.workspace.cards.get("behavior")
             if behavior_dock is not None:
                 behavior_dock.show()

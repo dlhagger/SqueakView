@@ -47,9 +47,17 @@ The JSON output includes progress counts, every bound capture/inference/preview
 factor, the power mode, required minimum duration, an explicit environment map,
 and a copyable launcher command. It never starts, stops, assigns, or modifies a
 run. Set the named power mode separately and verify it with `nvpmodel -q` before
-using the command. The generated environment requires
-`SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE=1`; routine structural validation is
-valid for ordinary scientific runs but cannot satisfy the qualification gate.
+using the command. The generated environment keeps
+`SQUEAKVIEW_VIDEO_VALIDATION_FULL_DECODE=0` so Stop remains a bounded count
+check. Explicit qualification of new fast-finalized runs performs full decoding,
+content hashing and preview reconciliation after acquisition. These derived
+results appear under `recording_audit` in `qualification_summary.json`; capture
+status, provenance and primary CSVs remain unchanged. Run qualification with
+acquisition stopped and budget time for the complete video decode. Re-evaluating
+a fast-finalized run repeats the audit against its current bytes. Historical
+runs with an existing full validation report retain their original evidence
+checks. Setting the environment variable to `1` remains an optional additional
+decode during Stop, but does not replace the post-acquisition evidence audit.
 
 Task snapshot checks accept the historical `config/task.yaml` and compact
 `_metadata/config/task.yaml` locations with the same size, hash, and direct-file

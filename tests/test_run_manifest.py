@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import os
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -16,10 +17,36 @@ from squeakview.apps.operator.backend.manifest import (
     snapshot_task_config,
 )
 from squeakview.common import run_context
+from squeakview.common import bounded_input
 from squeakview.common.failure_injection import FailurePlan
 
 
 class RunManifestServiceTests(unittest.TestCase):
+    def test_atomic_controller_summary_replacement_is_a_valid_snapshot(self) -> None:
+        context = replace(self.context, config=replace(
+            self.context.config, serial_enabled=True, controller_protocol="v2"))
+        path = self.run_dir / "diagnostics/controller_v2_summary.json"
+        path.parent.mkdir()
+        path.write_text('{"frames_stored":1}')
+        original_fstat = os.fstat
+        calls = 0
+
+        def replace_open_snapshot(fd):
+            nonlocal calls
+            result = original_fstat(fd)
+            calls += 1
+            if calls == 1:
+                replacement = path.with_suffix(".tmp")
+                replacement.write_text('{"frames_stored":2}')
+                os.replace(replacement, path)
+            return result
+
+        with mock.patch.object(bounded_input.os, "fstat", side_effect=replace_open_snapshot):
+            result = self.service.build(self.run_dir, context,
+                                        output_snapshot=lambda _: {}, bottle_snapshot=lambda _: {})
+        self.assertEqual(result["serial"]["v2_transport"]["frames_stored"], 1)
+        self.assertEqual(run_context.read_json_required(path)["frames_stored"], 2)
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)

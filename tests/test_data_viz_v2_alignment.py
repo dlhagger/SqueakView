@@ -8,11 +8,13 @@ from pathlib import Path
 
 import pandas as pd
 from squeakview.common import controller_protocol_v2 as protocol
+from squeakview.common.v2_timing import journal_records, read_v2_timing
 
 from data_viz.v2_alignment import (
     associate_events_to_frames,
     find_latest_run,
     load_v2_run,
+    load_v2_journal,
 )
 
 
@@ -74,6 +76,35 @@ class LatestRunSelectionTests(unittest.TestCase):
 
 
 class V2AlignmentTests(unittest.TestCase):
+    def test_replay_reorders_analysis_without_rewriting_receipt_evidence(self) -> None:
+        self.rows = [self.rows[i] for i in (0, 2, 3, 1, 4)]
+        self._write_journal()
+        path = self.run_dir / "diagnostics/controller_v2.jsonl"
+        original = path.read_bytes()
+        streaming = list(journal_records(path))
+        self.assertEqual([row["sequence"] for row in streaming], [10, 11, 12, 13, 14])
+        journal = load_v2_journal(path)
+        self.assertEqual(journal["journal_index"].tolist(), [0, 3, 1, 2, 4])
+        self.assertEqual(journal["host_unix_ns"].tolist(), [1_000_000_000 + i for i in range(10, 15)])
+        self.assertEqual(read_v2_timing(self.run_dir, triggered=True).records, 5)
+        self.assertEqual(len(load_v2_run(self.run_dir).frames), 4)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_streaming_order_still_rejects_holes_duplicates_and_crc_changes(self) -> None:
+        path = self.run_dir / "diagnostics/controller_v2.jsonl"
+        originals = list(self.rows)
+        for rows, error in ((originals[:2] + originals[3:], "sequence gap"),
+                            (originals + originals[:1], "duplicate")):
+            self.rows = rows
+            self._write_journal()
+            with self.assertRaisesRegex(ValueError, error):
+                list(journal_records(path))
+        self.rows = originals
+        self.rows[0]["decoded_hex"] = self.rows[0]["decoded_hex"][:-2] + "00"
+        self._write_journal()
+        with self.assertRaisesRegex(ValueError, "CRC"):
+            list(journal_records(path))
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.run_dir = Path(self.temp_dir.name)

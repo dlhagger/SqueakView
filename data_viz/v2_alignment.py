@@ -185,10 +185,12 @@ def load_v2_journal(path: Path) -> pd.DataFrame:
         raise ValueError("protocol-v2 journal crosses a controller boot boundary")
     if journal["sequence"].duplicated().any():
         raise ValueError("protocol-v2 journal contains duplicate stored sequences")
+    # Keep physical receipt order available even when replay fills an old hole.
+    journal.insert(0, "journal_index", np.arange(len(journal), dtype=np.int64))
+    journal = journal.sort_values("sequence", kind="stable").reset_index(drop=True)
     sequence_steps = journal["sequence"].diff().dropna()
     if not sequence_steps.eq(1).all():
         raise ValueError("protocol-v2 journal contains a durable sequence gap")
-    journal.insert(0, "journal_index", np.arange(len(journal), dtype=np.int64))
     return journal
 
 

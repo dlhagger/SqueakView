@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import tempfile
+import os
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from squeakview.common.bounded_input import (
+    read_atomic_json_snapshot,
     read_json_object,
     read_json_object_with_identity,
     read_stable_regular_file,
@@ -14,6 +17,43 @@ from squeakview.common.bounded_input import (
 
 
 class BoundedInputTests(unittest.TestCase):
+    def test_atomic_snapshot_retains_strict_content_and_file_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "live.json"
+            for payload, error in ((b'{"v":1,"v":2}', "duplicate"),
+                                   (b'[]', "JSON object"),
+                                   (b'{"v":NaN}', "number"),
+                                   (b'{"v":"\xff"}', "UTF-8")):
+                path.write_bytes(payload)
+                with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, error):
+                    read_atomic_json_snapshot(path, max_bytes=1024, label="live")
+            with self.assertRaisesRegex(ValueError, "exceeds"):
+                read_atomic_json_snapshot(path, max_bytes=1, label="live")
+            fifo = Path(temporary) / "fifo"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                read_atomic_json_snapshot(fifo, max_bytes=1024, label="live")
+
+    def test_atomic_snapshot_rejects_in_place_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "live.json"
+            path.write_text('{"v":1}')
+            original_fstat = os.fstat
+            changed = False
+
+            def mutate(fd):
+                nonlocal changed
+                result = original_fstat(fd)
+                if not changed:
+                    changed = True
+                    path.write_text('{"v":2}')
+                    os.utime(path, ns=(result.st_atime_ns, result.st_mtime_ns + 1_000_000))
+                return result
+
+            with mock.patch("squeakview.common.bounded_input.os.fstat", side_effect=mutate):
+                with self.assertRaisesRegex(ValueError, "changed in place"):
+                    read_atomic_json_snapshot(path, max_bytes=1024, label="live")
+
     def test_reads_a_regular_file_within_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "input.yaml"
