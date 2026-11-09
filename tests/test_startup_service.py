@@ -46,7 +46,7 @@ class _Serial:
         self.events.append(f"serial-negotiate:{requested_lease_ms}:{timeout_s}")
         return object()
 
-    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None:
+    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0, ensure_idle: bool = False) -> None:
         self.events.append(f"serial-negotiate-v2:{timeout_s}")
 
     def exchange_time_sync(

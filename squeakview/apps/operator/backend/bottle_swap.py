@@ -17,7 +17,7 @@ from typing import Any, Callable, Mapping
 import uuid
 
 from squeakview.common.run_context import atomic_write_json
-from squeakview.common.measurements import weight_value
+from squeakview.common.measurements import weight_value, bottle_note
 
 Controller = Callable[[str, str], Mapping[str, Any]]
 SIDES = ("left", "right")
@@ -78,7 +78,7 @@ class BottleSwapService:
         return {
             "bottle_id": uuid.uuid4().hex, "side": side,
             "fluid": BottleSwapService._fluid(values.get("fluid", "")),
-            "note": str(values.get("note") or ""),
+            "note": bottle_note(values.get("note")),
             "initial_weight_g": values.get("initial_weight_g"),
             "final_weight_g": values.get("final_weight_g"),
             "start_count": count, "end_count": None,
@@ -131,6 +131,32 @@ class BottleSwapService:
         if snapshot != self._data.get("lick_recovery"):
             self._data["lick_recovery"] = snapshot
             self._save()
+
+    def status_unavailable(self, error: str):
+        """Revoke readiness without discarding a pending bottle transaction."""
+        if self._data["state"] != "STOPPED":
+            self._data.update(available=False, error=str(error)[:1024])
+            self._save()
+
+    def reconcile_pause_boundary(self, response):
+        """Recover a missing historical boundary without accepting a new swap."""
+        ours = self._data["swap_id"]
+        if (self._data["state"] == "STOPPED" or not ours or
+                not isinstance(response, Mapping) or response.get("state") != "PAUSED" or
+                response.get("swap_id") != ours or
+                any(g["swap_id"] == ours for g in self._data["gaps"])):
+            return False
+        stamp = response.get("monotonic_us")
+        counts = {side: response.get(f"{side}_count") for side in SIDES}
+        if any(type(value) is not int or value < 0 for value in (stamp, *counts.values())):
+            return False
+        self._data["gaps"].append({"swap_id": ours,
+            "selected_sides": list(self._data["selected_sides"]),
+            "paused_monotonic_us": stamp, "resumed_monotonic_us": None,
+            "pause_counts": counts, "resume_counts": None})
+        self._audit("pause_boundary_recovered", response=dict(response))
+        self._save()
+        return True
 
     def snapshot(self):
         result = deepcopy({key: value for key, value in self._data.items()
@@ -240,7 +266,7 @@ class BottleSwapService:
             fluid = self._fluid(values.get("fluid", ""))
             if not fluid:
                 raise ValueError(f"{side.title()} replacement fluid is required")
-            cleaned[side] = {"fluid": fluid, "note": str(values.get("note") or ""),
+            cleaned[side] = {"fluid": fluid, "note": bottle_note(values.get("note")),
                              "initial_weight_g": self._weight(values.get("initial_weight_g"), True),
                              "final_weight_g": self._weight(values.get("final_weight_g"))}
         self._data.update(pending_replacements=cleaned, state="CALIBRATING", error="")
@@ -248,12 +274,12 @@ class BottleSwapService:
         self._audit("resume_requested", replacements=cleaned)
         return self._command(controller, "resume")
 
-    def observe_controller(self, response: Mapping[str, Any]):
+    def observe_controller(self, response: Mapping[str, Any], *, confirm_support: bool = True):
         if self._data["state"] == "STOPPED":
             return self.snapshot()
         if self._primary:
             self._audit("controller_state", response=dict(response))
-        if "supported" in response:
+        if confirm_support and "supported" in response:
             self._data["available"] = response["supported"] is True
         for side in SIDES:
             if response.get(f"{side}_count") is not None:
@@ -353,7 +379,7 @@ class BottleSwapService:
             for key in ("fluid", "initial_weight_g", "final_weight_g", "note"):
                 if key in values:
                     if key == "note":
-                        entry[key] = str(values[key] or "")
+                        entry[key] = bottle_note(values[key])
                     elif key == "fluid":
                         entry[key] = self._fluid(values[key])
                     else:

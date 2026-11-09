@@ -22,6 +22,21 @@ from squeakview.common.failure_injection import FailurePlan
 
 
 class RunManifestServiceTests(unittest.TestCase):
+    def test_application_parser_identity_follows_selected_sdk_for_both_versions(self):
+        from squeakview import config as runtime_config
+        from squeakview.common.parser_selection import parser_library_for_sdk
+        for version in ('9.1.0', '9.2.0'):
+            (runtime_config.DEEPSTREAM_SDK_ROOT / 'version').write_text(f'Version: {version}\n')
+            parser = parser_library_for_sdk(self.root / 'native', runtime_config.DEEPSTREAM_SDK_ROOT)
+            parser.parent.mkdir(parents=True, exist_ok=True)
+            parser.write_bytes(version.encode())
+            result = self.service.build(self.run_dir, self.context,
+                                        output_snapshot=lambda _: {}, bottle_snapshot=lambda _: {})
+            plugins = result['native_plugins']
+            self.assertEqual(plugins['application_deepstream_yolo_parser_build']['path'], str(parser.resolve()))
+            self.assertTrue(plugins['application_deepstream_yolo_parser_build']['available'])
+            self.assertEqual(plugins['deepstream_yolo_parser'], plugins['application_deepstream_yolo_parser_build'])
+
     def test_atomic_controller_summary_replacement_is_a_valid_snapshot(self) -> None:
         context = replace(self.context, config=replace(
             self.context.config, serial_enabled=True, controller_protocol="v2"))
@@ -50,6 +65,13 @@ class RunManifestServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
+        from squeakview import config as runtime_config
+        sdk = self.root / 'sdk'
+        sdk.mkdir()
+        (sdk / 'version').write_text('Version: 9.1.0\n')
+        sdk_patch = mock.patch.object(runtime_config, 'DEEPSTREAM_SDK_ROOT', sdk)
+        sdk_patch.start()
+        self.addCleanup(sdk_patch.stop)
         self.run_dir = self.root / "run-001"
         self.run_dir.mkdir()
         self.logs: list[str] = []
@@ -338,10 +360,9 @@ class RunManifestServiceTests(unittest.TestCase):
         self.assertEqual(result["inference"]["model_package"], model_snapshot)
 
     def test_effective_runtime_uses_package_parser_not_workspace_build(self) -> None:
-        workspace_parser = (
-            self.root
-            / "native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
-        )
+        from squeakview.common.parser_selection import parser_library_for_sdk
+        from squeakview import config as runtime_config
+        workspace_parser = parser_library_for_sdk(self.root / "native", runtime_config.DEEPSTREAM_SDK_ROOT)
         workspace_parser.parent.mkdir(parents=True)
         workspace_parser.write_bytes(b"workspace parser")
         package_parser = self.root / "models/mouse/lib/parser.so"

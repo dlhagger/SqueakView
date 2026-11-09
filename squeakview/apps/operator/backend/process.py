@@ -356,6 +356,7 @@ def _spawn(
     on_exit: Callable[[int], None] | None = None,
     output_log_path: Path | None = None,
     parent_death_signal: signal.Signals | None = None,
+    keep_stdin_open: bool = False,
 ) -> ProcessHandle:
     return supervision.spawn(
         module,
@@ -367,6 +368,7 @@ def _spawn(
         on_exit=on_exit,
         output_log_path=output_log_path,
         parent_death_signal=parent_death_signal,
+        keep_stdin_open=keep_stdin_open,
     )
 
 
@@ -462,6 +464,7 @@ def spawn_inference(
         on_exit=on_exit,
         output_log_path=output_log_path,
         parent_death_signal=signal.SIGINT,
+        keep_stdin_open=True,
     )
 
 

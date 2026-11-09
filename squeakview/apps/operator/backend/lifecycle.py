@@ -45,6 +45,8 @@ class SerialHandle(Protocol):
 
     def wait_for_camera_stop(self, timeout_s: float = 3.0) -> bool: ...
 
+    def confirm_idle(self, *, timeout_s: float = 2.0) -> None: ...
+
     def disarm_watchdog_v1(self, *, timeout_s: float = 2.0) -> None: ...
 
     def close(self) -> None: ...
@@ -178,6 +180,11 @@ def finalize_run(
                     )
                     if not stop_acked:
                         stop_failures.append("controller STOP was not acknowledged")
+                    elif request.controller_protocol == "v2":
+                        try:
+                            serial_handle.confirm_idle(timeout_s=2.0)
+                        except Exception as exc:
+                            stop_failures.append(f"controller idle was not confirmed: {exc}")
                     if stop_failures:
                         controller_stop_error = "; ".join(stop_failures)
         except Exception as exc:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable
+from squeakview import config as runtime_config
 
 from squeakview.common.capture_policy import (
     capture_buffer_policy,
@@ -107,8 +108,7 @@ def add_inference_tracking_branch(
             "tracker-width": 640,
             "tracker-height": 480,
             "ll-lib-file": (
-                "/opt/nvidia/deepstream/deepstream/lib/"
-                "libnvds_nvmultiobjecttracker.so"
+                str(runtime_config.DEEPSTREAM_SDK_ROOT / "lib/libnvds_nvmultiobjecttracker.so")
             ),
             "ll-config-file": str(tracker_config),
             "operate-on-class-ids": ";".join(

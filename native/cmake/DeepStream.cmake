@@ -1,0 +1,15 @@
+# DeepStream 9.2 binary packages use includes/; 9.1 uses sources/includes/.
+set(_deepstream_default "/opt/nvidia/deepstream/deepstream")
+if(DEFINED ENV{SQUEAKVIEW_DEEPSTREAM_SDK} AND NOT "$ENV{SQUEAKVIEW_DEEPSTREAM_SDK}" STREQUAL "")
+  set(_deepstream_default "$ENV{SQUEAKVIEW_DEEPSTREAM_SDK}")
+endif()
+set(DEEPSTREAM_SDK "${_deepstream_default}" CACHE PATH "DeepStream SDK root")
+# Header layout always follows the selected SDK, including on cached reruns.
+if(EXISTS "${DEEPSTREAM_SDK}/includes/nvdsinfer_custom_impl.h")
+  set(_deepstream_includes "${DEEPSTREAM_SDK}/includes")
+elseif(EXISTS "${DEEPSTREAM_SDK}/sources/includes/nvdsinfer_custom_impl.h")
+  set(_deepstream_includes "${DEEPSTREAM_SDK}/sources/includes")
+else()
+  message(FATAL_ERROR "DeepStream headers missing under ${DEEPSTREAM_SDK}")
+endif()
+set(DEEPSTREAM_INCLUDES "${_deepstream_includes}" CACHE PATH "Headers for the selected DeepStream SDK" FORCE)

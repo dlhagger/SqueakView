@@ -49,6 +49,9 @@ class _Serial:
         self.events.append(f"serial:camera-stop:{timeout_s}")
         return True
 
+    def confirm_idle(self, *, timeout_s: float = 2.0) -> None:
+        self.events.append("serial:idle-confirmed")
+
     def disarm_watchdog_v1(self, *, timeout_s: float = 2.0) -> None:
         self.events.append(f"serial:disarm:{timeout_s}")
 
@@ -118,6 +121,18 @@ class FinalizationServiceTests(unittest.TestCase):
             trigger_on=True,
             phase=RunPhase.RECORDING,
         )
+
+    def test_idle_confirmation_failure_cannot_finalize_successfully(self) -> None:
+        serial = _Serial(self.events)
+        def reject(**_):
+            raise TimeoutError('controller is still busy')
+        serial.confirm_idle = reject
+        result = lifecycle.finalize_run(
+            self._request(_Capture(self.events), serial), self._hooks()
+        )
+        self.assertEqual(result.final_state, 'failed')
+        self.assertIn('idle was not confirmed', result.error)
+        self.assertIn('serial:close', self.events)
 
     def test_contracts_are_immutable(self) -> None:
         request = self._request(_Capture(self.events), _Serial(self.events))

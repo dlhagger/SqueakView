@@ -264,6 +264,7 @@ def _format_optional_float(value: float | None) -> str:
 def normalize_bottle_measurements(
     bottles: Mapping[str, Any] | None,
 ) -> dict[str, dict[str, Any]]:
+    from .measurements import bottle_note
     source = bottles if isinstance(bottles, Mapping) else {}
     normalized: dict[str, dict[str, Any]] = {}
     for side in ("left", "right"):
@@ -276,7 +277,7 @@ def normalize_bottle_measurements(
             "fluid": str(raw_side.get("fluid") or "").strip(),
             "initial_weight_g": _optional_float(raw_side.get("initial_weight_g")),
             "final_weight_g": _optional_float(raw_side.get("final_weight_g")),
-            "note": str(raw_side.get("note") or "").strip(),
+            "note": bottle_note(raw_side.get("note")).strip(),
         }
     return normalized
 

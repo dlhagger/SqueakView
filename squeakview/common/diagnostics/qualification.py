@@ -17,6 +17,7 @@ from typing import Any
 import yaml
 
 from squeakview.common import run_context
+from squeakview.common.deepstream_identity import deepstream_package_errors
 from squeakview.common.bounded_input import (
     read_stable_regular_file,
     read_stable_regular_file_with_identity,
@@ -105,7 +106,6 @@ _REQUIRED_PLATFORM_FIELDS = (
 )
 _REQUIRED_PLATFORM_PACKAGES = (
     "nvidia-l4t-core",
-    "deepstream-9.1",
     "cuda-toolkit-13-2",
     "libcudnn9-cuda-13",
     "libnvinfer10",
@@ -401,7 +401,7 @@ def _platform_provenance_complete(platform: object) -> bool:
     if not all(_nonempty_string(platform.get(name)) for name in _REQUIRED_PLATFORM_FIELDS):
         return False
     packages = platform.get("packages")
-    return isinstance(packages, dict) and all(
+    return not deepstream_package_errors(platform) and isinstance(packages, dict) and all(
         _nonempty_string(packages.get(name)) for name in _REQUIRED_PLATFORM_PACKAGES
     )
 

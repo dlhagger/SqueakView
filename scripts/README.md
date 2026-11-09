@@ -18,10 +18,35 @@ scripts/
 Start the operator with `bash squeakview.sh`. The unused
 `scripts/launch_operator.sh` forwarding alias has been removed.
 
+Setup installs the bundled official `99-platformio-udev.rules` and reloads udev
+for PlatformIO flashing and RP2040 bootloader access. Unplug and reconnect the
+controller afterward to apply the rules; setup prints this reminder. The rules
+are bundled under `scripts/udev/` so setup does not need a live rules download.
+
+`setup_jetson.sh` also installs the controller USB recovery helper as a fixed,
+root-owned executable, a no-argument sudo rule for the selected desktop user,
+and a boot-created `dialout` lock file. When Start is pressed for a fresh run,
+SqueakView holds the acquisition lock and recovers a missing Feather controller
+on the dedicated Jetson USB-C port. Recovery is bounded to three attempts and
+refuses an occupied port or a controller connection owned by SqueakView.
+An already-present serial device is left in place. A stable by-id selection
+never falls back to another board; an unambiguous ttyACM port can follow a
+changed enumeration number.
+
+Before a fresh production-v2 run, the app sends STOP to the verified Feather
+controller and requires a fresh, durably recorded idle handshake before capture.
+Shutdown waits for STOP acknowledgement and confirms idle with another fresh
+challenge; failure is reported in the run result. Idle checks use the existing
+firmware protocol and do not set the RTC. Opening or reattaching the GUI does
+not reset USB or stop an experiment owned by the supervisor. Recovery does not
+run mid-experiment. Restart the application after installing these changes so
+its serial connection participates in the shared USB lock.
+
 | Script | Purpose | When to use it |
 | --- | --- | --- |
-| `setup_jetson.sh` | Install OS packages, configure serial permissions and the project parent, then build native components as the desktop user. | Initial machine setup; it requests a reboot afterward. |
-| `build_native.sh` | Build and check the FLIR source and pose parser. | After native source changes or SDK updates. It does not install OS packages. |
+| `setup_jetson.sh` | Install OS packages, configure serial access, disable sleep, enable the R39.2.x firmware workaround, sync the UV environment, and build native components as the desktop user. | Initial machine setup; it requests a reboot afterward. |
+| `build_pose_parser.sh` | Build the parser-only YOLO26 candidate and compare it against the legacy/model-package library. | Explicit equivalence testing; does not modify existing model packages. |
+| `build_native.sh` | Build and check the FLIR source and SDK-selected parser (9.2 parser-only; 9.1 legacy). | After native source changes or SDK updates. It does not install OS packages. |
 | `test.py` | Check dependencies, run nonempty unittest discovery, and build/run native EOS and pose-parser CTests. | Software changes or dependency upgrades; run with `.venv/bin/python scripts/test.py`. `--python-only` explicitly omits native checks. |
 | `preflight.sh` | Check system, model, controller access, and recording prerequisites. | The operator runs it before acquisition; it can also be run manually with the selected project/model environment. |
 | `qualify_run.py` | Evaluate a completed run against qualification limits. | Verify a run after acquisition. |

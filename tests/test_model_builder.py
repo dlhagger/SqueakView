@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
+from types import SimpleNamespace
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +12,10 @@ from unittest import mock
 from squeakview.apps import model_builder as model_builder_cli
 from squeakview.model_builder import (
     BuildSpec,
+    _export_arguments,
+    _prepare_export_environment,
+    _require_vendor_tensorrt,
+    _validate_export_metadata,
     BuildResult,
     discover_model_sources,
     import_model_source,
@@ -83,6 +90,56 @@ class ModelBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(spec.tensorrt_workspace_gib, 1.0)
+
+    def test_build_disables_autoinstall_before_ultralytics_import(self) -> None:
+        with mock.patch.dict(os.environ, {"YOLO_AUTOINSTALL": "true"}):
+            with mock.patch.dict(sys.modules, {"ultralytics.utils": None}):
+                _prepare_export_environment()
+            self.assertEqual(os.environ["YOLO_AUTOINSTALL"], "false")
+            with mock.patch.dict(sys.modules, {"ultralytics.utils": SimpleNamespace(AUTOINSTALL=True)}):
+                with self.assertRaisesRegex(RuntimeError, "fresh worker"):
+                    _prepare_export_environment()
+            with mock.patch.dict(sys.modules, {"ultralytics.utils": SimpleNamespace(AUTOINSTALL=False)}):
+                _prepare_export_environment()
+
+    def test_build_rejects_tensor_rt_shadowing_inside_venv(self) -> None:
+        with mock.patch.object(sys, "prefix", "/project/.venv"), mock.patch.object(sys, "base_prefix", "/usr"):
+            _require_vendor_tensorrt("/usr/lib/python3.12/dist-packages/tensorrt/__init__.py")
+            with self.assertRaisesRegex(RuntimeError, "instead of JetPack"):
+                _require_vendor_tensorrt("/project/.venv/lib/python3.12/site-packages/tensorrt/__init__.py")
+
+    def test_export_contract_is_explicit_for_both_precisions(self) -> None:
+        for precision, quantize in (("fp16", 16), ("fp32", 32)):
+            spec = BuildSpec(Path("/project"), "source", "model", precision=precision)
+            args = _export_arguments(spec, Path("/project/data.yaml"))
+            self.assertIs(args["nms"], False)
+            self.assertIs(args["agnostic_nms"], False)
+            self.assertIs(args["dynamic"], False)
+            self.assertEqual(args["max_det"], 300)
+            self.assertEqual(args["quantize"], quantize)
+
+    def test_export_metadata_rejects_head_and_shape_or_precision_mismatch(self) -> None:
+        import copy
+        spec = BuildSpec(Path("/project"), "source", "model")
+        valid = {
+            "task": "pose", "end2end": True, "batch": 1,
+            "imgsz": [640, 640], "kpt_shape": [8, 3],
+            "args": {"nms": False, "dynamic": False, "quantize": 16},
+        }
+        _validate_export_metadata(valid, spec, 8, 3)
+        for key, value in (("task", "detect"), ("end2end", False), ("batch", 2),
+                           ("imgsz", [320, 320]), ("kpt_shape", [17, 3]), ("args", None)):
+            with self.subTest(key=key):
+                bad = copy.deepcopy(valid)
+                bad[key] = value
+                with self.assertRaises(ValueError):
+                    _validate_export_metadata(bad, spec, 8, 3)
+        for key, value in (("nms", None), ("nms", True), ("dynamic", True), ("quantize", 32)):
+            with self.subTest(argument=key, value=value):
+                bad = copy.deepcopy(valid)
+                bad["args"][key] = value
+                with self.assertRaises(ValueError):
+                    _validate_export_metadata(bad, spec, 8, 3)
 
     def test_import_source_is_project_owned_private_and_non_overwriting(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

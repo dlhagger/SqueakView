@@ -8,10 +8,19 @@ SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 APP_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 BUILD_JOBS="${SQUEAKVIEW_BUILD_JOBS:-$(nproc)}"
 
+DEEPSTREAM_SDK="$(readlink -f -- "${SQUEAKVIEW_DEEPSTREAM_SDK:-/opt/nvidia/deepstream/deepstream}")"
+PARSER_SELECTOR="$APP_ROOT/squeakview/common/parser_selection.py"
+DEEPSTREAM_VERSION="$(python3 "$PARSER_SELECTOR" --sdk "$DEEPSTREAM_SDK" --version)"
+DEEPSTREAM_INCLUDES="$(python3 "$PARSER_SELECTOR" --sdk "$DEEPSTREAM_SDK" --includes)"
+PARSER_VARIANT="$(python3 "$PARSER_SELECTOR" --sdk "$DEEPSTREAM_SDK" --native "$APP_ROOT/native" --variant)"
+YOLO_PARSER="$(python3 "$PARSER_SELECTOR" --sdk "$DEEPSTREAM_SDK" --native "$APP_ROOT/native")"
+printf '[INFO] Detected DeepStream %s: %s (parser: %s)\n' "$DEEPSTREAM_VERSION" "$DEEPSTREAM_SDK" "$PARSER_VARIANT"
+printf '[INFO] DeepStream headers: %s\n' "$DEEPSTREAM_INCLUDES"
+
 required_paths=(
   /opt/spinnaker/include
   /opt/spinnaker/lib
-  /opt/nvidia/deepstream/deepstream/sources/includes
+  "$DEEPSTREAM_INCLUDES"
   /usr/local/cuda/bin/nvcc
 )
 for path in "${required_paths[@]}"; do
@@ -30,17 +39,30 @@ fi
 printf 'Building FLIR GStreamer source with %s parallel job(s)...\n' "$BUILD_JOBS"
 cmake \
   -S "$APP_ROOT/native/flir_gst_source" \
-  -B "$APP_ROOT/native/flir_gst_source/build"
+  -B "$APP_ROOT/native/flir_gst_source/build" \
+  -DDEEPSTREAM_SDK="$DEEPSTREAM_SDK" \
+  -DDEEPSTREAM_INCLUDES="$DEEPSTREAM_INCLUDES"
 cmake --build "$APP_ROOT/native/flir_gst_source/build" --parallel "$BUILD_JOBS"
 
-printf 'Building DeepStream YOLO parser against CUDA %s...\n' "$CUDA_VER"
-make \
-  -C "$APP_ROOT/native/nvdsinfer_custom_impl_yolo" \
-  "CUDA_VER=$CUDA_VER" \
-  -j"$BUILD_JOBS"
+# Share the exact SDK-version policy with the model-package builder.
+if [ "$PARSER_VARIANT" = yolo26 ]; then
+  printf 'Building parser-only YOLO26 library for DeepStream 9.2...\n'
+  cmake -S "$APP_ROOT/native/yolo26_pose_parser" -B "$APP_ROOT/native/yolo26_pose_parser/build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTING=ON \
+    -DBASELINE_PARSER= \
+    -DDEEPSTREAM_SDK="$DEEPSTREAM_SDK" \
+    -DDEEPSTREAM_INCLUDES="$DEEPSTREAM_INCLUDES"
+  cmake --build "$APP_ROOT/native/yolo26_pose_parser/build" --parallel "$BUILD_JOBS"
+  ctest --test-dir "$APP_ROOT/native/yolo26_pose_parser/build" --output-on-failure --no-tests=error
+else
+  printf 'Building legacy DeepStream 9.1 YOLO parser against CUDA %s...\n' "$CUDA_VER"
+  make -C "$APP_ROOT/native/nvdsinfer_custom_impl_yolo" \
+    "CUDA_VER=$CUDA_VER" "DEEPSTREAM_SDK=$DEEPSTREAM_SDK" \
+    "DEEPSTREAM_INCLUDES=$DEEPSTREAM_INCLUDES" -j"$BUILD_JOBS"
+fi
 
 FLIR_PLUGIN="$APP_ROOT/native/flir_gst_source/build/gstflirspinsrc.so"
-YOLO_PARSER="$APP_ROOT/native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
 for output in "$FLIR_PLUGIN" "$YOLO_PARSER"; do
   if [ ! -s "$output" ]; then
     printf '[FAIL] Required native build output is missing or empty: %s\n' "$output" >&2
@@ -61,7 +83,7 @@ if ! nm -D "$YOLO_PARSER" 2>/dev/null | grep -E '[[:space:]]NvDsInferParseYolo26
 fi
 
 FLIR_INSPECT="$(
-  GST_PLUGIN_PATH="$APP_ROOT/native/flir_gst_source/build:/opt/nvidia/deepstream/deepstream/lib/gst-plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
+  GST_PLUGIN_PATH="$APP_ROOT/native/flir_gst_source/build:$DEEPSTREAM_SDK/lib/gst-plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
     gst-inspect-1.0 flirspinsrc
 )"
 for property in capture-health-path frame-manifest-path camera-telemetry-path error-log-path camera-runtime-path native-timing-validation; do

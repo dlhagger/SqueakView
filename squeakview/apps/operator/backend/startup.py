@@ -34,7 +34,7 @@ class SerialHandle(Protocol):
         self, *, requested_lease_ms: int, timeout_s: float
     ) -> object: ...
 
-    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None: ...
+    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0, ensure_idle: bool = False) -> None: ...
 
     def exchange_time_sync(
         self, sequence: int, jetson_send_ns: int, *, timeout_s: float
@@ -512,7 +512,7 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
                 # freshly booted v1 controller and a controller that remained
                 # in v2 after an earlier run. TIME_SYNC/SET_RTC are accepted as
                 # framed command results while v2 is idle.
-                serial_handle.negotiate_protocol_v2(timeout_s=3.0)
+                serial_handle.negotiate_protocol_v2(timeout_s=3.0, ensure_idle=True)
                 serial_handle.log_marker("PROTOCOL_V2_NEGOTIATED")
                 hooks.log("[SER] controller protocol v2 active")
             except Exception as exc:

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from squeakview.common import controller_protocol_v2 as protocol_v2
+from squeakview.common import controller_usb
 from squeakview.common.bottle_control import SWAP_ID, parse_bottle_state, parse_lick_recovery
 from squeakview.common.failure_injection import FailurePlan
 from squeakview.common.controller_watchdog import (
@@ -175,10 +176,15 @@ class SerialHandle:
         self._clock_response: tuple[str, int] | None = None
         self._clock_error: str | None = None
         self._bottle_condition = threading.Condition()
+        self._usb_guard_fd = None
         self._bottle_command_lock = threading.Lock()
         self._bottle_generation = 0
         self._bottle_responses: deque[tuple[int, dict[str, object]]] = deque(maxlen=32)
         self._bottle_state: dict[str, object] | None = None
+        self._bottle_pause_boundary: dict[str, object] | None = None
+        self._bottle_live_epoch: tuple[int, int] | None = None
+        self._bottle_live_sequence = 0
+        self._bottle_live_cursors: dict[str, int] = {}
         self._lick_recovery: dict[str, object] | None = None
         self._bottle_counts = {"left": 0, "right": 0}
         self._protocol_mode = "v1"
@@ -436,6 +442,7 @@ class SerialHandle:
             return False
         try:
             self.emit(f"[{timestamp()}] [SER] Opening {self.port} @ {self.baud} …")
+            self._usb_guard_fd = controller_usb.acquire_session_guard()
             self.ser = serial.Serial(
                 self.port,
                 self.baud,
@@ -460,6 +467,11 @@ class SerialHandle:
                 self._bottle_generation = 0
                 self._bottle_responses.clear()
                 self._bottle_state = None
+                self._bottle_pause_boundary = None
+                self._bottle_live_epoch = None
+                self._bottle_live_sequence = 0
+                self._bottle_live_cursors.clear()
+                self._lick_recovery = None
                 self._bottle_counts = {"left": 0, "right": 0}
             self._write_queue = queue.PriorityQueue()
             self._v2_queue = queue.Queue(maxsize=MAX_BUFFERED_V2_RECORDS)
@@ -1248,33 +1260,99 @@ class SerialHandle:
     def send_line(self, text: str) -> None:
         self._send_line(text)
 
+    def _present_bottle_record(self, kind: str) -> bool:
+        """Project durable records by controller sequence, not replay arrival order.
+
+        Separate cursors let a delayed pause boundary reach reconciliation even
+        when a newer recovery event has already arrived. Journal/CSV publication
+        is unaffected; this only controls the live controller projection.
+        """
+        frame = getattr(getattr(self, "_csv_context", None), "frame", None)
+        if frame is None:
+            return True  # Unframed input is already ordered.
+        epoch = (frame.boot_id, frame.session_id)
+        if epoch != self._bottle_live_epoch:
+            if (self._bottle_live_epoch is not None
+                    and epoch[0] == self._bottle_live_epoch[0]
+                    and frame.sequence <= self._bottle_live_sequence):
+                return False
+            self._bottle_live_epoch = epoch
+            self._bottle_live_sequence = 0
+            self._bottle_live_cursors.clear()
+            self._bottle_state = self._lick_recovery = None
+            self._bottle_pause_boundary = None
+            self._bottle_counts = {"left": 0, "right": 0}
+            self._bottle_responses.clear()
+        # A replayed START must not reset a session already observed live.
+        if kind in {"start", "rejection"} and frame.sequence <= self._bottle_live_sequence:
+            return False
+        if frame.sequence <= self._bottle_live_cursors.get(kind, 0):
+            return False
+        self._bottle_live_cursors[kind] = frame.sequence
+        self._bottle_live_sequence = max(self._bottle_live_sequence, frame.sequence)
+        return True
+
+    def _bottle_record_in_live_epoch(self) -> bool:
+        frame = getattr(getattr(self, "_csv_context", None), "frame", None)
+        return frame is None or (frame.boot_id, frame.session_id) == self._bottle_live_epoch
+
     def _ingest_bottle_line(self, line: str) -> None:
         """Observe only records already committed to the reliable journal."""
         with self._bottle_condition:
             if line.startswith(("ACK_START,", "ACK_START_BEHAVIOR,")):
+                if not self._present_bottle_record("start"):
+                    return
                 self._bottle_counts = {"left": 0, "right": 0}
                 self._bottle_state = None
+                self._bottle_pause_boundary = None
                 self._lick_recovery = None
                 self._bottle_responses.clear()
             elif line.startswith("LICK_RECOVERY_"):
                 recovery = parse_lick_recovery(line)
+                current = self._present_bottle_record("recovery")
                 side, count = recovery.pop("side"), recovery.pop("count")
-                self._bottle_counts[side] = max(self._bottle_counts[side], count)
-                self._lick_recovery = recovery
+                if self._bottle_record_in_live_epoch():
+                    self._bottle_counts[side] = max(self._bottle_counts[side], count)
+                if current:
+                    self._lick_recovery = recovery
             elif line.startswith("BOTTLE_STATE,"):
                 state = parse_bottle_state(line)
+                current = self._present_bottle_record("state")
+                same_epoch = self._bottle_record_in_live_epoch()
+                if same_epoch:
+                    for side in ("left", "right"):
+                        self._bottle_counts[side] = max(
+                            self._bottle_counts[side], int(state[f"{side}_count"])
+                        )
+                # Keep a late PAUSED boundary for bottle-history reconciliation,
+                # without letting it replace a newer live state or satisfy a wait.
+                if (same_epoch and state["state"] == "PAUSED" and
+                        (current or (self._bottle_state or {}).get("swap_id") == state["swap_id"])):
+                    self._bottle_pause_boundary = dict(state)
+                if not current:
+                    return
+                if (self._bottle_state or {}).get("swap_id") != state["swap_id"]:
+                    if state["state"] != "PAUSED":
+                        self._bottle_pause_boundary = None
                 self._bottle_generation += 1
                 self._bottle_state = state
-                for side in ("left", "right"):
-                    self._bottle_counts[side] = max(
-                        self._bottle_counts[side], int(state[f"{side}_count"])
-                    )
                 self._bottle_responses.append((self._bottle_generation, state))
+                self._bottle_condition.notify_all()
+            elif line.startswith(("NACK,BOTTLE_STATUS,", "NACK,BOTTLE_PAUSE,", "NACK,BOTTLE_RESUME,")):
+                if not self._present_bottle_record("rejection"):
+                    return
+                _, command, reason = line.split(",", 2)
+                self._bottle_generation += 1
+                self._bottle_responses.append((self._bottle_generation, {
+                    "command": command, "error": reason,
+                }))
                 self._bottle_condition.notify_all()
             elif line.startswith("DRINK_START,"):
                 fields = line.split(",")
                 if len(fields) >= 5 and fields[3] in {"LD", "RD"}:
                     side = "left" if fields[3] == "LD" else "right"
+                    if not self._present_bottle_record(f"counts_{side}"):
+                        return
                     if fields[4].isascii() and fields[4].isdecimal():
                         self._bottle_counts[side] = max(self._bottle_counts[side], int(fields[4]))
 
@@ -1283,6 +1361,7 @@ class SerialHandle:
         with self._bottle_condition:
             return {
                 "controller": dict(self._bottle_state) if self._bottle_state else None,
+                "pause_boundary": dict(self._bottle_pause_boundary) if self._bottle_pause_boundary else None,
                 "counts": dict(self._bottle_counts),
                 "lick_recovery": dict(self._lick_recovery) if self._lick_recovery else None,
             }
@@ -1312,6 +1391,10 @@ class SerialHandle:
                         raise RuntimeError("Bottle operation interrupted by experiment Stop")
                     for generation, response in self._bottle_responses:
                         if generation <= after:
+                            continue
+                        if "error" in response:
+                            if response["command"] == f"BOTTLE_{action.upper()}":
+                                raise RuntimeError(f"Controller rejected bottle {action}: {response['error']}")
                             continue
                         if action != "status" and response["swap_id"] != swap_id:
                             continue
@@ -1362,7 +1445,7 @@ class SerialHandle:
             self._behavior_start_pending = False
             self._behavior_start_lock.release()
 
-    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None:
+    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0, ensure_idle: bool = False) -> None:
         """Establish a fresh, durable idle-controller boundary before a new run."""
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not 0 < timeout_s <= 30:
             raise ValueError("protocol-v2 startup timeout must be greater than zero and at most 30 seconds")
@@ -1392,6 +1475,11 @@ class SerialHandle:
             self._v2_decoder.reset()
             sequence, sent_ns = self._protocol_v2_probe
         try:
+            if ensure_idle and controller_usb.is_controller_port(self.port):
+                # The caller owns acquisition and USB locks. Stop orphaned
+                # state before taking the fresh idle proof for this new run.
+                self.log_marker("CONTROLLER_IDLE_REQUESTED")
+                self._send_line("STOP")
             self._send_line("PROTO,2")
             # Existing firmware echoes both arguments and rejects this command
             # while a session/feed is active. No firmware reset or update needed.
@@ -1402,6 +1490,9 @@ class SerialHandle:
                 raise RuntimeError(self._protocol_v2_error)
             if self._protocol_mode != "v2" or self._v2_boot_id is None:
                 raise RuntimeError("protocol-v2 startup completed without a durable controller identity")
+            if ensure_idle:
+                self.log_marker("CONTROLLER_IDLE_CONFIRMED")
+                self.emit(f"[{timestamp()}] [SER] Controller idle confirmed by fresh handshake")
         finally:
             with self._ingest_lock:
                 if self._protocol_v2_pending or self._protocol_v2_error is not None or self._v2_boot_id is None:
@@ -1603,6 +1694,17 @@ class SerialHandle:
         return self._clock_exchange(
             f"TIME_SYNC,{sequence},{jetson_send_ns}", "TIME_SYNC", timeout_s=timeout_s
         )
+
+    def confirm_idle(self, *, timeout_s: float = 2.0) -> None:
+        """Prove STOP reached idle using a fresh challenge on the owned transport."""
+        from squeakview.common.clock_validation import parse_clock_response
+
+        sequence = uuid.uuid4().int & ((1 << 64) - 1)
+        sent_ns = time.time_ns()
+        response, received_ns = self.exchange_time_sync(sequence, sent_ns, timeout_s=timeout_s)
+        parse_clock_response(response, sequence, sent_ns, received_ns)
+        self.log_marker("CONTROLLER_IDLE_CONFIRMED")
+        self.emit(f"[{timestamp()}] [SER] Controller idle confirmed after STOP")
 
     def exchange_set_rtc(
         self, unix_seconds: int, *, timeout_s: float = 3.0
@@ -1887,6 +1989,9 @@ class SerialHandle:
                 if self.ser is not None and getattr(self.ser, "is_open", False):
                     raise RuntimeError("serial port remains open after shutdown")
                 self.ser = None
+                if self._usb_guard_fd is not None:
+                    os.close(self._usb_guard_fd)
+                    self._usb_guard_fd = None
                 self._closed = True
                 resources_retired = True
                 self._close_stage = "closed"
@@ -1907,6 +2012,7 @@ class SerialHandle:
         with self._close_lock:
             if (
                 self._closed
+                and self._usb_guard_fd is None
                 and self.ser is None
                 and self._csv_file is None
                 and self._v2_journal is None

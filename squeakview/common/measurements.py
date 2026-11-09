@@ -5,6 +5,14 @@ import math
 from collections.abc import Mapping
 
 MAX_WEIGHT_G = 100_000.0
+MAX_BOTTLE_NOTE_BYTES = 1024
+
+
+def bottle_note(value) -> str:
+    note = str(value or "")
+    if len(note.encode("utf-8")) > MAX_BOTTLE_NOTE_BYTES:
+        raise ValueError(f"Bottle notes must be at most {MAX_BOTTLE_NOTE_BYTES} UTF-8 bytes.")
+    return note
 
 
 def weight_value(value, label: str, *, positive: bool = False) -> float | None:
@@ -40,6 +48,8 @@ def validate_bottle_inputs(bottles) -> None:
         values = bottles[side]
         if not isinstance(values, Mapping):
             raise ValueError(f"{side.title()} bottle measurements must be an object.")
+        if "note" in values:
+            bottle_note(values["note"])
         for phase in ("initial", "final"):
             if f"{phase}_weight_g" in values:
                 weight_value(values[f"{phase}_weight_g"], f"{side.title()} {phase} weight")

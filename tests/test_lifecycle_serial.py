@@ -276,6 +276,7 @@ class LifecycleSerialTests(BackendLifecycleCase):
                 "send:STOP",
                 "wait:ACK_STOP",
                 "marker:CAPTURE_STOP_ACKED",
+                "marker:CONTROLLER_IDLE_CONFIRMED",
                 "inference:terminate",
                 "marker:CAPTURE_STOP_DONE",
                 "serial:close",

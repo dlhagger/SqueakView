@@ -92,8 +92,6 @@ For a fresh checkout:
 cd "$HOME/Documents"
 git clone https://github.com/dlhagger/SqueakView.git
 cd SqueakView
-uv venv --python 3.12 --system-site-packages
-uv sync
 bash scripts/setup_jetson.sh
 ```
 
@@ -122,17 +120,48 @@ Run the device setup once as the desktop user who will launch SqueakView:
 bash scripts/setup_jetson.sh
 ```
 
-The script installs NVIDIA's Jetson FFmpeg package (including `ffprobe`) and
-the complete GStreamer runtime/plugin and native build prerequisites, builds
-both the FLIR GStreamer source and the
-DeepStream YOLO parser against the installed CUDA toolkit, and adds that user
-to the `dialout` group for RP2040/USB serial access. It also creates
-`~/Documents/SqueakView Projects` when absent and leaves an existing directory
-untouched. It can be launched from any working directory. Reboot after it
-completes because a group change cannot affect an already-running login session.
-If the whole setup script is invoked through `sudo`, it deliberately drops back
-to the desktop user for native compilation so the checkout does not acquire
-root-owned build files. Do not run the application itself with `sudo`.
+The script updates APT package indexes and installs FFmpeg/ffprobe, VLC,
+GStreamer runtime/development packages, DeepStream prerequisites (including
+`libgstrtspserver-1.0-0`, `libmosquitto1`, and `libmosquitto-dev`), and
+Spinnaker USB/Qt prerequisites from the configured repositories. No Mosquitto
+PPA is added. JetPack, DeepStream, Spinnaker, and `uv` must already be installed.
+
+It creates a Python 3.12 `.venv` with `--system-site-packages`, then runs
+`uv sync --locked`. A compatible existing environment is reused; an incompatible
+one causes a clear error rather than being deleted. Python setup and native
+compilation run as the desktop user, including when setup is launched via sudo.
+It builds the FLIR GStreamer source and DeepStream YOLO parser, adds the user to
+`dialout`, and creates `~/Documents/SqueakView Projects` if absent.
+
+Setup detects the installed DeepStream version and headers before changing the
+system: 9.1 selects the legacy parser and 9.2 selects the parser-only build.
+Both use the same SDK root throughout setup. Missing headers or unsupported
+versions stop setup with an error. This provisions SqueakView against the SDK
+already installed; it does not upgrade or replace JetPack/DeepStream.
+
+On L4T R39.2.x, setup also enables `firmware-path.service`, the
+[community GPU boot workaround](https://forums.developer.nvidia.com/t/384170/7)
+that searches `/usr/lib/firmware` directly before drivers load. It preserves a
+matching existing unit and stops for review if its directives differ. This is
+a community workaround, not an NVIDIA-confirmed driver fix. Reboot to apply it;
+setup does not try to recover a GPU that has already failed during this boot.
+To undo it, run `sudo systemctl disable firmware-path.service`, remove
+`/etc/systemd/system/firmware-path.service`, run `sudo systemctl daemon-reload`,
+and reboot.
+
+Setup disables GNOME automatic suspend on AC and battery for the desktop user
+and masks the system sleep, suspend, hibernate, hybrid-sleep, and
+suspend-then-hibernate targets. It also disables idle screen blanking and
+automatic screen locking for that user so the acquisition display stays visible.
+To restore sleep support, unmask these targets with `sudo systemctl unmask
+sleep.target suspend.target hibernate.target hybrid-sleep.target
+suspend-then-hibernate.target` and choose the desired automatic-suspend policy
+in GNOME Settings → Power. Restore screen blanking and locking separately in
+GNOME Settings → Power and Privacy & Security → Screen Lock.
+
+The script works from any working directory. Reboot after it completes to apply
+the firmware workaround and serial group membership. Do not run the application
+itself with sudo.
 
 After the one-time privileged setup, checkout updates rebuild their native
 components without sudo through `bash scripts/build_native.sh`.
@@ -142,7 +171,7 @@ components without sudo through `bash scripts/build_native.sh`.
 Install these before setting up the repository:
 
 - JetPack 7.2.1 with CUDA/TensorRT
-- NVIDIA DeepStream 9.1 at `/opt/nvidia/deepstream/deepstream`
+- NVIDIA DeepStream 9.1 or 9.2 at `/opt/nvidia/deepstream/deepstream`
 - FLIR/Teledyne Spinnaker SDK at `/opt/spinnaker`
 - [Spinnaker for the JetPack 7.2 series](https://teledyne.app.box.com/s/ccj73r4xu8rusbnu12pytcisbexdchfa)
   is currently distributed as a beta build by Teledyne and is deployed here on
@@ -163,11 +192,13 @@ Expected vendor paths:
 ```text
 /opt/spinnaker/include
 /opt/spinnaker/lib
-/opt/nvidia/deepstream/deepstream/sources/includes
+/opt/nvidia/deepstream/deepstream/includes  # 9.2; sources/includes on 9.1
 /usr/local/cuda-13.2
 ```
 
-Override the DeepStream root when necessary:
+Native builds detect both the DeepStream 9.1 (`sources/includes`) and 9.2
+(`includes`) header layouts. This does not establish full application runtime
+compatibility with 9.2. Override the DeepStream root when necessary:
 
 ```bash
 export SQUEAKVIEW_DEEPSTREAM_SDK=/opt/nvidia/deepstream/deepstream
@@ -175,8 +206,9 @@ export SQUEAKVIEW_DEEPSTREAM_SDK=/opt/nvidia/deepstream/deepstream
 
 ## Python environment
 
-SqueakView targets Python 3.12 on Linux AArch64. Create the project environment
-with access to the JetPack/DeepStream system packages:
+SqueakView targets Python 3.12 on Linux AArch64. `setup_jetson.sh` creates the
+project environment with access to the JetPack/DeepStream system packages.
+For manual Python-only setup:
 
 ```bash
 uv venv --python 3.12 --system-site-packages
@@ -185,7 +217,7 @@ source .venv/bin/activate
 ```
 
 The project uses CUDA 13.2 PyTorch wheels and a CUDA 13 ONNX Runtime index as
-configured in `pyproject.toml`. DeepStream 9.1 supplies PyServiceMaker through
+configured in `pyproject.toml`. DeepStream supplies PyServiceMaker through
 the system Python installation.
 
 The live tensor decoder currently uses PyTorch DLPack to read DeepStream tensor
@@ -216,17 +248,35 @@ standalone camera smoke tests and complete metadata contract.
 
 ### DeepStream YOLO parser
 
-Build against the CUDA version installed on the device:
+Native setup and the model builder select the parser from the installed SDK:
 
-```bash
-make -C native/nvdsinfer_custom_impl_yolo CUDA_VER=13.2 -j
-```
+- **DeepStream 9.2:** `native/yolo26_pose_parser/build/libnvdsinfer_squeakview_pose.so`,
+  the validated parser-only C++17 build with no deprecated TensorRT plugins.
+- **DeepStream 9.1:** `native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so`,
+  the retained legacy implementation.
 
-This produces:
+Run `bash scripts/build_native.sh` after SDK changes. Both scripts read the SDK
+`version` file through the same selector and reject unknown versions. Existing
+model packages retain their bundled parser; changing the build default does not
+rewrite them or require rebuilding an accepted engine. Newly built model
+packages receive the library selected for the installed SDK.
 
-```text
-native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so
-```
+Native builds refresh the header layout for the selected SDK. Legacy builds
+also track SDK identity, ABI headers, CUDA selection, and build flags so a
+changed environment rebuilds the parser instead of reusing stale objects.
+Optional parser comparison builds use a separate `build-comparison` directory;
+normal setup does not depend on a previously selected comparison library.
+
+Run provenance records the selected SDK root and build version. Qualification
+requires the matching installed `deepstream-9.1` or `deepstream-9.2` package
+identity, including the patch version when the recorded build supplies it.
+Having both packages installed does not require both for the selected runtime.
+Archived evidence is validated from its recorded identity without rewriting it.
+
+For explicit legacy builds, run
+`make -C native/nvdsinfer_custom_impl_yolo CUDA_VER=13.2 -j`.
+For parser-only equivalence testing, run `bash scripts/build_pose_parser.sh`.
+See [parser validation and compatibility limits](native/yolo26_pose_parser/README.md).
 
 The library satisfies DeepStream's detector parser ABI for the YOLO26
 end-to-end output. The PyServiceMaker `Yolo26PoseTensorOperator` is the
@@ -982,6 +1032,19 @@ retry the capability check after a transient connection failure. Swapping requir
 compatible reliable-v2 controller firmware. Mouse-weight saves remain available
 without changing swapped bottle metadata.
 
+When controller readiness is unavailable or recovery is unresolved, the host
+rechecks status automatically with at least five seconds between background
+probes. **Check Status** requests an immediate check. These probes never repeat
+pause or resume commands. Replayed controller records remain in the saved
+evidence, but older records cannot reverse the current recovery/swap display;
+late pause boundaries remain available for bottle-history reconciliation.
+Explicit controller rejections are reported with their reason rather than
+appearing only as a confirmation timeout.
+
+Bottle notes are limited to 1,024 UTF-8 bytes per bottle. Initial metadata,
+measurement updates, and replacement notes are validated before a resume
+command can activate a replacement, keeping bottle state available over IPC.
+
 Bottle swaps and behavioral recording also work with **camera triggering off**.
 With serial enabled, SqueakView sends `START_BEHAVIOR` and waits for its reliable-v2
 acknowledgement before publishing the run as recording. The controller runs the
@@ -1124,6 +1187,20 @@ The report contains recent log tails, up to three run-status snapshots, recovery
 and stall evidence, current memory information, and accessible kernel OOM/crash
 messages. Missing files or journal permissions are recorded in the report. Use
 a new output filename for each report.
+
+Capture owns an idle stdin pipe until the inference child exits. Service Maker
+polls stdin for keyboard input; inherited EOF otherwise removes its GLib source
+before shutdown tries to remove it again. Capture remains controlled by signals
+and EOS, not keyboard input. This fixes the stale-source cleanup warning without
+filtering it or changing the vendor SDK.
+
+Two vendor diagnostics remain visible. VPI can print `Failed to open PVA device
+node` on Orin Nano even for an explicitly CUDA-only VPI stream; it was reproduced
+independently of the SqueakView tracker. The TensorRT device-plan warning can
+occur after reboot on the same Nano; [NVIDIA reproduced it and reported an
+internal fix for a future TensorRT release](https://forums.developer.nvidia.com/t/376848/6).
+Keep engine/device identity validation enabled. Neither message is filtered by
+this change, and no TensorRT/VPI package replacement is performed.
 
 Show optional DeepStream plugin warnings that the GUI normally filters:
 

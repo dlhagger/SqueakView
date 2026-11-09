@@ -24,6 +24,36 @@ from squeakview.apps.inference.pose_pipeline import (
 
 
 class OfflineInferenceTests(unittest.TestCase):
+    def test_offline_tracker_follows_selected_sdk(self):
+        from squeakview.apps.inference import offline
+        from squeakview import config as runtime_config
+        from tests.support.service_maker_runner import ServiceMakerCase, FakePipeline
+        fixture = ServiceMakerCase()
+        fixture.setUp()
+        try:
+            for version in ('9.1', '9.2'):
+                app = object.__new__(OfflineInferenceApp)
+                app.pipeline_factory = FakePipeline
+                app.probe_factory = lambda name, operator: (name, operator)
+                app.video_path = fixture.root / 'raw.mp4'
+                app.cfg_path = fixture.infer_config
+                app.width, app.height = 640, 480
+                app.tracker_path = fixture.root / 'tracker.yml'
+                app.audit = mock.Mock()
+                app.out_dir = fixture.root / f'offline-{version}'
+                app.out_dir.mkdir()
+                app.ledger = {}
+                sdk = fixture.root / f'sdk-{version}'
+                with mock.patch.object(runtime_config, 'DEEPSTREAM_SDK_ROOT', sdk):
+                    pipeline = app.build()
+                try:
+                    self.assertEqual(pipeline.nodes['tracker'][1]['ll-lib-file'],
+                                     str(sdk / 'lib/libnvds_nvmultiobjecttracker.so'))
+                finally:
+                    app.observations.close()
+        finally:
+            fixture.tearDown()
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

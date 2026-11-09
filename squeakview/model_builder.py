@@ -9,6 +9,9 @@ only for source discovery and never creates a CUDA context of its own.
 
 import hashlib
 import json
+import math
+import os
+import sys
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -25,6 +28,8 @@ from squeakview.model_build import (
     run_trtexec_validation,
 )
 from squeakview.model_package import validate_model_package
+from squeakview.common.parser_selection import parser_library_for_sdk
+from squeakview import config as runtime_config
 from squeakview.project import AppPaths, Project, ProjectSession, set_default_model
 
 
@@ -216,6 +221,74 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _prepare_export_environment() -> None:
+    # Ultralytics reads this once at import. Package installation belongs to
+    # explicit UV/system provisioning, never to a running engine build.
+    os.environ["YOLO_AUTOINSTALL"] = "false"
+    loaded_utils = sys.modules.get("ultralytics.utils")
+    if loaded_utils is not None and getattr(loaded_utils, "AUTOINSTALL", True):
+        raise RuntimeError(
+            "Ultralytics was imported with automatic package installation enabled. "
+            "Restart the model builder in a fresh worker process."
+        )
+
+
+def _require_vendor_tensorrt(module_path: str) -> None:
+    if sys.prefix != sys.base_prefix and Path(module_path).resolve().is_relative_to(Path(sys.prefix).resolve()):
+        raise RuntimeError(
+            "TensorRT is being imported from the project environment instead of JetPack: "
+            f"{module_path}. Remove the pip-installed TensorRT packages from .venv "
+            "and restart the builder; keep the JetPack system TensorRT installation."
+        )
+
+
+# Fixed model-package contract, per image (not camera count or frame rate).
+_YOLO26_MAX_DETECTIONS = 300
+
+
+def _export_arguments(spec: BuildSpec, data_yaml: Path) -> dict[str, object]:
+    return {
+        "format": "engine",
+        "device": spec.device,
+        "imgsz": spec.image_size,
+        "batch": spec.batch_size,
+        "dynamic": False,
+        "quantize": 16 if spec.precision == "fp16" else 32,
+        "simplify": True,
+        "nms": False,
+        "max_det": _YOLO26_MAX_DETECTIONS,
+        "agnostic_nms": False,
+        # Bound workspace on Jetson's shared CPU/GPU memory.
+        "workspace": spec.tensorrt_workspace_gib,
+        "data": str(data_yaml),
+    }
+
+
+def _validate_export_metadata(
+    metadata: object, spec: BuildSpec, keypoint_count: int, keypoint_dims: int
+) -> None:
+    _require(isinstance(metadata, dict), "engine metadata must be a mapping")
+    _require(metadata.get("task") == "pose", "engine task must be pose")
+    _require(metadata.get("end2end") is True, "engine is not end-to-end")
+    _require(metadata.get("batch") == spec.batch_size, "engine batch size differs from request")
+    _require(
+        metadata.get("imgsz") == [spec.image_size, spec.image_size],
+        "engine image size differs from request",
+    )
+    _require(
+        metadata.get("kpt_shape") == [keypoint_count, keypoint_dims],
+        "engine keypoint shape differs from checkpoint/YAML",
+    )
+    args = metadata.get("args")
+    _require(isinstance(args, dict), "engine export arguments are missing")
+    _require(args.get("nms") is False, "engine must explicitly select the NMS-free head")
+    _require(args.get("dynamic") is False, "engine must use static input dimensions")
+    _require(
+        args.get("quantize") == (16 if spec.precision == "fp16" else 32),
+        "engine export precision differs from request",
+    )
+
+
 def build_model_package(
     spec: BuildSpec,
     *,
@@ -223,14 +296,15 @@ def build_model_package(
 ) -> BuildResult:
     """Build, validate, and atomically publish one project-owned model package."""
 
+    _prepare_export_environment()
     notify = emit or (lambda _stage, _message: None)
     model_name = _one_component(spec.model_name, label="model name")
     _require(spec.precision in {"fp16", "fp32"}, "precision must be fp16 or fp32")
     _require(spec.batch_size > 0, "batch size must be positive")
     _require(spec.image_size > 0, "image size must be positive")
     _require(
-        spec.tensorrt_workspace_gib > 0,
-        "TensorRT workspace limit must be positive",
+        math.isfinite(spec.tensorrt_workspace_gib) and spec.tensorrt_workspace_gib > 0,
+        "TensorRT workspace limit must be finite and positive",
     )
     app = AppPaths.discover()
     staging_package: Path | None = None
@@ -240,9 +314,7 @@ def build_model_package(
         project = session.project
         app.validate_for_project(project.paths)
         source = _source_for(project, spec.source_name)
-        parser_library = (
-            app.native / "nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
-        )
+        parser_library = parser_library_for_sdk(app.native, runtime_config.DEEPSTREAM_SDK_ROOT)
         if not parser_library.is_file():
             raise FileNotFoundError(
                 f"DeepStream parser is not built: {parser_library}. "
@@ -261,9 +333,11 @@ def build_model_package(
             notify("loading", "Loading CUDA, TensorRT, and the selected checkpoint")
             import onnx
             import tensorrt as trt
+            _require_vendor_tensorrt(trt.__file__)
             import torch
             import ultralytics
             from ultralytics import YOLO
+            _prepare_export_environment()  # Verify the import honored the setting.
 
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA is required for TensorRT export")
@@ -332,7 +406,7 @@ def build_model_package(
                 }
                 for class_id, class_name in enumerate(class_names)
             ]
-            expected_output = [spec.batch_size, 300, 6 + keypoint_count * keypoint_dims]
+            expected_output = [spec.batch_size, _YOLO26_MAX_DETECTIONS, 6 + keypoint_count * keypoint_dims]
 
             weights_dir = staging_package / "weights"
             onnx_dir = staging_package / "onnx"
@@ -365,23 +439,8 @@ def build_model_package(
                 "Building the TensorRT engine; this is the longest stage and has no reliable percentage",
             )
             export_model = YOLO(str(packaged_model))
-            ultralytics_engine = Path(
-                export_model.export(
-                    format="engine",
-                    device=spec.device,
-                    imgsz=spec.image_size,
-                    batch=spec.batch_size,
-                    dynamic=False,
-                    quantize=16 if spec.precision == "fp16" else 32,
-                    simplify=True,
-                    nms=False,
-                    # Jetson memory is shared by the CPU and GPU. Leaving this
-                    # unset lets TensorRT consider tactics whose workspace can
-                    # exhaust an 8 GiB Orin Nano during engine construction.
-                    workspace=spec.tensorrt_workspace_gib,
-                    data=str(source.data_yaml),
-                )
-            ).resolve()
+            export_arguments = _export_arguments(spec, source.data_yaml)
+            ultralytics_engine = Path(export_model.export(**export_arguments)).resolve()
             exported_onnx = packaged_model.with_suffix(".onnx")
             _require(ultralytics_engine.is_file(), "Ultralytics did not produce an engine")
             _require(exported_onnx.is_file(), "Ultralytics did not retain the ONNX graph")
@@ -395,11 +454,7 @@ def build_model_package(
                 )
                 engine_metadata = json.loads(engine_file.read(metadata_size))
                 raw_plan = engine_file.read()
-            _require(engine_metadata.get("end2end") is True, "engine is not end-to-end")
-            _require(
-                engine_metadata.get("args", {}).get("nms") is False,
-                "engine unexpectedly contains Ultralytics NMS",
-            )
+            _validate_export_metadata(engine_metadata, spec, keypoint_count, keypoint_dims)
             _require(bool(raw_plan), "the exported TensorRT plan is empty")
             engine_path.write_bytes(raw_plan)
             ultralytics_engine.unlink()
@@ -500,6 +555,7 @@ def build_model_package(
             )
             build_environment = {
                 "tensorrt_version": str(trt.__version__),
+                "tensorrt_module_path": str(Path(trt.__file__).resolve()),
                 "cuda_version": str(torch.version.cuda),
                 "gpu_name": str(torch.cuda.get_device_name(spec.device)),
                 "compute_capability": list(torch.cuda.get_device_capability(spec.device)),
@@ -522,6 +578,7 @@ def build_model_package(
                         "onnx_output_shapes": output_shapes,
                         "output_layer": output_layer,
                         "ultralytics_engine_metadata": engine_metadata,
+                        "requested_export_arguments": export_arguments,
                         "build_environment": build_environment,
                         "checks": {
                             "onnx": True,

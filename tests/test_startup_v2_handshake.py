@@ -173,6 +173,22 @@ class StartupV2HandshakeTests(unittest.TestCase):
                 self.assertEqual(self.handle._v2_boot_id,99)
                 self.assertIn('ACK_EVENTS,99,42',self.commands)
 
+    def test_fresh_run_stops_verified_controller_before_idle_challenge(self):
+        sent = []
+        def send(command):
+            sent.append(command)
+            if command.startswith('TIME_SYNC,'):
+                _, nonce, timestamp = command.split(',')
+                self.handle._ingest_serial_bytes(self.encode(42,
+                    f'CLOCK_SYNC,{nonce},{timestamp},100,110,1000000,RTC_VALID'))
+                self.persist()
+        with mock.patch('squeakview.common.controller_usb.is_controller_port', return_value=True), \
+                mock.patch.object(self.handle, '_send_line', side_effect=send):
+            self.handle.negotiate_protocol_v2(timeout_s=.5, ensure_idle=True)
+        self.assertEqual(sent[:2], ['STOP', 'PROTO,2'])
+        self.assertTrue(sent[2].startswith('TIME_SYNC,'))
+        self.assertTrue(self.handle.protocol_v2_snapshot['startup_handshake']['durable'])
+
     def test_pending_negotiation_cannot_be_bypassed_before_fsync(self):
         self.begin()
         self.handle._ingest_serial_bytes(self.proof())

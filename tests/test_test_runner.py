@@ -40,11 +40,11 @@ class TestRunnerTests(unittest.TestCase):
     def test_success_still_passes(self):
         self.assertTrue(runner.run_python_suite(unittest.TestSuite([unittest.FunctionTestCase(lambda: None)]), stream=io.StringIO()))
 
-    def test_both_native_suites_reject_empty_ctest_discovery(self):
+    def test_all_native_suites_reject_empty_ctest_discovery(self):
         with mock.patch.object(runner.subprocess, 'run') as run:
             runner.native_suites('/temporary-build')
         commands = [call.args[0] for call in run.call_args_list]
         ctests = [command for command in commands if command[0] == 'ctest']
-        self.assertEqual(len(ctests), 2)
+        self.assertEqual(len(ctests), 3)
         self.assertTrue(all('--no-tests=error' in command for command in ctests))
         self.assertTrue(all(call.kwargs['check'] for call in run.call_args_list))

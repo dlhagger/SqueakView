@@ -2,6 +2,7 @@ from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
 from squeakview.apps.operator.backend.bottle_swap import BottleSwapService
 
@@ -29,6 +30,43 @@ class Controller:
 
 
 class BottleSwapTests(unittest.TestCase):
+    def test_oversized_note_is_rejected_before_resume_and_preserves_paused_transaction(self):
+        self.service.begin('left', self.controller)
+        before = self.service.snapshot()
+        controller = mock.Mock(wraps=self.controller)
+        for note in ('x' * 58000, '\U0001f42d' * 257):
+            with self.assertRaisesRegex(ValueError, '1024 UTF-8 bytes'):
+                self.service.resume({'left': dict(self.new, note=note)}, controller)
+            self.assertEqual(self.controller.state, 'PAUSED')
+            self.assertEqual(self.service.snapshot()['current'], before['current'])
+            self.assertFalse(self.service.snapshot()['resume_pending'])
+        self.assertTrue(all(call.args[0] == 'status' for call in controller.call_args_list))
+        accepted = self.service.resume({'left': dict(self.new, note='\x00' * 1024)}, self.controller)
+        self.assertEqual(accepted['state'], 'ACTIVE')
+        self.assertEqual(accepted['current']['left']['note'], '\x00' * 1024)
+
+    def test_invalid_note_edit_does_not_mutate_current_bottle(self):
+        before = self.service.snapshot()['current']
+        with self.assertRaisesRegex(ValueError, '1024 UTF-8 bytes'):
+            self.service.sync_measurements({'left': {'note': 'x' * 1025}})
+        self.assertEqual(self.service.snapshot()['current'], before)
+    def test_recovering_pause_history_does_not_grant_readiness_or_change_live_state(self):
+        self.controller.fail = 'pause'
+        self.service.begin('left', self.controller)
+        self.service.status_unavailable('status timeout')
+        identity = self.service.snapshot()['swap_id']
+        pause = dict(supported=True, state='PAUSED', swap_id=identity,
+                     monotonic_us=300, left_count=12, right_count=23)
+        self.assertFalse(self.service.reconcile_pause_boundary(dict(pause, swap_id='b'*32)))
+        self.assertTrue(self.service.reconcile_pause_boundary(pause))
+        self.assertFalse(self.service.reconcile_pause_boundary(pause))
+        snapshot = self.service.snapshot()
+        self.assertFalse(snapshot['available'])
+        self.assertEqual(snapshot['state'], 'UNCONFIRMED')
+        self.assertEqual(snapshot['error'], 'status timeout')
+        self.assertEqual(len(snapshot['gaps']), 1)
+        self.assertFalse(snapshot['history'])
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

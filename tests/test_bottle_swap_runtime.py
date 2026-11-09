@@ -44,6 +44,59 @@ class FakeSerial:
 
 
 class BottleSwapRuntimeTests(unittest.TestCase):
+    def test_transient_status_timeout_recovers_with_bounded_read_only_probes(self):
+        backend = self.backend
+        real = self.serial.exchange_bottle_control
+        with mock.patch('squeakview.apps.operator.backend.manager.time.monotonic', return_value=100.0):
+            backend.bottle_swap_snapshot()
+            backend.begin_bottle_swap(['left'])
+            with mock.patch.object(self.serial, 'exchange_bottle_control', side_effect=TimeoutError('status timeout')):
+                with self.assertRaisesRegex(ValueError, 'status is unavailable'):
+                    backend.resume_bottle_swap({'left': {'fluid': 'water', 'initial_weight_g': 90}})
+            with mock.patch.object(self.serial, 'exchange_bottle_control', wraps=real) as exchange:
+                for _ in range(3):
+                    self.assertFalse(backend.bottle_swap_snapshot()['available'])
+                exchange.assert_not_called()
+        with mock.patch('squeakview.apps.operator.backend.manager.time.monotonic', return_value=105.0):
+            with mock.patch.object(self.serial, 'exchange_bottle_control', wraps=real) as exchange:
+                snapshot = backend.bottle_swap_snapshot()
+            self.assertTrue(snapshot['available'])
+            self.assertEqual(snapshot['state'], 'PAUSED')
+            self.assertFalse(snapshot['history'])
+            self.assertEqual([call.args[0] for call in exchange.call_args_list], ['status'])
+
+    def test_failed_status_probe_revokes_readiness_and_explicit_probe_bypasses_backoff(self):
+        backend = self.backend
+        backend.bottle_swap_snapshot()
+        with mock.patch.object(self.serial, 'exchange_bottle_control', side_effect=TimeoutError('offline')):
+            snapshot = backend.bottle_swap_snapshot(force_probe=True)
+        self.assertFalse(snapshot['available'])
+        self.assertIn('offline', snapshot['error'])
+        self.assertTrue(backend.bottle_swap_snapshot(force_probe=True)['available'])
+
+    def test_late_pause_boundary_is_reconciled_without_reversing_latest_state(self):
+        backend = self.backend
+        real = self.serial.exchange_bottle_control
+        def lost_pause(action, identity, **kwargs):
+            response = real(action, identity, **kwargs)
+            if action == 'pause':
+                raise TimeoutError('lost pause acknowledgement')
+            return response
+        with mock.patch.object(self.serial, 'exchange_bottle_control', side_effect=lost_pause):
+            backend.begin_bottle_swap(['left'])
+        pause = deepcopy(self.serial.controller)
+        # A newer status is the live view, while the original pause boundary
+        # arrives through replay. Both must be retained for reconciliation.
+        latest = dict(pause, state='CALIBRATING', monotonic_us=500)
+        observed = dict(controller=latest, pause_boundary=pause, counts=self.serial.counts)
+        with mock.patch.object(type(self.serial), 'bottle_control_snapshot', new_callable=mock.PropertyMock, return_value=observed):
+            backend._observe_bottle_runtime()
+            backend._observe_bottle_runtime()
+        snapshot = backend._bottle_swap.snapshot()
+        self.assertEqual(snapshot['state'], 'CALIBRATING')
+        self.assertEqual(len(snapshot['gaps']), 1)
+        self.assertEqual(snapshot['gaps'][0]['paused_monotonic_us'], pause['monotonic_us'])
+
     def test_recovering_sensors_cannot_create_a_swap_transaction(self):
         self.backend._bottle_swap.observe_lick_recovery({"state": "RECOVERING", "available": False})
         self.backend._observe_bottle_runtime()

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from squeakview import config as runtime_config
 
 from pyservicemaker import BatchMetadataOperator, EOSMessage, Pipeline, Probe
 
@@ -506,7 +507,7 @@ class OfflineInferenceApp:
             "nvtracker", "tracker",
             {
                 "tracker-width": 640, "tracker-height": 480,
-                "ll-lib-file": "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+                "ll-lib-file": str(runtime_config.DEEPSTREAM_SDK_ROOT / "lib/libnvds_nvmultiobjecttracker.so"),
                 "ll-config-file": str(self.tracker_path),
                 "operate-on-class-ids": ";".join(
                     str(item.class_id) for item in schema.classes if item.track

@@ -31,6 +31,28 @@ from squeakview.common.failure_injection import FailurePlan
 from tests.support.service_maker_runner import ServiceMakerCase, FakePipeline
 
 class CaptureGraphTests(ServiceMakerCase):
+    def test_live_tracker_and_metadata_loader_follow_selected_sdk(self):
+        from squeakview import config as runtime_config
+        for version in ('9.1', '9.2'):
+            sdk = self.root / f'sdk-{version}'
+            with (
+                mock.patch.object(runtime_config, 'DEEPSTREAM_SDK_ROOT', sdk),
+                mock.patch.object(frame_audit, '_flir_frame_meta_type', return_value=1),
+            ):
+                app, pipeline = self.build(self.config(run_dir=self.root / f'run-{version}'))
+                try:
+                    self.assertEqual(pipeline.nodes['tracker'][1]['ll-lib-file'],
+                                     str(sdk / 'lib/libnvds_nvmultiobjecttracker.so'))
+                finally:
+                    app.stop()
+            with (
+                mock.patch.object(runtime_config, 'DEEPSTREAM_SDK_ROOT', sdk),
+                mock.patch.object(frame_audit.ctypes, 'CDLL', side_effect=OSError('missing')) as load,
+            ):
+                with self.assertRaisesRegex(RuntimeError, 'metadata library is unavailable'):
+                    frame_audit._user_meta_type(b'test')
+                load.assert_called_once_with(str(sdk / 'lib/libnvds_meta.so'))
+
     def test_runner_preserves_frame_audit_compatibility_exports(self) -> None:
         self.assertIs(runner.FrameCsvOperator, frame_audit.FrameCsvOperator)
         self.assertIs(

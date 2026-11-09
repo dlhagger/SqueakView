@@ -1,0 +1,12 @@
+[Unit]
+Description=Set direct firmware search path
+DefaultDependencies=no
+Before=systemd-udev-trigger.service systemd-modules-load.service nv-load-display-modules.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'printf /usr/lib/firmware > /sys/module/firmware_class/parameters/path'
+
+[Install]
+WantedBy=sysinit.target

@@ -25,6 +25,15 @@ from squeakview.common.run_context import normalize_bottle_measurements
 
 
 class BottlePayloadTests(unittest.TestCase):
+    def test_note_limits_apply_to_initial_inputs_and_measurement_updates(self):
+        from squeakview.common.measurements import validate_bottle_inputs
+        payload = {'left': {'note': '\U0001f42d' * 257}}
+        for validate in (normalize_bottle_measurements, validate_bottle_inputs):
+            with self.assertRaisesRegex(ValueError, '1024 UTF-8 bytes'):
+                validate(payload)
+        payload['left']['note'] = '\U0001f42d' * 256
+        self.assertEqual(normalize_bottle_measurements(payload)['left']['note'], payload['left']['note'])
+
     def test_close_save_discard_cancel_and_failed_save(self):
         buttons = QtWidgets.QMessageBox.StandardButton
         for answer, save_result, expected in ((buttons.Save, True, True), (buttons.Save, False, False),

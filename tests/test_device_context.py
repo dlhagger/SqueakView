@@ -9,6 +9,19 @@ from squeakview.common import device_context
 
 
 class DeviceContextTests(unittest.TestCase):
+    def test_snapshot_uses_selected_sdk_and_inventories_both_supported_packages(self):
+        with (
+            mock.patch.object(device_context.runtime_config, 'DEEPSTREAM_SDK_ROOT', Path('/selected/sdk')),
+            mock.patch.object(device_context, '_read_text', return_value='value') as read,
+            mock.patch.object(device_context, '_command_output', return_value='') as command,
+        ):
+            snapshot = device_context.device_context_snapshot()
+        self.assertIn(mock.call(Path('/selected/sdk/version')), read.call_args_list)
+        self.assertEqual(snapshot['deepstream_sdk_root'], '/selected/sdk')
+        packages = command.call_args_list[0].args[0]
+        self.assertIn('deepstream-9.1', packages)
+        self.assertIn('deepstream-9.2', packages)
+
     def test_snapshot_records_exact_package_versions_and_runtime(self) -> None:
         with (
             mock.patch.object(device_context, "_read_text", side_effect=["Orin", "R39.2.1", "9.1"]),

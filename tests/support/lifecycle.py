@@ -136,7 +136,10 @@ class FakeSerialHandle:
         del timeout_s
         return True
 
-    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0) -> None:
+    def confirm_idle(self, *, timeout_s: float = 2.0) -> None:
+        self.log_marker("CONTROLLER_IDLE_CONFIRMED")
+
+    def negotiate_protocol_v2(self, *, timeout_s: float = 3.0, ensure_idle: bool = False) -> None:
         self.sent.append(f"PROTO_V2_TEST,{timeout_s}")
 
     def negotiate_watchdog_v1(

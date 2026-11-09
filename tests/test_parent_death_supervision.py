@@ -63,6 +63,32 @@ class ParentDeathSupervisionTests(unittest.TestCase):
 
         self.assertIs(result, mock.sentinel.handle)
         self.assertEqual(spawn.call_args.kwargs["parent_death_signal"], signal.SIGINT)
+        self.assertTrue(spawn.call_args.kwargs["keep_stdin_open"])
+
+    def test_capture_stdin_remains_open_until_child_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            (workspace / "stdin_probe.py").write_text(
+                "import select, sys\n"
+                "assert not select.select([sys.stdin], [], [], 0.1)[0], 'unexpected EOF'\n"
+                "print('stdin alive', flush=True)\n"
+            )
+            lines = []
+            handle = supervision.spawn(
+                "stdin_probe", [], lines.append, "probe", workspace=workspace,
+                keep_stdin_open=True,
+            )
+            try:
+                self.assertEqual(handle.p.wait(timeout=5), 0)
+                handle._thread.join(timeout=5)
+                self.assertFalse(handle._thread.is_alive())
+                self.assertTrue(handle.p.stdin.closed)
+                self.assertTrue(any('stdin alive' in line for line in lines))
+            finally:
+                if handle.p.poll() is None:
+                    handle.p.kill()
+                    handle.p.wait(timeout=5)
+
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from pathlib import Path
 from pyservicemaker import BatchMetadataOperator
 
 from squeakview.common import run_context
+from squeakview import config as runtime_config
 
 
 FLIR_FRAME_META_DESCRIPTOR = b"SQUEAKVIEW.FLIR.FRAME_META.v1"
@@ -24,8 +25,7 @@ def _user_meta_type(descriptor: bytes) -> int:
     """Resolve a process-local NvDs user-meta type without depending on pyds."""
 
     candidates = (
-        "/opt/nvidia/deepstream/deepstream/lib/libnvds_meta.so",
-        "libnvds_meta.so",
+        str(runtime_config.DEEPSTREAM_SDK_ROOT / "lib/libnvds_meta.so"),
     )
     last_error: OSError | None = None
     for candidate in candidates:

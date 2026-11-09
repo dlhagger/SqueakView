@@ -38,11 +38,17 @@ ifeq ($(GRAPH),)
 GRAPH=0
 endif
 
+DEEPSTREAM_SDK?=$(if $(SQUEAKVIEW_DEEPSTREAM_SDK),$(SQUEAKVIEW_DEEPSTREAM_SDK),/opt/nvidia/deepstream/deepstream)
+DEEPSTREAM_INCLUDES?=$(patsubst %/nvdsinfer_custom_impl.h,%,$(firstword $(wildcard $(DEEPSTREAM_SDK)/includes/nvdsinfer_custom_impl.h $(DEEPSTREAM_SDK)/sources/includes/nvdsinfer_custom_impl.h)))
+ifeq ($(DEEPSTREAM_INCLUDES),)
+$(error "DeepStream headers missing under $(DEEPSTREAM_SDK)")
+endif
+
 CC:= g++
 NVCC:=/usr/local/cuda-$(CUDA_VER)/bin/nvcc
 
 CFLAGS:= -Wall -std=c++11 -shared -fPIC -Wno-error=deprecated-declarations
-CFLAGS+= -I/opt/nvidia/deepstream/deepstream/sources/includes -I/usr/local/cuda-$(CUDA_VER)/include
+CFLAGS+= -I$(DEEPSTREAM_INCLUDES) -I/usr/local/cuda-$(CUDA_VER)/include
 
 ifeq ($(OPENCV), 1)
 COMMON+= -DOPENCV
@@ -54,7 +60,7 @@ ifeq ($(GRAPH), 1)
 COMMON+= -DGRAPH
 endif
 
-CUFLAGS:= -I/opt/nvidia/deepstream/deepstream/sources/includes -I/usr/local/cuda-$(CUDA_VER)/include
+CUFLAGS:= -I$(DEEPSTREAM_INCLUDES) -I/usr/local/cuda-$(CUDA_VER)/include
 
 ifeq ($(shell ldconfig -p | grep -q libnvparsers && echo 1 || echo 0), 1)
 LIBS+= -lnvparsers
@@ -82,15 +88,29 @@ TARGET_OBJS:= $(TARGET_OBJS:.cu=.o)
 
 all: $(TARGET_LIB)
 
-%.o: %.cpp $(INCS) Makefile
+# Make does not track command-line flag changes. Refresh this stamp only when
+# SDK identity, headers, CUDA selection, or compilation/link flags change.
+BUILD_CONFIG:= .build-config
+.PHONY: all clean FORCE
+FORCE:
+$(BUILD_CONFIG): FORCE
+	@set -e; { printf '%s\n' "$(CC)" "$(NVCC)" "$(CFLAGS)" "$(CUFLAGS)" "$(COMMON)" "$(LFLAGS)"; \
+	  readlink -f "$(DEEPSTREAM_SDK)"; \
+	  cat "$(DEEPSTREAM_SDK)/version"; \
+	  sha256sum "$(DEEPSTREAM_INCLUDES)/nvdsinfer_custom_impl.h" "$(DEEPSTREAM_INCLUDES)/nvdsinfer.h"; \
+	} > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
+
+%.o: %.cpp $(INCS) Makefile $(BUILD_CONFIG)
 	$(CC) -c $(COMMON) -o $@ $(CFLAGS) $<
 
-%.o: %.cu $(INCS) Makefile
+%.o: %.cu $(INCS) Makefile $(BUILD_CONFIG)
 	$(NVCC) -c -o $@ --compiler-options '-fPIC' $(CUFLAGS) $<
 
-$(TARGET_LIB) : $(TARGET_OBJS)
+$(TARGET_LIB) : $(TARGET_OBJS) $(BUILD_CONFIG)
 	$(CC) -o $@  $(TARGET_OBJS) $(LFLAGS)
 
 clean:
 	rm -rf $(TARGET_LIB)
 	rm -rf $(TARGET_OBJS)
+	rm -f $(BUILD_CONFIG) $(BUILD_CONFIG).tmp

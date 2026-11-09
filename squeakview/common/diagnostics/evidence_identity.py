@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from squeakview.common import run_context
+from squeakview.common.deepstream_identity import deepstream_package_errors
 from squeakview.common.recording_evidence import (
     capture_recording_evidence,
     recording_evidence_same_content,
@@ -30,7 +31,7 @@ _PLATFORM_FIELDS = (
     "jetson_linux_release", "deepstream_build",
 )
 _REQUIRED_PACKAGES = (
-    "nvidia-l4t-core", "deepstream-9.1", "cuda-toolkit-13-2",
+    "nvidia-l4t-core", "cuda-toolkit-13-2",
     "libcudnn9-cuda-13", "libnvinfer10", "libgstreamer1.0-0", "libspinnaker",
 )
 _NATIVE_PLUGINS = ("flir_gstreamer_source", "deepstream_yolo_parser")
@@ -280,6 +281,7 @@ def runtime_identity_errors(identity: Mapping[str, Any] | None) -> list[str]:
         ]
         if missing:
             errors.append("runtime_identity.packages missing: " + ", ".join(missing))
+        errors.extend(deepstream_package_errors(platform))
     for name in _NATIVE_PLUGINS:
         value = native.get(name) if isinstance(native, Mapping) else None
         digest = value.get("sha256") if isinstance(value, Mapping) else None

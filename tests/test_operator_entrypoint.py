@@ -213,7 +213,6 @@ class JetsonSetupScriptTest(unittest.TestCase):
         self.assertIn("gstreamer1.0-plugins-ugly", script)
         self.assertIn('bash "$ROOT/scripts/build_native.sh"', script)
         self.assertIn('runuser -u "$TARGET_USER"', script)
-        self.assertIn("keep native build outputs owned", script)
         self.assertIn('TARGET_USER_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"', script)
         self.assertIn('SQUEAKVIEW_PROJECTS_DIR:-$TARGET_USER_HOME/Documents/SqueakView Projects', script)
         self.assertIn("Project parent is a dangling symbolic link", script)
@@ -227,7 +226,8 @@ class JetsonSetupScriptTest(unittest.TestCase):
         script = (root / "scripts" / "build_native.sh").read_text()
 
         self.assertIn("gstflirspinsrc.so", script)
-        self.assertIn("libnvdsinfer_custom_impl_Yolo.so", script)
+        self.assertIn('python3 "$PARSER_SELECTOR" --sdk "$DEEPSTREAM_SDK" --native "$APP_ROOT/native"', script)
+        self.assertIn('for output in "$FLIR_PLUGIN" "$YOLO_PARSER"', script)
         self.assertIn("ldd \"$output\"", script)
         self.assertIn("NvDsInferParseYolo26Pose", script)
         self.assertIn("capture-health-path", script)

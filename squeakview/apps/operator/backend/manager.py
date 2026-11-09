@@ -43,6 +43,7 @@ from squeakview.common.diagnostics.qualification_matrix import (
 )
 from squeakview.common.failure_injection import FailurePlan, load_failure_plan
 from squeakview.common import serial as serial_util
+from squeakview.common import controller_usb
 from squeakview.project import PROJECT_ENV, RuntimeContext
 
 
@@ -127,6 +128,7 @@ class OperatorBackend:
         self._failure_plan: FailurePlan | None = None
         self._bottle_swap: BottleSwapService | None = None
         self._bottle_support_checked = False
+        self._bottle_next_probe_at = 0.0
         self._bottle_last_controller: dict[str, object] | None = None
         self._bottle_last_snapshot: dict[str, Any] = {}
         self._bottle_operation_active = threading.Event()
@@ -601,9 +603,10 @@ class OperatorBackend:
         for side, count in observed.get("counts", {}).items():
             service.observe_lick(side, count)
         service.observe_lick_recovery(observed.get("lick_recovery"))
+        recovered_boundary = service.reconcile_pause_boundary(observed.get("pause_boundary"))
         controller = observed.get("controller")
-        if controller and controller != self._bottle_last_controller:
-            service.observe_controller(controller)
+        if controller and (recovered_boundary or controller != self._bottle_last_controller):
+            service.observe_controller(controller, confirm_support=controller != self._bottle_last_controller)
             self._bottle_last_controller = controller
 
     def _exchange_bottle_control(self, action: str, swap_id: str) -> dict[str, object]:
@@ -636,15 +639,24 @@ class OperatorBackend:
             return {**self._bottle_last_snapshot, "available": False}
         try:
             previous_count = service.snapshot()["history_count"]
-            unresolved = service.snapshot()["state"] in {"UNCONFIRMED", "CALIBRATING"}
-            if (force_probe or unresolved or not self._bottle_support_checked) and self._state_machine.phase == RunPhase.RECORDING:
+            current = service.snapshot()
+            recovery = current.get("lick_recovery") or {}
+            needs_probe = (current["state"] in {"UNCONFIRMED", "CALIBRATING"}
+                           or not current["available"]
+                           or (recovery and not recovery.get("available")))
+            retry_due = needs_probe and time.monotonic() >= self._bottle_next_probe_at
+            if (force_probe or retry_due or not self._bottle_support_checked) and self._state_machine.phase == RunPhase.RECORDING:
                 self._bottle_support_checked = True
                 try:
                     response = self._exchange_bottle_control("status", "")
                     service.observe_controller(response)
                     self._bottle_last_controller = response
                 except Exception as exc:
+                    service.status_unavailable(str(exc))
                     self._log(f"[BOTTLES] live swapping unavailable: {exc}")
+                finally:
+                    # Poll readiness only: never replay PAUSE/RESUME automatically.
+                    self._bottle_next_probe_at = time.monotonic() + 5.0
             self._observe_bottle_runtime()
             if service.snapshot()["history_count"] != previous_count:
                 self._persist_bottle_swap_summary()
@@ -951,6 +963,7 @@ class OperatorBackend:
         def establish_run(prepared: startup.PreparedRun) -> None:
             self._bottle_swap = None
             self._bottle_support_checked = False
+            self._bottle_next_probe_at = 0.0
             self._bottle_last_controller = None
             self._bottle_last_snapshot = {}
             self.launch_cfg = prepared.config
@@ -1243,6 +1256,22 @@ class OperatorBackend:
             self._log(f"[BACKEND] {self._last_error}")
             return False
         if not self.state.any_running():
+            if cfg.serial_enabled:
+                # Preflight needs the re-enumerated port. Hold a separate lock
+                # object so reconnecting cannot release an existing run's lock.
+                guard = AcquisitionLock(self.runtime_context.user.acquisition_lock)
+                if not guard.acquire():
+                    self._last_error = "another acquisition owns the controller; USB recovery was not attempted"
+                    self._log(f"[USB] {self._last_error}")
+                    return False
+                try:
+                    cfg = replace(cfg, serial_port=controller_usb.prepare_port(cfg.serial_port, self._log))
+                except Exception as exc:
+                    self._last_error = f"controller USB preparation failed: {exc}"
+                    self._log(f"[USB] {self._last_error}")
+                    return False
+                finally:
+                    guard.release()
             result = preflight.run_preflight(
                 preflight.PreflightRequest(
                     capture_backend=cfg.capture_backend,

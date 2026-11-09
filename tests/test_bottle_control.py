@@ -58,6 +58,83 @@ class BottleControlTests(unittest.TestCase):
         self.addCleanup(handle.close)
         return handle
 
+    def journaled_handle(self):
+        handle = self.handle()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        handle._v2_journal = v2.DurableJournal(Path(directory.name) / "journal.jsonl")
+        self.addCleanup(handle._v2_journal.close)
+        return handle
+
+    def persist(self, handle, sequence, text, *, session=1, replay=False):
+        frame = v2.decode_frame(v2.encode_frame(
+            message_type=2 if text.startswith(("BOTTLE_STATE", "NACK")) else 1,
+            flags=3 if replay else 1, boot_id=42, session_id=session,
+            sequence=sequence, monotonic_us=sequence * 100, payload=text.encode(),
+        )[:-1])
+        with mock.patch.object(handle, "_queue_line"):
+            handle._persist_v2_frame(frame, 1000, 2000)
+
+    def test_replayed_recovery_cannot_reverse_ready_but_remains_journaled(self):
+        handle = self.journaled_handle()
+        self.persist(handle, 2, "LICK_RECOVERY_READY,1,800000,LD,21,799000,1,1,task,READY")
+        self.persist(handle, 1, "LICK_RECOVERY_START,1,1000,LD,21,0,0,1,task,SESSION_START", replay=True)
+        self.assertEqual(handle.bottle_control_snapshot["lick_recovery"]["state"], "READY")
+        self.assertEqual(handle._v2_counts["frames_stored"], 2)
+
+    def test_reordered_channel_records_preserve_both_counts(self):
+        handle = self.journaled_handle()
+        self.persist(handle, 4, "LICK_RECOVERY_READY,1,800000,RD,16,799000,1,1,task,READY")
+        self.persist(handle, 3, "LICK_RECOVERY_READY,1,800000,LD,21,799000,1,1,task,READY", replay=True)
+        self.persist(handle, 6, "DRINK_START,1,900000,RD,17,nan,nan,nan,task,nan")
+        self.persist(handle, 5, "DRINK_START,1,850000,LD,22,nan,nan,nan,task,nan", replay=True)
+        self.assertEqual(handle.bottle_control_snapshot["counts"], {"left": 22, "right": 17})
+        self.assertEqual(handle.bottle_control_snapshot["lick_recovery"]["state"], "READY")
+
+    def test_old_bottle_replay_cannot_acknowledge_command_or_replace_active(self):
+        handle = self.journaled_handle()
+        self.persist(handle, 4, line("ACTIVE", stamp=400))
+        self.persist(handle, 3, line("CALIBRATING", stamp=300), replay=True)
+        def send(_command):
+            self.persist(handle, 2, line("PAUSED", stamp=200), replay=True)
+        with mock.patch.object(handle, "send_line", side_effect=send):
+            with self.assertRaises(TimeoutError):
+                handle.exchange_bottle_control("pause", IDENTITY, timeout_s=0.01)
+        snapshot = handle.bottle_control_snapshot
+        self.assertEqual(snapshot["controller"]["state"], "ACTIVE")
+        self.assertEqual(snapshot["pause_boundary"]["monotonic_us"], 200)
+
+    def test_late_start_and_previous_session_replay_do_not_reset_current_state(self):
+        handle = self.journaled_handle()
+        self.persist(handle, 12, "LICK_RECOVERY_READY,1,800000,LD,21,799000,1,1,task,READY", session=2)
+        self.persist(handle, 10, "ACK_START,1,2,nan,30,nan,nan,nan,task,nan", session=2, replay=True)
+        self.persist(handle, 9, "LICK_RECOVERY_START,1,1000,LD,99,0,0,1,task,SESSION_START", session=1, replay=True)
+        snapshot = handle.bottle_control_snapshot
+        self.assertEqual(snapshot["lick_recovery"]["state"], "READY")
+        self.assertEqual(snapshot["counts"]["left"], 21)
+        self.persist(handle, 20, "ACK_START,1,2,nan,30,nan,nan,nan,task,nan", session=3)
+        self.assertIsNone(handle.bottle_control_snapshot["lick_recovery"])
+        self.assertEqual(handle.bottle_control_snapshot["counts"], {"left": 0, "right": 0})
+
+    def test_matching_rejection_is_reported_without_waiting_for_timeout(self):
+        handle = self.handle()
+        def send(_command):
+            handle._ingest_bottle_line("NACK,BOTTLE_RESUME,SWAP_ID_OR_STATE_CONFLICT")
+            handle._ingest_bottle_line("NACK,BOTTLE_PAUSE,SENSOR_RECOVERY_ACTIVE")
+        with mock.patch.object(handle, "send_line", side_effect=send):
+            with self.assertRaisesRegex(RuntimeError, "SENSOR_RECOVERY_ACTIVE"):
+                handle.exchange_bottle_control("pause", IDENTITY, timeout_s=0.1)
+
+    def test_old_replayed_rejection_cannot_reject_a_new_command(self):
+        handle = self.journaled_handle()
+        self.persist(handle, 4, line("ACTIVE", stamp=400))
+        def send(_command):
+            self.persist(handle, 2, "NACK,BOTTLE_PAUSE,SENSOR_RECOVERY_ACTIVE", replay=True)
+            self.persist(handle, 5, line("PAUSED", stamp=500))
+        with mock.patch.object(handle, "send_line", side_effect=send):
+            response = handle.exchange_bottle_control("pause", IDENTITY, timeout_s=0.1)
+        self.assertEqual(response["monotonic_us"], 500)
+
     def test_state_decoder_rejects_invalid_versions_ids_and_numbers(self):
         state = parse_bottle_state(line())
         self.assertEqual(state["left_count"], 7)

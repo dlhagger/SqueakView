@@ -9,12 +9,14 @@ import stat as stat_module
 import subprocess
 import sys
 from pathlib import Path
+from squeakview import config as runtime_config
 
 
 _PACKAGES = (
     "nvidia-jetpack",
     "nvidia-l4t-core",
     "deepstream-9.1",
+    "deepstream-9.2",
     "cuda-toolkit-13-2",
     "libcudnn9-cuda-13",
     "libnvinfer10",
@@ -117,8 +119,9 @@ def device_context_snapshot() -> dict[str, object]:
         "python_executable": sys.executable,
         "jetson_linux_release": _read_text(Path("/etc/nv_tegra_release")),
         "deepstream_build": _read_text(
-            Path("/opt/nvidia/deepstream/deepstream/version")
+            runtime_config.DEEPSTREAM_SDK_ROOT / "version"
         ),
+        "deepstream_sdk_root": str(runtime_config.DEEPSTREAM_SDK_ROOT),
         "nvpmodel": _command_output(["nvpmodel", "-q"]),
         "packages": packages,
     }

@@ -125,6 +125,13 @@ class ProcessHandle:
             self._safe_emit(f"{self.name} output error: {exc}")
         finally:
             returncode = self.p.wait()
+            # Keep the writer alive until the child has exited: closing it
+            # sooner reintroduces the Service Maker stdin-EOF cleanup race.
+            if self.p.stdin is not None:
+                try:
+                    self.p.stdin.close()
+                except Exception:
+                    pass
             if log_handle is not None:
                 try:
                     log_handle.close()
@@ -202,6 +209,7 @@ def spawn(
     output_log_path: Path | None = None,
     output_log_max_bytes: int = DEFAULT_OUTPUT_LOG_MAX_BYTES,
     parent_death_signal: signal.Signals | None = None,
+    keep_stdin_open: bool = False,
 ) -> ProcessHandle:
     cmd = [sys.executable, "-m", module, *args]
     if parent_death_signal is not None:
@@ -230,6 +238,10 @@ def spawn(
     child = subprocess.Popen(
         cmd,
         cwd=str(workspace),
+        # Service Maker's keyboard watcher self-removes on EOF, then its
+        # shutdown removes that source again. Own an idle pipe for capture;
+        # signal-driven shutdown remains the only control path.
+        stdin=subprocess.PIPE if keep_stdin_open else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

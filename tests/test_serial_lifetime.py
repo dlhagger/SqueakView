@@ -1,6 +1,7 @@
 """Scientific writers outlive every serial producer, including delayed shutdown."""
 import csv
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +65,8 @@ class SerialLifetimeTests(unittest.TestCase):
         return release
 
     def test_late_reader_record_is_persisted_before_journal_and_csv_close(self):
+        descriptor = os.open(self.root / 'usb.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        self.handle._usb_guard_fd = descriptor
         self.start_persistence()
         release = self.blocked_reader(lambda: self.handle._v2_queue.put((self.frame(), 1, 2)))
         journal = self.handle._v2_journal
@@ -74,11 +77,15 @@ class SerialLifetimeTests(unittest.TestCase):
         self.assertFalse(journal._file.closed)
         self.assertFalse(self.handle._v2_worker_stop.is_set())
         self.assertFalse(self.handle._closed)
+        os.fstat(descriptor)  # USB recovery stays excluded while the reader lives.
         self.assertFalse(self.handle.open(self.root))
         self.assertIn("still pending", self.handle.last_error)
         release.set()
         self.assertTrue(self.handle._close_done.wait(2))
         self.assertTrue(self.handle._closed)
+        self.assertIsNone(self.handle._usb_guard_fd)
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
         self.assertTrue(csv_file.closed)
         self.assertTrue(journal._file.closed)
         saved = [json.loads(line) for line in (self.root / "diagnostics/controller_v2.jsonl").read_text().splitlines()]

@@ -26,6 +26,8 @@ from squeakview.common import run_context
 from squeakview.common.bounded_input import read_atomic_json_snapshot
 from squeakview.common.capture_policy import capture_buffer_policy
 from squeakview.common.device_context import device_context_snapshot, file_identity
+from squeakview.common.parser_selection import parser_library_for_sdk
+from squeakview import config as runtime_config
 from squeakview.common.storage_policy import resolve_storage_reserve_policy
 
 
@@ -390,6 +392,11 @@ class RunManifestService:
             "check_interval_s": storage_policy.check_interval_s,
             "failure_policy": "fatal_graceful_capture_shutdown",
         }
+        try:
+            application_parser = file_identity(parser_library_for_sdk(
+                context.application_root / "native", runtime_config.DEEPSTREAM_SDK_ROOT))
+        except ValueError as exc:
+            application_parser = {"available": False, "error": str(exc)}
         manifest = {
             "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
             "run_id": run_dir.name,
@@ -421,15 +428,9 @@ class RunManifestService:
                     copy.deepcopy(context.effective_deepstream["custom_parser"])
                     if context.effective_deepstream is not None
                     and isinstance(context.effective_deepstream.get("custom_parser"), Mapping)
-                    else file_identity(
-                        context.application_root
-                        / "native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
-                    )
+                    else copy.deepcopy(application_parser)
                 ),
-                "application_deepstream_yolo_parser_build": file_identity(
-                    context.application_root
-                    / "native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so"
-                ),
+                "application_deepstream_yolo_parser_build": application_parser,
             },
             "git": self.git_snapshot(context.application_root),
             "failure_injection": (
