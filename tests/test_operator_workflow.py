@@ -3,6 +3,7 @@
 The camera and hardware preflight are fixtures; lifecycle, IPC, persistence and
 the independent finalizer are production code. No devices are opened.
 """
+import csv
 import json
 import os
 from pathlib import Path
@@ -49,6 +50,7 @@ class OperatorWorkflowTests(unittest.TestCase):
             ports = []
             def open_port(*_args, **_kwargs):
                 port = VirtualControllerPort()
+                port.feeder_jammed = True
                 ports.append(port)
                 return port
             def spawn(config, emit, on_exit=None, **_kwargs):
@@ -89,8 +91,13 @@ class OperatorWorkflowTests(unittest.TestCase):
                 loaded = load_v2_run(run)
                 self.assertEqual(len(loaded.frames), 3)
                 self.assertIn('DRINK_START', set(loaded.events.eventType))
+                with (run / 'sensors.csv').open(newline='') as sensor_file:
+                    self.assertIn('ACK_CLEAR_JAM', {row['eventType'] for row in csv.DictReader(sensor_file)})
                 self.assertEqual(len(ports), 2)
                 for port in ports:
                     self.assertTrue(any(command.startswith('ACK_EVENTS,') for command in port.commands))
                     self.assertIn('START_BEHAVIOR', port.commands)
+                    self.assertFalse(port.feeder_jammed)
+                    self.assertEqual(port.commands.count('CLEAR_JAM'), 1)
+                    self.assertLess(port.commands.index('CLEAR_JAM'), port.commands.index('START_BEHAVIOR'))
                     self.assertIn('STOP', port.commands)

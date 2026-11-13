@@ -29,6 +29,7 @@ class SerialHandle(Protocol):
     def open(self, run_dir: Path) -> bool: ...
     def send_line(self, line: str) -> None: ...
     def log_marker(self, marker: str) -> None: ...
+    def clear_feeder_jam(self, *, timeout_s: float = 2.0) -> str: ...
     def wait_for_ttl(self, *, timeout_s: float) -> bool: ...
     def negotiate_watchdog_v1(
         self, *, requested_lease_ms: int, timeout_s: float
@@ -567,6 +568,20 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
             return StartupResult(
                 started=False, prepared=prepared, serial=serial_handle, error=error
             )
+        if hooks.stop_requested():
+            return StartupResult(False, prepared, serial_handle)
+        try:
+            # Reset only at the new-run boundary. A jam during acquisition
+            # remains latched until an explicit operator clear or the next run.
+            response = serial_handle.clear_feeder_jam(timeout_s=2.0)
+            if response not in {"ACK_CLEAR_JAM", "NACK,CLEAR_JAM,NOT_JAMMED"}:
+                raise RuntimeError(response)
+            hooks.log(f"[SER] new-run feeder jam reset confirmed: {response}")
+        except Exception as exc:
+            error = f"could not reset prior feeder jam before starting new run: {exc}"
+            hooks.log(f"[SER] {error}")
+            hooks.finalize_failure(error, False)
+            return StartupResult(False, prepared, serial_handle, error=error)
         if cfg.controller_protocol == "watchdog_v1_experimental":
             try:
                 serial_handle.negotiate_watchdog_v1(

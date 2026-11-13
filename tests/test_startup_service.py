@@ -5,6 +5,7 @@ import unittest
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from squeakview.apps.operator.backend import startup
 from squeakview.apps.operator.backend.contracts import RunRequest
@@ -35,6 +36,10 @@ class _Serial:
 
     def log_marker(self, marker: str) -> None:
         self.events.append(f"serial-marker:{marker}")
+
+    def clear_feeder_jam(self, *, timeout_s: float = 2.0) -> str:
+        self.events.append("serial-clear-jam")
+        return "NACK,CLEAR_JAM,NOT_JAMMED"
 
     def wait_for_ttl(self, *, timeout_s: float) -> bool:
         self.events.append(f"serial-ttl:{timeout_s}")
@@ -160,6 +165,7 @@ class StartupServiceTests(unittest.TestCase):
             "serial-open",
             "serial-arm",
             "clock-validate",
+            "serial-clear-jam",
             "capture-spawn",
             "capture-set:True",
             "ready-wait:30.0",
@@ -188,7 +194,7 @@ class StartupServiceTests(unittest.TestCase):
             replace(self.hooks(), start_controller=start_behavior),
         )
         self.assertTrue(result.started)
-        ordered = ["capture-spawn", "ready-wait:30.0", "capture-running",
+        ordered = ["serial-clear-jam", "capture-spawn", "ready-wait:30.0", "capture-running",
                    "serial-send:START_BEHAVIOR", "behavior-acknowledged", "watch"]
         positions = [self.events.index(event) for event in ordered]
         self.assertEqual(positions, sorted(positions))
@@ -208,6 +214,41 @@ class StartupServiceTests(unittest.TestCase):
         self.assertNotIn("watch", self.events)
         self.assertFalse(any(event.startswith("serial-ttl:") for event in self.events))
         self.assertTrue(any(event.startswith("finalize:True:") for event in self.events))
+
+    def test_prior_jam_is_cleared_once_before_either_session_mode(self) -> None:
+        for trigger_on in (True, False):
+            with self.subTest(trigger_on=trigger_on):
+                self.events.clear()
+                with mock.patch.object(self.serial, "clear_feeder_jam", return_value="ACK_CLEAR_JAM") as clear:
+                    result = startup.start_run(
+                        startup.StartupRequest(RunRequest(
+                            task_cfg=self.task, inference_enabled=False,
+                            serial_enabled=True, trigger_on=trigger_on,
+                        ), False), self.hooks(),
+                    )
+                self.assertTrue(result.started)
+                clear.assert_called_once_with(timeout_s=2.0)
+                confirmed = self.events.index("log:[SER] new-run feeder jam reset confirmed: ACK_CLEAR_JAM")
+                self.assertLess(confirmed, self.events.index("capture-spawn"))
+
+    def test_unconfirmed_jam_reset_blocks_new_run_before_capture(self) -> None:
+        for outcome in ("NACK,CLEAR_JAM,FEED_ACTIVE", "unexpected reply",
+                        TimeoutError("no CLEAR_JAM reply"), ConnectionError("USB lost")):
+            with self.subTest(outcome=outcome):
+                self.events.clear()
+                kwargs = {"side_effect": outcome} if isinstance(outcome, Exception) else {"return_value": outcome}
+                with mock.patch.object(self.serial, "clear_feeder_jam", **kwargs):
+                    result = startup.start_run(
+                        startup.StartupRequest(RunRequest(
+                            task_cfg=self.task, inference_enabled=False,
+                            serial_enabled=True, trigger_on=True,
+                        ), False), self.hooks(),
+                    )
+                self.assertFalse(result.started)
+                self.assertIn("could not reset prior feeder jam", result.error)
+                self.assertNotIn("capture-spawn", self.events)
+                self.assertNotIn("controller-started", self.events)
+                self.assertTrue(any(event.startswith("finalize:False:") for event in self.events))
 
     def test_behavior_start_is_blocked_until_capture_ready(self) -> None:
         result = startup.start_run(

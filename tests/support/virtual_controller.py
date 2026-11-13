@@ -13,6 +13,7 @@ class VirtualControllerPort:
         self.sequence = 0
         self.session = 0
         self.count = 0
+        self.feeder_jammed = False
 
     def read(self, size):
         try:
@@ -40,6 +41,9 @@ class VirtualControllerPort:
             self.incoming.put(b'partial-tail\0')
         elif fields[0] == 'TIME_SYNC':
             self.reply(lambda stamp: f'CLOCK_SYNC,{fields[1]},{fields[2]},{stamp},{stamp},{time.time_ns() // 1000},RTC_VALID')
+        elif text == 'CLEAR_JAM':
+            self.reply('ACK_CLEAR_JAM' if self.feeder_jammed else 'NACK,CLEAR_JAM,NOT_JAMMED')
+            self.feeder_jammed = False
         elif text == 'START_BEHAVIOR':
             self.session = 7
             self.reply(lambda stamp: f'ACK_START_BEHAVIOR,1,{stamp},nan,0,0,69420,69420,task,nan', event=True)

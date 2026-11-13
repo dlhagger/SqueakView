@@ -119,6 +119,10 @@ class FakeSerialHandle:
         self.log_marker("START_SENT")
         self.send_line(f"START,{fps}")
 
+    def clear_feeder_jam(self, *, timeout_s: float = 2.0) -> str:
+        self.send_line("CLEAR_JAM")
+        return "NACK,CLEAR_JAM,NOT_JAMMED"
+
     def send_behavior_start(self, *, timeout_s: float = 3.0) -> None:
         del timeout_s
         self.log_marker("START_BEHAVIOR_SENT")

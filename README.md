@@ -438,6 +438,13 @@ Stop requests are acknowledged immediately by the supervisor. Capture closure
 and post-run analysis continue in a supervisor-owned worker while the responsive
 GUI receives lifecycle events and heartbeats; run duration therefore cannot
 turn a slow alignment pass into an IPC timeout or a false GUI-loss failure.
+
+Each new run automatically clears any feeder jam latch from a prior run after
+controller clock preflight and before capture starts. Startup requires either
+`ACK_CLEAR_JAM` or confirmation that no jam is latched; a timeout, lost connection,
+or active feed blocks the new run with an error. Jams during acquisition remain
+latched until the operator clears them or starts a new run. This resets the
+software latch; it does not remove a physical obstruction.
 The launcher reports success only after the supervisor has authenticated the
 GUI's IPC connection; an early GUI failure or connection timeout returns
 nonzero with the supervisor log path. The bounded wait defaults to 35 seconds,
