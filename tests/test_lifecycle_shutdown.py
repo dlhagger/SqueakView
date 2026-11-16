@@ -43,6 +43,26 @@ class LifecycleShutdownTests(BackendLifecycleCase):
         self.assertEqual(self.backend.snapshot().phase, RunPhase.FAILED)
         self.assertEqual(self.status()["state"], "failed")
         self.assertIn("shutdown coordinator failed", self.failures[-1])
+        self.assertFalse(self.handle.is_running())
+        self.assertEqual(self.handle.terminate_calls, 1)
+
+    def test_failed_emergency_capture_exit_retains_ownership(self):
+        self.assertTrue(self.backend.start_run(self.config()))
+        self.handle.terminate_group_graceful = mock.Mock()
+        self.handle.wait = mock.Mock(side_effect=subprocess.TimeoutExpired('capture', 2))
+        with mock.patch.object(manager.lifecycle, 'finalize_run', side_effect=OSError('disk full')):
+            self.backend.stop_run()
+        self.assertTrue(self.backend._acquisition_lock.held)
+        self.assertIs(self.backend.state.inference, self.handle)
+        self.assertFalse(self.backend._run_finalized)
+        self.assertEqual(self.backend.snapshot().phase, RunPhase.FAILED)
+        self.assertFalse(self.backend.start_run(self.config()))
+        self.handle.terminate_group_graceful = lambda *_args: setattr(self.handle, 'running', False)
+        self.handle.wait = mock.Mock(return_value=0)
+        self.backend.stop_run()
+        self.assertFalse(self.backend._acquisition_lock.held)
+        self.assertIsNone(self.backend.state.inference)
+        self.assertEqual(self.backend.snapshot().phase, RunPhase.FAILED)
 
 
     def test_stop_finalizes_even_when_child_already_exited(self) -> None:

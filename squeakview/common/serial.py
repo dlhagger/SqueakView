@@ -1259,6 +1259,14 @@ class SerialHandle:
 
     def send_line(self, text: str) -> None:
         self._send_line(text)
+        if text.strip().upper() == "STOP":
+            # Serial command order stops the motor before clearing its latch.
+            # Older firmware needs CLEAR_JAM; newer firmware clears on STOP
+            # and confirms the already-clear state with NOT_JAMMED.
+            response = self.clear_feeder_jam(timeout_s=2.0)
+            if response not in {"ACK_CLEAR_JAM", "NACK,CLEAR_JAM,NOT_JAMMED"}:
+                raise RuntimeError(f"could not reset feeder jam after STOP: {response}")
+            self.emit(f"[{timestamp()}] [SER] STOP feeder jam reset confirmed: {response}")
 
     def _present_bottle_record(self, kind: str) -> bool:
         """Project durable records by controller sequence, not replay arrival order.

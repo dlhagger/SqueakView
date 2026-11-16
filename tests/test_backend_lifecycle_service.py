@@ -60,6 +60,19 @@ class _Serial:
 
 
 class FinalizationServiceTests(unittest.TestCase):
+    def test_drain_status_failure_still_terminates_capture_and_closes_serial(self):
+        def fail(*_args, **_kwargs):
+            raise OSError('disk full during drain status write')
+        result = lifecycle.finalize_run(
+            self._request(_Capture(self.events), _Serial(self.events)),
+            dataclasses.replace(self._hooks(), wait_for_capture_drain=fail),
+        )
+        self.assertTrue(result.failed)
+        self.assertIn('disk full', result.error)
+        self.assertIn('capture:terminate', self.events)
+        self.assertIn('capture:wait:2', self.events)
+        self.assertIn('serial:close', self.events)
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.run_dir = Path(self.temp_dir.name) / "run"

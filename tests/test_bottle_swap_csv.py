@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from data_viz.bottle_history import load_bottle_history
 from squeakview.apps.operator.backend.bottle_swap import BottleSwapService
@@ -162,6 +164,58 @@ class BottleSwapCsvTests(unittest.TestCase):
                 save_swap_state(self.root,changed)
         self.assertEqual(load_swap_state(self.root),before)
         self.assertFalse(list(self.root.glob('.weigh_in.csv.*')))
+
+    def test_live_status_replacement_during_reads_does_not_disable_bottle_swap(self):
+        from squeakview.common.run_context import atomic_write_json
+
+        summary = artifact_path(self.root, 'diagnostics/controller_v2_summary.json')
+        atomic_write_json(summary, {'boot_id': 71, 'session_id': 3, 'counts': {}})
+        for name in ('diagnostics/controller_v2_summary.json', 'run_manifest.json', 'run_status.json'):
+            with self.subTest(snapshot=name):
+                target = artifact_path(self.root, name)
+                payload = {'boot_id': 71, 'session_id': 3, 'counts': {}} if target == summary else {'mouse_id': 'BENCH'}
+                atomic_write_json(target, payload)
+                # Force the exact race: publish another complete version after
+                # the reader opened/stat'ed the old one, before it reads bytes.
+                replacements = 0
+                original_fstat = os.fstat
+
+                def replace_open_snapshot(fd):
+                    nonlocal replacements
+                    before = original_fstat(fd)
+                    if before.st_ino == target.stat().st_ino:
+                        replacements += 1
+                        temporary = target.with_suffix('.replacement')
+                        temporary.write_text(json.dumps({**payload, 'generation': replacements}))
+                        os.replace(temporary, target)
+                    return before
+
+                # A nonempty manifest subject would short-circuit status reads.
+                if name == 'run_status.json':
+                    atomic_write_json(artifact_path(self.root, 'run_manifest.json'), {})
+                with mock.patch('squeakview.common.bounded_input.os.fstat', side_effect=replace_open_snapshot):
+                    snapshot = self.swap()
+                    write_weigh_in(self.root, {**snapshot['current'], 'mouse_weight_g': 25})
+                self.assertGreater(replacements, 0)
+                self.assertTrue(snapshot['available'])
+                self.assertEqual(snapshot['state'], 'ACTIVE')
+                self.assertEqual(snapshot['error'], '')
+                self.assertEqual(load_swap_state(self.root)['current'], self.service._data['current'])
+                boundaries = [row for row in self.rows() if row['controller_time_method'] == 'direct_boundary']
+                self.assertTrue(boundaries)
+                self.assertTrue(all(row['controller_boot_id'] == '71' and row['controller_session_id'] == '3'
+                                    for row in boundaries))
+
+    def test_malformed_live_summary_still_blocks_metadata_save(self):
+        summary = artifact_path(self.root, 'diagnostics/controller_v2_summary.json')
+        summary.parent.mkdir(parents=True, exist_ok=True)
+        before = (self.root / 'weigh_in.csv').read_bytes()
+        for malformed in ('{"boot_id":1,"boot_id":2}', '{"boot_id":NaN}', '[]', '{'):
+            with self.subTest(payload=malformed):
+                summary.write_text(malformed)
+                with self.assertRaises(ValueError):
+                    self.service._save()
+                self.assertEqual((self.root / 'weigh_in.csv').read_bytes(), before)
 
 if __name__=='__main__':
     unittest.main()

@@ -186,8 +186,7 @@ class BehaviorDashboard(QtWidgets.QWidget):
         self._clear_jam_btn.setEnabled(False)
         self._clear_jam_btn.setText("Clearing…")
         self._jam_detail.setText(
-            "Waiting for the controller. The jam remains latched until "
-            "ACK_CLEAR_JAM is received."
+            "Waiting for the controller to confirm the jam latch is clear."
         )
         self.clear_jam_requested.emit()
 
@@ -449,17 +448,13 @@ class BehaviorDashboard(QtWidgets.QWidget):
         if jam_event == dashboard_model.FeederJamEvent.JAMMED:
             reason = str(data.get("reason", "")).strip()
             self._set_jam_alert(reason)
-        elif jam_event == dashboard_model.FeederJamEvent.CLEAR_ACK:
+        elif jam_event in {dashboard_model.FeederJamEvent.CLEAR_ACK,
+                           dashboard_model.FeederJamEvent.CLEAR_NOT_JAMMED}:
             self.clear_jam_alert()
         elif jam_event == dashboard_model.FeederJamEvent.CLEAR_FEED_ACTIVE:
             self.clear_jam_failed(
                 "Clear Jam was rejected: wait until the current feed stops, "
                 "then inspect the mechanism and try again."
-            )
-        elif jam_event == dashboard_model.FeederJamEvent.CLEAR_NOT_JAMMED:
-            self.clear_jam_failed(
-                "The firmware reports that no jam is currently latched. "
-                "The warning remains active because no ACK_CLEAR_JAM was received."
             )
         event = str(data.get("event_uc", ""))
         if event == "TASK_INFO":

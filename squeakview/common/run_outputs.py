@@ -30,9 +30,12 @@ WEIGH_FIELDS = ["record_type", "record_id", "measurement_type", "mouse_id", "bot
 _WEIGH_LOCK = threading.RLock()
 
 
-def _json(path):
+def _json(path, *, atomic_snapshot=False):
     if not path.exists():
         return {}
+    if atomic_snapshot:
+        from .bounded_input import read_atomic_json_snapshot
+        return read_atomic_json_snapshot(path, max_bytes=16 * 1024 * 1024, label=path.name)
     from .run_context import read_json_required
     return read_json_required(path, max_bytes=64 * 1024 * 1024 if path.name == "bottle_history.json" else 16 * 1024 * 1024)
 
@@ -80,7 +83,10 @@ class ClockMapping:
             samples = evidence.get("after_samples") or evidence.get("before_samples") or []
             if samples:
                 self.sample = min(samples, key=lambda s: s["round_trip_ns"])
-        summary = _json(artifact_path(run_dir, "diagnostics/controller_v2_summary.json"))
+        # Serial publishes this live status by os.replace. Pin one complete
+        # version; a newer pathname must not invalidate a bottle transaction.
+        summary = _json(artifact_path(run_dir, "diagnostics/controller_v2_summary.json"),
+                        atomic_snapshot=True)
         self.boot = summary.get("boot_id", "")
         self.session = summary.get("session_id", "")
         self.valid_boot = not summary.get("integrity_latched") and not summary.get("counts", {}).get("boot_boundaries", 0)
@@ -150,7 +156,7 @@ def _write_weigh_in(run_dir, bottles):
     path = artifact_path(run_dir, "weigh_in.csv")
     from .bottle_csv import load_swap_state
     history = load_swap_state(run_dir) or _json(artifact_path(run_dir, "bottle_history.json"))
-    manifest = _json(artifact_path(run_dir, "run_manifest.json"))
+    manifest = _json(artifact_path(run_dir, "run_manifest.json"), atomic_snapshot=True)
     entries = history.get("history", []) + list(history.get("current", {}).values())
     if not entries:
         entries = [dict(values, side=side, bottle_id=f"initial_{side}")
@@ -189,7 +195,7 @@ def _write_weigh_in(run_dir, bottles):
             row["event"] = "measurement_cleared"
         if previous and all(str(previous.get(name, "")) == str(row.get(name, "")) for name in ("fluid", "note")) and previous_weight == new_weight:
             continue
-        row.update(record_type="measurement", mouse_id=manifest.get("mouse_id") or _json(artifact_path(run_dir, "run_status.json")).get("mouse_id") or "", entered_at_unix_ns=now,
+        row.update(record_type="measurement", mouse_id=manifest.get("mouse_id") or _json(artifact_path(run_dir, "run_status.json"), atomic_snapshot=True).get("mouse_id") or "", entered_at_unix_ns=now,
                    entered_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now / 1e9)),
                    host_unix_ns=now, host_monotonic_ns=monotonic)
         additions.append(mapping.apply(row))

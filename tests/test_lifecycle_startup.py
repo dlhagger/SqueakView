@@ -28,9 +28,59 @@ from squeakview.project import (
 from tests.support.lifecycle import BackendLifecycleCase, _runtime_context, FakeProcessHandle, FakeHungFinalizer, FakeSerialHandle
 
 class LifecycleStartupTests(BackendLifecycleCase):
+    def test_missing_first_frame_aborts_without_publishing_recording(self):
+        self.backend._wait_for_first_frames.side_effect = (
+            lambda *args, **kwargs: manager.OperatorBackend._wait_for_first_frames(
+                self.backend, *args, **kwargs))
+        with mock.patch.object(manager.startup, 'FIRST_FRAME_TIMEOUT_S', 0.01):
+            self.assertFalse(self.backend.start_run(self.config(num_cameras=2)))
+        self.assertEqual(self.started, [])
+        self.assertEqual(self.status()['state'], 'failed')
+        self.assertIn('0, 1', self.status()['error'])
+        self.assertFalse(self.handle.is_running())
+        self.assertFalse(self.backend._acquisition_lock.held)
+
+    def test_first_frame_evidence_persisted_before_recording(self):
+        self.backend._wait_for_first_frames.side_effect = (
+            lambda *args, **kwargs: manager.OperatorBackend._wait_for_first_frames(
+                self.backend, *args, **kwargs))
+        with mock.patch.object(manager.first_frames, 'wait_for_first_frames', return_value={0: 1, 1: 4}):
+            self.assertTrue(self.backend.start_run(self.config(num_cameras=2)))
+        self.assertEqual(self.status()['first_frame_confirmation'], {
+            'passed': True, 'timeout_s': 10.0, 'source_frames_by_camera': {'0': 1, '1': 4}})
+        self.assertEqual(self.status()['state'], 'recording')
+
+    def test_ttl_without_camera_frames_stops_controller_and_capture(self):
+        FakeSerialHandle.instances.clear()
+        self.backend._wait_for_first_frames.side_effect = TimeoutError('missing camera 1')
+        with (
+            mock.patch.object(manager.serial_util, 'have_pyserial', return_value=True),
+            mock.patch.object(manager.serial_util, 'SerialHandle', FakeSerialHandle),
+            mock.patch.object(self.backend._inference_ready, 'wait', return_value=True),
+            mock.patch.object(self.backend, '_wait_for_capture_drain', return_value=True),
+        ):
+            self.assertFalse(self.backend.start_run(self.config(
+                serial_enabled=True, trigger_on=True, num_cameras=2)))
+        serial = FakeSerialHandle.instances[-1]
+        self.assertTrue(any(line.startswith('START,') for line in serial.sent))
+        self.assertIn('STOP', serial.sent)
+        self.assertTrue(serial.closed)
+        self.assertFalse(self.handle.is_running())
+        self.assertEqual(self.started, [])
+        self.assertEqual(self.status()['state'], 'failed')
+        self.assertIn('camera 1', self.status()['error'])
+
     def test_ready_marker_transitions_starting_to_recording(self) -> None:
-        self.assertTrue(self.backend.start_run(self.config()))
-        self.assertEqual(self.status()["state"], "starting")
+        def ready(**_kwargs):
+            self.assertEqual(self.status()["state"], "starting")
+            self.backend._inference_emit(
+                encode_child_event("pipeline_ready", run_dir=str(self.run_dir))
+            )
+            self.assertEqual(self.started, [])
+            self.assertEqual(self.status()["state"], "starting")
+            return True
+        with mock.patch.object(self.backend._inference_ready, "wait", side_effect=ready):
+            self.assertTrue(self.backend.start_run(self.config()))
         self.assertTrue(self.status()["preflight"]["passed"])
         self.assertEqual(
             (self.run_dir / "config/task.yaml").read_text(),
@@ -174,25 +224,30 @@ power_modes: [25W]
 
 
     def test_only_structured_ready_event_marks_recording(self) -> None:
-        self.assertTrue(self.backend.start_run(self.config()))
-
-        self.backend._inference_emit("[12:00:00] [READY] inference playing")
-        self.assertEqual(self.status()["state"], "starting")
-        self.assertTrue(
-            any("ignored legacy text readiness marker" in message for message in self.logs)
-        )
-
-        self.backend._inference_emit(
-            encode_child_event("pipeline_ready", run_dir=str(self.run_dir))
-        )
+        self.auto_ready = False
+        def ready(**_kwargs):
+            self.backend._inference_emit("[12:00:00] [READY] inference playing")
+            self.assertEqual(self.status()["state"], "starting")
+            self.assertFalse(self.backend._inference_ready.is_set())
+            self.assertTrue(any("ignored legacy text readiness marker" in msg for msg in self.logs))
+            self.backend._inference_emit(
+                encode_child_event("pipeline_ready", run_dir=str(self.run_dir))
+            )
+            self.assertTrue(self.backend._inference_ready.is_set())
+            self.assertEqual(self.status()["state"], "starting")
+            return True
+        with mock.patch.object(self.backend._inference_ready, "wait", side_effect=ready):
+            self.assertTrue(self.backend.start_run(self.config()))
 
         self.assertEqual(self.status()["state"], "recording")
 
 
     def test_malformed_structured_event_fails_run_without_marking_ready(self) -> None:
-        self.assertTrue(self.backend.start_run(self.config()))
-
-        self.backend._inference_emit(EVENT_PREFIX + "not-json")
+        def malformed(**_kwargs):
+            self.backend._inference_emit(EVENT_PREFIX + "not-json")
+            return True
+        with mock.patch.object(self.backend._inference_ready, "wait", side_effect=malformed):
+            self.assertFalse(self.backend.start_run(self.config()))
         self.assertTrue(self.failure_event.wait(timeout=2.0))
 
         self.assertEqual(self.status()["state"], "failed")
@@ -201,13 +256,15 @@ power_modes: [25W]
 
 
     def test_structured_fatal_event_fails_run_with_child_detail(self) -> None:
-        self.assertTrue(self.backend.start_run(self.config()))
-
-        self.backend._inference_emit(
-            encode_child_event(
-                "fatal", run_dir=str(self.run_dir), error="recording sink stalled"
+        def fatal(**_kwargs):
+            self.backend._inference_emit(
+                encode_child_event(
+                    "fatal", run_dir=str(self.run_dir), error="recording sink stalled"
+                )
             )
-        )
+            return True
+        with mock.patch.object(self.backend._inference_ready, "wait", side_effect=fatal):
+            self.assertFalse(self.backend.start_run(self.config()))
         self.assertTrue(self.failure_event.wait(timeout=2.0))
 
         self.assertEqual(self.status()["state"], "failed")

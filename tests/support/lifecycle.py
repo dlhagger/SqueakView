@@ -209,12 +209,13 @@ class BackendLifecycleCase(unittest.TestCase):
         self.handle = FakeProcessHandle()
         self.exit_callback = None
         self.spawn_kwargs = None
+        self.auto_ready = True
 
         def spawn(_cfg, emit, on_exit=None, **kwargs):
             del emit
             self.exit_callback = on_exit
             self.spawn_kwargs = kwargs
-            if _cfg.serial_enabled and not _cfg.trigger_on:
+            if self.auto_ready and not _cfg.trigger_on:
                 self.backend._inference_ready.set()
             return self.handle
 
@@ -273,6 +274,7 @@ class BackendLifecycleCase(unittest.TestCase):
             mock.patch.object(self.backend, "_ensure_metadata"),
             mock.patch.object(self.backend, "_run_capture_finalizer", side_effect=finalize),
             mock.patch.object(self.backend, "_run_output_snapshot", return_value={}),
+            mock.patch.object(self.backend, "_wait_for_first_frames"),
             mock.patch.object(manager.time, "sleep"),
         ]
         for patcher in self.patches:

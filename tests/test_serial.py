@@ -150,6 +150,47 @@ class SerialCsvTests(unittest.TestCase):
         self.assertEqual(self.handle.clear_feeder_jam(), "ACK_CLEAR_JAM")
         self.assertEqual(port.writes, [b"CLEAR_JAM\n"])
 
+    def test_stop_clears_jam_on_old_and_new_firmware_and_rejects_active_feed(self) -> None:
+        for reply in ("ACK_CLEAR_JAM", "NACK,CLEAR_JAM,NOT_JAMMED",
+                      "NACK,CLEAR_JAM,FEED_ACTIVE"):
+            with self.subTest(reply=reply):
+                handle = serial_util.SerialHandle("/dev/test", 115200, self.logs.append)
+                writes = []
+
+                class ReplyingPort:
+                    is_open = True
+
+                    def write(self, payload):
+                        writes.append(payload)
+                        if payload == b"CLEAR_JAM\n":
+                            handle._ingest_clear_jam_response(reply)
+
+                    def flush(self):
+                        pass
+
+                    def close(self):
+                        self.is_open = False
+
+                handle.ser = ReplyingPort()
+                handle._closed = False
+                try:
+                    if reply.endswith("FEED_ACTIVE"):
+                        with self.assertRaisesRegex(RuntimeError, "FEED_ACTIVE"):
+                            handle.send_line("STOP")
+                    else:
+                        handle.send_line("STOP")
+                    self.assertEqual(writes, [b"STOP\n", b"CLEAR_JAM\n"])
+                finally:
+                    handle.close()
+
+    def test_stop_reports_unconfirmed_jam_reset(self) -> None:
+        with mock.patch.object(self.handle, "_send_line") as send, mock.patch.object(
+            self.handle, "clear_feeder_jam", side_effect=TimeoutError("no reply")
+        ):
+            with self.assertRaisesRegex(TimeoutError, "no reply"):
+                self.handle.send_line("STOP")
+        send.assert_called_once_with("STOP")
+
     def test_clear_feeder_jam_returns_each_firmware_nack(self) -> None:
         for reply in (
             "NACK,CLEAR_JAM,FEED_ACTIVE",

@@ -67,12 +67,13 @@ class BehaviorOnlyRuntimeTests(unittest.TestCase):
         confirm.assert_not_called()
         self.assertFalse(self.backend._recording_started)
 
-    def test_without_serial_inference_readiness_still_confirms_recording(self):
+    def test_without_serial_readiness_still_waits_for_camera_frames(self):
         self.backend.launch_cfg.serial_enabled = False
         with mock.patch.object(self.backend, "_confirm_recording") as confirm:
             self.backend._mark_inference_ready()
-        confirm.assert_called_once()
+        confirm.assert_not_called()
         self.assertTrue(self.backend._inference_ready.is_set())
+        self.assertFalse(self.backend._recording_started)
 
     def test_trigger_on_retains_camera_start(self):
         self.backend.launch_cfg.trigger_on = True

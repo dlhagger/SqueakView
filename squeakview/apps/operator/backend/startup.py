@@ -9,6 +9,7 @@ notifications do not cross this boundary.
 
 import copy
 import math
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -17,6 +18,7 @@ from typing import Any, Callable, Mapping, Protocol
 from squeakview.apps.operator.backend.contracts import RunRequest
 from squeakview.common.failure_injection import FailurePlan
 from squeakview.common.bounded_input import read_json_object, read_yaml_mapping
+from .first_frames import FIRST_FRAME_TIMEOUT_S
 
 
 MAX_TASK_CONFIG_BYTES = 1024 * 1024
@@ -155,11 +157,13 @@ class StartupHooks:
     run_finalized: Callable[[], bool]
     finalize_failure: Callable[[str, bool], None]
     wait_ready: Callable[[float], bool]
+    wait_first_frames: Callable[..., None]
     stop_requested: Callable[[], bool]
     start_controller: Callable[[SerialHandle, int], bool]
     start_run_dir_watch: Callable[[], None]
     ready_timeout: Callable[[], float]
     serial_open_failure_message: Callable[[SerialHandle, str, int], str]
+    monotonic: Callable[[], float] = time.monotonic
     resolve_qualification_case: Callable[
         [RunRequest, Mapping[str, object]], Mapping[str, Any] | None
     ] = lambda _config, _device: None
@@ -571,8 +575,8 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
         if hooks.stop_requested():
             return StartupResult(False, prepared, serial_handle)
         try:
-            # Reset only at the new-run boundary. A jam during acquisition
-            # remains latched until an explicit operator clear or the next run.
+            # Keep this new-run reset for controllers whose older firmware
+            # does not yet clear the jam latch on STOP.
             response = serial_handle.clear_feeder_jam(timeout_s=2.0)
             if response not in {"ACK_CLEAR_JAM", "NACK,CLEAR_JAM,NOT_JAMMED"}:
                 raise RuntimeError(response)
@@ -646,29 +650,36 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
         )
     hooks.log("[DS] inference launched")
 
+    # Readiness is required for camera-only runs as well as controller runs.
+    start_action = "START" if cfg.trigger_on else "START_BEHAVIOR"
+    hooks.log("[BACKEND] waiting for capture pipeline readiness")
+    try:
+        timeout = hooks.ready_timeout()
+        ready = hooks.wait_ready(timeout)
+    except Exception as exc:
+        error = f"inference readiness check failed: {type(exc).__name__}: {exc}"
+        hooks.log(f"[BACKEND] {error}")
+        hooks.finalize_failure(error, True)
+        return StartupResult(False, prepared, serial_handle, capture, error)
+    if not ready:
+        error = f"inference was not ready within {timeout:.1f}s; controller was not started"
+        hooks.log(f"[BACKEND] {error}")
+        hooks.finalize_failure(error, True)
+        return StartupResult(False, prepared, serial_handle, capture, error)
+    if hooks.stop_requested():
+        error = "startup cancelled while waiting for capture readiness"
+        hooks.finalize_failure(error, True)
+        return StartupResult(False, prepared, serial_handle, capture, error)
+    if hooks.run_finalized() or not capture.is_running():
+        error = "inference exited before the controller could be started"
+        hooks.log(f"[BACKEND] {error}")
+        hooks.finalize_failure(error, False)
+        return StartupResult(False, prepared, serial_handle, capture, error)
+
+    # Start the clock immediately before START, never during model/camera setup.
+    # TTL/behavior acknowledgement consumes this same budget, not a fresh one.
+    frame_deadline = hooks.monotonic() + FIRST_FRAME_TIMEOUT_S
     if serial_handle is not None:
-        start_action = "START" if cfg.trigger_on else "START_BEHAVIOR"
-        hooks.log(f"[BACKEND] waiting for inference ready before {start_action}")
-        try:
-            timeout = hooks.ready_timeout()
-            ready = hooks.wait_ready(timeout)
-        except Exception as exc:
-            error = f"inference readiness check failed: {type(exc).__name__}: {exc}"
-            hooks.log(f"[BACKEND] {error}")
-            hooks.finalize_failure(error, True)
-            return StartupResult(False, prepared, serial_handle, capture, error)
-        if not ready:
-            error = f"inference was not ready within {timeout:.1f}s; controller was not started"
-            hooks.log(f"[BACKEND] {error}")
-            hooks.finalize_failure(error, True)
-            return StartupResult(False, prepared, serial_handle, capture, error)
-        if hooks.stop_requested():
-            return StartupResult(False, prepared, serial_handle, capture)
-        if hooks.run_finalized() or not capture.is_running():
-            error = "inference exited before the controller could be started"
-            hooks.log(f"[BACKEND] {error}")
-            hooks.finalize_failure(error, False)
-            return StartupResult(False, prepared, serial_handle, capture, error)
         try:
             hooks.log(f"[BACKEND] inference ready; sending {start_action}")
             if not hooks.start_controller(serial_handle, int(cfg.arduino_fps)):
@@ -690,6 +701,18 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
             hooks.log(f"[BACKEND] {error}")
             hooks.finalize_failure(error, True)
             return StartupResult(False, prepared, serial_handle, capture, error)
+
+    try:
+        hooks.log(
+            f"[BACKEND] waiting up to {FIRST_FRAME_TIMEOUT_S:g}s for first frames "
+            f"from all {cfg.num_cameras} camera(s)"
+        )
+        hooks.wait_first_frames(run_dir, cfg.num_cameras, deadline=frame_deadline)
+    except Exception as exc:
+        error = f"camera startup confirmation failed: {exc}"
+        hooks.log(f"[BACKEND] {error}")
+        hooks.finalize_failure(error, True)
+        return StartupResult(False, prepared, serial_handle, capture, error)
 
     if hooks.stop_requested():
         error = "startup cancelled before run-directory supervision"

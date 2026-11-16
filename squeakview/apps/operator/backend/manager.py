@@ -6,6 +6,7 @@ from squeakview.common.run_layout import artifact_path, is_primary_layout, uses_
 
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -17,6 +18,7 @@ from typing import Any, Callable, Optional
 from squeakview.apps.operator.backend import (
     capture_events,
     capture_drain,
+    first_frames,
     finalizer,
     lifecycle,
     manifest,
@@ -355,7 +357,7 @@ class OperatorBackend:
                 ).start()
                 return
         if not bool(getattr(self.launch_cfg, "serial_enabled", False)):
-            self._confirm_recording()
+            self._log("[BACKEND] inference ready; waiting for first camera frames")
         elif not bool(getattr(self.launch_cfg, "trigger_on", False)):
             self._log("[BACKEND] inference ready; waiting for behavioral controller START acknowledgement")
         else:
@@ -791,6 +793,11 @@ class OperatorBackend:
         with self._finalize_lock:
             if self._run_finalized:
                 return False
+            if self._state_machine.phase == RunPhase.FAILED:
+                # A retained capture may need another cleanup attempt. Reaping
+                # it later must not turn the already failed experiment green.
+                final_state = "failed"
+                error = error or self._last_error or "retrying failed capture cleanup"
             self._stop_requested.set()
             inference = self.state.inference
             try:
@@ -824,13 +831,26 @@ class OperatorBackend:
                     ),
                 )
             except Exception as exc:
-                # No shutdown helper failure may leave the application looking
-                # active or retain the process-wide acquisition lock.
+                # Coordinator/status failures must not bypass process cleanup.
                 detail = f"shutdown coordinator failed: {type(exc).__name__}: {exc}"
                 self._log(f"[BACKEND] {detail}")
                 try:
                     if self.state.serial is not None:
+                        self.state.serial.send_line("STOP")
+                except Exception as stop_exc:
+                    detail += f"; emergency controller STOP failed: {stop_exc}"
+                returncode = None
+                try:
+                    if inference is not None:
+                        inference.terminate_group_graceful(signal.SIGINT, 30.0, True)
+                        returncode = inference.wait(timeout=2.0)
+                except Exception as capture_exc:
+                    detail += f"; emergency capture shutdown failed: {capture_exc}"
+                serial_closed = False
+                try:
+                    if self.state.serial is not None:
                         self.state.serial.close()
+                        serial_closed = True
                 except Exception as close_exc:
                     self._log(f"[SER] close after coordinator failure failed: {close_exc}")
                 if self.state.run_dir is not None:
@@ -843,8 +863,8 @@ class OperatorBackend:
                 result = lifecycle.FinalizationResult(
                     final_state="failed",
                     error=detail,
-                    capture_returncode=None,
-                    serial_closed=self.state.serial is not None,
+                    capture_returncode=returncode,
+                    serial_closed=serial_closed,
                 )
             # A failed capture exit can skip the recording validator entirely.
             # Bottle history still needs a terminal state and final counters.
@@ -884,11 +904,16 @@ class OperatorBackend:
                         capture_returncode=result.capture_returncode,
                         serial_closed=result.serial_closed,
                     )
-                self.state.inference = None
+                # Ownership is tied to an observed process exit, not merely a
+                # failed UI state. Retain the handle/lock if cleanup is unsure.
+                capture_unconfirmed = inference is not None and result.capture_returncode is None
+                if not capture_unconfirmed:
+                    self.state.inference = None
                 if result.serial_closed:
                     self.state.serial = None
-                self._run_finalized = True
-                self._acquisition_lock.release()
+                self._run_finalized = not capture_unconfirmed
+                if not capture_unconfirmed:
+                    self._acquisition_lock.release()
                 notify_failure = result.failed
                 error = result.error
                 self._last_error = error if notify_failure else None
@@ -1230,6 +1255,7 @@ class OperatorBackend:
                 terminate_inference=terminate,
             ),
             wait_ready=lambda timeout: self._inference_ready.wait(timeout=timeout),
+            wait_first_frames=self._wait_for_first_frames,
             stop_requested=self._stop_requested.is_set,
             start_controller=start_controller,
             start_run_dir_watch=self._start_run_dir_watch,
@@ -1247,6 +1273,21 @@ class OperatorBackend:
                 )
             ),
         )
+
+    def _wait_for_first_frames(self, run_dir: Path, camera_count: int, *, deadline: float) -> None:
+        capture = self.state.inference
+        counts = first_frames.wait_for_first_frames(
+            run_dir, camera_count, deadline=deadline,
+            cancelled=lambda: self._stop_requested.is_set() or self._run_finalized,
+            capture_running=lambda: capture is not None and capture.is_running(),
+            wait=self._stop_requested.wait,
+        )
+        run_context.update_status(run_dir, first_frame_confirmation={
+            "passed": True,
+            "timeout_s": first_frames.FIRST_FRAME_TIMEOUT_S,
+            "source_frames_by_camera": {str(index): count for index, count in counts.items()},
+        })
+        self._log("[BACKEND] validated first frames received from every camera")
 
     def start_run(self, cfg: process.LaunchConfig) -> bool:
         try:
@@ -1302,7 +1343,7 @@ class OperatorBackend:
         )
         if not result.started and result.error:
             self._last_error = result.error
-        if result.started and bool(getattr(cfg, "serial_enabled", False)):
+        if result.started:
             return self._confirm_recording()
         return result.started
 

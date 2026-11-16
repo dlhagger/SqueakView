@@ -497,6 +497,10 @@ class SupervisorServerTests(unittest.TestCase):
         self.server._emit_dashboard(DashboardEvent.parse("NACK,CLEAR_JAM,FEED_ACTIVE"))
         result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "still-jammed"))
         self.assertEqual(result["dashboard_events"][0]["event_uc"], "FEED_JAM")
+        clear = DashboardEvent.parse("NACK,CLEAR_JAM,NOT_JAMMED")
+        self.server._emit_dashboard(clear)
+        result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "restore-already-clear"))
+        self.assertEqual(result["dashboard_events"], [clear.to_payload()])
         self.server._emit_dashboard(DashboardEvent.parse("ACK_CLEAR_JAM"))
         result, _ = self.server._dispatch(CommandEnvelope("runtime_state", "restore-clear"))
         self.assertEqual(result["dashboard_events"][0]["event_uc"], "ACK_CLEAR_JAM")
@@ -551,7 +555,8 @@ class SupervisorServerTests(unittest.TestCase):
                     self.server._emit_dashboard(event)
                     queued = self.server._critical_events.get_nowait()
                     self.assertEqual(DashboardEvent.from_payload(queued.payload), event)
-                    if feeder_jam_event(event) in {FeederJamEvent.JAMMED, FeederJamEvent.CLEAR_ACK}:
+                    if feeder_jam_event(event) in {FeederJamEvent.JAMMED, FeederJamEvent.CLEAR_ACK,
+                                                   FeederJamEvent.CLEAR_NOT_JAMMED}:
                         state, _ = self.server._dispatch(CommandEnvelope("runtime_state", "jam-state"))
                         self.assertEqual(state["dashboard_events"], [event.to_payload()])
         self.assertEqual(self.server._dropped_presentation, 0)

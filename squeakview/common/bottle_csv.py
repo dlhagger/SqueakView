@@ -48,8 +48,8 @@ def _record(run_dir, kind, *, controller_time_us=None, **values):
     if now is None:
         now = time.time_ns()
     monotonic = values.pop("host_monotonic_ns", time.monotonic_ns())
-    subject = _json(artifact_path(run_dir, "run_manifest.json")).get("mouse_id") or _json(
-        artifact_path(run_dir, "run_status.json")).get("mouse_id") or ""
+    subject = _json(artifact_path(run_dir, "run_manifest.json"), atomic_snapshot=True).get("mouse_id") or _json(
+        artifact_path(run_dir, "run_status.json"), atomic_snapshot=True).get("mouse_id") or ""
     row = dict(record_type=kind, mouse_id=subject, entered_at_unix_ns=now,
                entered_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now / 1e9)),
                host_unix_ns=now, host_monotonic_ns=monotonic, **values)

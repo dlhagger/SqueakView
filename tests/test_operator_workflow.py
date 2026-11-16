@@ -98,6 +98,7 @@ class OperatorWorkflowTests(unittest.TestCase):
                     self.assertTrue(any(command.startswith('ACK_EVENTS,') for command in port.commands))
                     self.assertIn('START_BEHAVIOR', port.commands)
                     self.assertFalse(port.feeder_jammed)
-                    self.assertEqual(port.commands.count('CLEAR_JAM'), 1)
+                    self.assertEqual(port.commands.count('CLEAR_JAM'), 2)
+                    self.assertEqual(port.commands[port.commands.index('STOP') + 1], 'CLEAR_JAM')
                     self.assertLess(port.commands.index('CLEAR_JAM'), port.commands.index('START_BEHAVIOR'))
                     self.assertIn('STOP', port.commands)

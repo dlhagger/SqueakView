@@ -292,7 +292,8 @@ class SupervisorServer:
         if not isinstance(event, DashboardEvent):
             raise TypeError("dashboard callback requires DashboardEvent")
         jam_status = feeder_jam_event(event)
-        if jam_status in {FeederJamEvent.JAMMED, FeederJamEvent.CLEAR_ACK}:
+        if jam_status in {FeederJamEvent.JAMMED, FeederJamEvent.CLEAR_ACK,
+                          FeederJamEvent.CLEAR_NOT_JAMMED}:
             self._feeder_dashboard_event = event
         elif event.event_uc == "SYSTEM_START" or event.event_uc.startswith("SYSTEM_START,"):
             self._feeder_dashboard_event = None

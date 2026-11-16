@@ -443,8 +443,16 @@ Each new run automatically clears any feeder jam latch from a prior run after
 controller clock preflight and before capture starts. Startup requires either
 `ACK_CLEAR_JAM` or confirmation that no jam is latched; a timeout, lost connection,
 or active feed blocks the new run with an error. Jams during acquisition remain
-latched until the operator clears them or starts a new run. This resets the
-software latch; it does not remove a physical obstruction.
+latched until the operator clears them, stops the run, or starts a new run.
+The application sends `CLEAR_JAM` after `STOP` and requires confirmation of a
+cleared latch, supporting older firmware. Updated controller firmware also
+clears the latch directly on every `STOP`, including while idle. These actions reset the latch; they do not remove a physical obstruction.
+Both `ACK_CLEAR_JAM` and `NACK,CLEAR_JAM,NOT_JAMMED` clear the dashboard warning
+and the supervisor's retained jam state, including after GUI reconnection.
+An active-feed rejection or communication failure retains the warning.
+Live bottle metadata reads the atomically published controller summary and run
+status as complete snapshots. A concurrent status update does not disable bottle
+swapping; malformed JSON and in-place file mutation remain errors.
 The launcher reports success only after the supervisor has authenticated the
 GUI's IPC connection; an early GUI failure or connection timeout returns
 nonzero with the supervisor log path. The bounded wait defaults to 35 seconds,
@@ -496,12 +504,20 @@ export SQUEAKVIEW_PROJECTS_DIR="$HOME/Documents/SqueakView Projects"
 bash squeakview.sh /absolute/path/to/a/project
 ```
 
-The supervised backend launches inference first. For free-running capture, the
-GUI reports recording after the PyServiceMaker pipeline reaches `PLAYING`. In
-triggered mode, it sends `START` only after that readiness signal and reports
-recording only after the first controller TTL is observed. The default readiness
-timeout is 30 seconds and can be changed with
-`SQUEAKVIEW_INFERENCE_READY_TIMEOUT`.
+The supervised backend prepares the capture/inference pipeline before starting
+the controller. The default pipeline readiness timeout is 30 seconds, adjustable
+with `SQUEAKVIEW_INFERENCE_READY_TIMEOUT`. Triggered mode then sends `START` and
+requires controller TTL evidence within 3 seconds. Free-running controller runs
+send `START_BEHAVIOR` instead, without camera pulses.
+
+All modes remain **Starting** until every camera has delivered a frame with
+validated native timing. A shared 10-second first-frame deadline starts just
+before the controller start command (or after pipeline readiness for camera-only
+runs); controller acknowledgement/TTL waiting uses that same budget. This is a
+maximum wait, not an added delay. Missing-camera errors identify the camera
+indices, stop the run, and mark it failed. First-frame evidence is saved in run
+status as `first_frame_confirmation`. A pipeline ready message or controller TTL
+alone cannot establish that the cameras are recording.
 
 Serial logging may remain enabled during free-running capture, but its data are
 auxiliary and no trigger/frame alignment is claimed. Exact TTL alignment is a

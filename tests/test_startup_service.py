@@ -126,6 +126,7 @@ class StartupServiceTests(unittest.TestCase):
             run_finalized=lambda: False,
             finalize_failure=lambda error, terminate: self.events.append(f"finalize:{terminate}:{error}"),
             wait_ready=lambda timeout: self.events.append(f"ready-wait:{timeout}") or True,
+            wait_first_frames=lambda _run, count, **_kw: self.events.append(f"first-frames:{count}"),
             stop_requested=lambda: False,
             start_controller=start_controller,
             start_run_dir_watch=lambda: self.events.append("watch"),
@@ -174,6 +175,7 @@ class StartupServiceTests(unittest.TestCase):
             "serial-marker:START_SENT",
             "controller-started",
             "serial-ttl:3.0",
+            "first-frames:1",
             "watch",
         ]
         positions = [self.events.index(event) for event in ordered]
@@ -181,6 +183,46 @@ class StartupServiceTests(unittest.TestCase):
         self.assertEqual(self.events.count("storage"), 1)
         self.assertEqual(result.prepared.config.run_dir, self.run_dir)
         self.assertEqual(result.prepared.config.preview_socket_paths, (Path("/tmp/preview.sock"),))
+
+    def test_first_frame_deadline_excludes_preparation_but_includes_controller_wait(self):
+        now = [100.0]
+        hooks = self.hooks()
+        def ready(_timeout):
+            now[0] += 25  # Preparation is not charged to the first-frame budget.
+            return True
+        def start(handle, fps):
+            now[0] += 2
+            return hooks.start_controller(handle, fps)
+        def ttl(**_kwargs):
+            now[0] += 3
+            return True
+        def frames(_run, cameras, *, deadline):
+            self.assertEqual(cameras, 2)
+            self.assertEqual(now[0], 130)
+            self.assertEqual(deadline, 135)
+        self.serial.wait_for_ttl = ttl
+        result = startup.start_run(startup.StartupRequest(RunRequest(
+            task_cfg=self.task, inference_enabled=False, serial_enabled=True,
+            trigger_on=True, num_cameras=2), False),
+            replace(hooks, wait_ready=ready, start_controller=start,
+                    monotonic=lambda: now[0], wait_first_frames=frames))
+        self.assertTrue(result.started)
+
+    def test_first_frame_failure_stops_all_capture_modes_before_success(self):
+        for serial, triggered in ((False, False), (True, False), (True, True)):
+            with self.subTest(serial=serial, triggered=triggered):
+                self.events.clear()
+                frames = mock.Mock(side_effect=TimeoutError('no frame from camera 1'))
+                result = startup.start_run(startup.StartupRequest(RunRequest(
+                    task_cfg=self.task, inference_enabled=False, serial_enabled=serial,
+                    trigger_on=triggered, num_cameras=2), False),
+                    replace(self.hooks(), wait_first_frames=frames))
+                self.assertFalse(result.started)
+                self.assertIn('camera 1', result.error)
+                frames.assert_called_once()
+                self.assertIn('ready-wait:30.0', self.events)
+                self.assertNotIn('watch', self.events)
+                self.assertTrue(any(event.startswith('finalize:True:') for event in self.events))
 
     def test_behavior_session_starts_after_readiness_without_camera_ttl(self) -> None:
         def start_behavior(handle, _fps):

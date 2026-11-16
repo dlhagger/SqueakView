@@ -467,7 +467,6 @@ class BehaviorDashboardTests(unittest.TestCase):
             dashboard.ingest("NACK,FEED,JAMMED")
             for response, expected in (
                 ("NACK,CLEAR_JAM,FEED_ACTIVE", "current feed stops"),
-                ("NACK,CLEAR_JAM,NOT_JAMMED", "no jam is currently latched"),
             ):
                 with self.subTest(response=response):
                     dashboard._request_clear_jam()
@@ -481,6 +480,29 @@ class BehaviorDashboardTests(unittest.TestCase):
             dashboard.clear_jam_failed("Controller disconnected; jam remains active.")
             self.assertTrue(dashboard.feeder_jammed)
             self.assertIn("disconnected", dashboard._jam_detail.text())
+        finally:
+            dashboard.close()
+
+
+    def test_stop_followed_by_not_jammed_clears_live_alert_and_pending_request(self) -> None:
+        from squeakview.apps.operator.gui.dashboard import BehaviorDashboard
+        from squeakview.common.sensor_csv import format_controller_log
+
+        dashboard = BehaviorDashboard(window_sec=30.0, pellet_mode="auto")
+        try:
+            raw = "NACK,CLEAR_JAM,NOT_JAMMED"
+            formatted = format_controller_log(f"【SER】 {raw}").split("【SER】", 1)[1].strip()
+            for response in (raw, formatted):
+                dashboard.ingest("FEED_JAM,100,200,nan,1,0,0,0,Feeding,Jam")
+                dashboard._request_clear_jam()
+                dashboard.ingest("ACK_STOP,100,200,nan,0,0,0,0,Eligible,nan")
+                dashboard.ingest(response)
+                self.assertFalse(dashboard.feeder_jammed)
+                self.assertFalse(dashboard.clear_jam_pending)
+            window = mock.Mock(dashboard=dashboard)
+            dashboard.ingest("NACK,FEED,JAMMED")
+            MainWindow._on_clear_jam_finished(window, raw)
+            self.assertFalse(dashboard.feeder_jammed)
         finally:
             dashboard.close()
 

@@ -703,20 +703,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _on_clear_jam_finished(self, response: str) -> None:
-        if response == "ACK_CLEAR_JAM":
+        if response in {"ACK_CLEAR_JAM", "NACK,CLEAR_JAM,NOT_JAMMED"}:
             self.dashboard.clear_jam_alert()
-            self._emit_log("[GUI] Feeder jam latch cleared by ACK_CLEAR_JAM")
+            self._emit_log(f"[GUI] Controller confirms feeder jam latch is clear: {response}")
         elif response == "NACK,CLEAR_JAM,FEED_ACTIVE":
             message = (
                 "Clear Jam was rejected: wait until the current feed stops, "
                 "then inspect the mechanism and try again."
-            )
-            self.dashboard.clear_jam_failed(message)
-            self._emit_log(f"[GUI] {message}")
-        elif response == "NACK,CLEAR_JAM,NOT_JAMMED":
-            message = (
-                "The firmware reports that no jam is currently latched. "
-                "The warning remains active because no ACK_CLEAR_JAM was received."
             )
             self.dashboard.clear_jam_failed(message)
             self._emit_log(f"[GUI] {message}")

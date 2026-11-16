@@ -202,17 +202,20 @@ def finalize_run(
         and request.trigger_on
         and request.controller_started
     ):
-        drained = hooks.wait_for_capture_drain(
-            Path(run_dir),
-            expected_ttl_count=getattr(serial_handle, "stop_ack_count", None),
-        )
-        serial_handle.log_marker(
-            "CAPTURE_SOURCE_DRAINED" if drained else "CAPTURE_SOURCE_DRAIN_TIMEOUT"
-        )
-        if not drained:
-            capture_drain_error = (
-                "capture ledgers did not reach the controller TTL count and become quiet"
+        try:
+            drained = hooks.wait_for_capture_drain(
+                Path(run_dir),
+                expected_ttl_count=getattr(serial_handle, "stop_ack_count", None),
             )
+            serial_handle.log_marker(
+                "CAPTURE_SOURCE_DRAINED" if drained else "CAPTURE_SOURCE_DRAIN_TIMEOUT"
+            )
+            if not drained:
+                capture_drain_error = (
+                    "capture ledgers did not reach the controller TTL count and become quiet"
+                )
+        except Exception as exc:
+            capture_drain_error = f"capture drain failed: {type(exc).__name__}: {exc}"
 
     if stopping_capture and capture is not None:
         # Capture owns EOS/MP4 closure.  Validation can only begin after its
