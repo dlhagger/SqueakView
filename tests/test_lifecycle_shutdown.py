@@ -28,6 +28,14 @@ from squeakview.project import (
 from tests.support.lifecycle import BackendLifecycleCase, _runtime_context, FakeProcessHandle, FakeHungFinalizer, FakeSerialHandle
 
 class LifecycleShutdownTests(BackendLifecycleCase):
+    def test_sigterm_exit_explains_shutdown_failure_without_claiming_success(self):
+        self.assertTrue(self.backend.start_run(self.config()))
+        self.handle.returncode = -signal.SIGTERM
+        self.backend.stop_run()
+        self.assertEqual(self.status()["state"], "failed")
+        self.assertIn("terminated by SIGTERM", self.status()["error"])
+        self.assertIn("last [CLOSE] stage", self.status()["error"])
+
     def test_shutdown_coordinator_exception_fails_and_releases_lock(self) -> None:
         self.assertTrue(self.backend.start_run(self.config()))
         self.assertTrue(self.backend._acquisition_lock.held)

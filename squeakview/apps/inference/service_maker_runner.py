@@ -30,6 +30,7 @@ from .contracts import (
     _read_config_value,
     _validate_config,
 )
+from .capture_pipeline import CapturePipeline
 from .frame_audit import (
     FLIR_FRAME_META_DESCRIPTOR,
     FrameCsvOperator,
@@ -83,7 +84,7 @@ class ServiceMakerApp:
         self,
         config: InferenceConfig,
         *,
-        pipeline_factory: Callable[[str], Pipeline] = Pipeline,
+        pipeline_factory: Callable[[str], Pipeline] = CapturePipeline,
         probe_factory: Callable[[str, object], Probe] = Probe,
         system_telemetry_factory: Callable[..., SystemTelemetryRecorder] = SystemTelemetryRecorder,
     ):
@@ -368,6 +369,7 @@ class ServiceMakerApp:
         def close_pipeline_with_timeout(
             name: str, close_fn: Callable[[], object]
         ) -> bool:
+            _safe_print(f"[{ts()}] [CLOSE] beginning {name}")
             completed = threading.Event()
             failure: list[BaseException] = []
 
@@ -403,6 +405,7 @@ class ServiceMakerApp:
                 close_errors.append(detail)
                 _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
                 return False
+            _safe_print(f"[{ts()}] [CLOSE] completed {name}")
             return True
 
         if self.pipeline is not None and self._recording_integrity_failed:
@@ -422,6 +425,7 @@ class ServiceMakerApp:
         elif self.pipeline is not None:
             close_pipeline_with_timeout("capture pipeline stop", self.pipeline.stop)
             if self._pipeline_wait_thread is not None:
+                _safe_print(f"[{ts()}] [CLOSE] waiting for pipeline EOS and camera release")
                 self._pipeline_wait_thread.join(
                     timeout=max(0.0, stage_deadline - time.monotonic())
                 )
@@ -440,6 +444,8 @@ class ServiceMakerApp:
                     close_errors.append(
                         f"capture pipeline wait: {self._pipeline_wait_error}"
                     )
+                if not self._pipeline_wait_thread.is_alive() and self._pipeline_wait_error is None:
+                    _safe_print(f"[{ts()}] [CLOSE] pipeline EOS and camera release completed")
             else:
                 close_pipeline_with_timeout("capture pipeline wait", self.pipeline.wait)
         # A blocked monitor or callback can hold a writer lock even after a

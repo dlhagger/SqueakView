@@ -1182,6 +1182,25 @@ until its producers and consumers have finished. Native pipeline shutdown and
 resource cleanup have bounded waits, with explicit errors when a real acquisition
 failure prevents a complete drain. GUI recovery does not invoke that shutdown.
 
+Normal capture Stop requests `graceful-eos` on each FLIR source, then waits for
+the pipeline to drain and release its cameras before closing scientific ledgers.
+The source control only sets an atomic flag: a frame already in progress is
+delivered before EOS, and repeated requests cannot flush or cancel that drain.
+This avoids Service Maker's `Pipeline.stop()` binding, which holds Python's GIL
+while synchronously sending EOS and can block callbacks that need the GIL.
+The source plugin and Python code must be updated together; preflight rejects
+plugins missing `graceful-eos`. Rebuild with `bash scripts/build_native.sh` and
+restart SqueakView after updating.
+
+Capture logs include `[CLOSE]` stages for source drain, pipeline completion, and
+file closure. The supervisor still escalates after 30 seconds if capture cannot
+exit; a `-15` status means SIGTERM termination and remains a failed recording,
+with an explanation directing the operator to the last shutdown stage. This
+change does not turn incomplete recordings into successful ones. Bench-check
+repeated short and long recording/Stop cycles in both free-running and triggered
+modes, including Stop immediately after recording starts. Confirm exit code 0,
+no shutdown escalation, and passing recording/frame-count validation each time.
+
 Controller duplicate/conflict detection uses a disposable SQLite index beside
 the canonical JSONL journal, with a 512 KiB page cache rather than retaining all
 events in Python memory. It still checks arbitrarily old duplicates and sequence

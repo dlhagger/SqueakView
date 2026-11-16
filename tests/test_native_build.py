@@ -51,7 +51,7 @@ elif name == 'make':
 elif name == 'nm':
     print('00000000 T NvDsInferParseYolo26Pose')
 elif name == 'gst-inspect-1.0':
-    print('capture-health-path frame-manifest-path camera-telemetry-path error-log-path camera-runtime-path native-timing-validation')
+    print('capture-health-path frame-manifest-path camera-telemetry-path error-log-path camera-runtime-path native-timing-validation graceful-eos')
 ''')
         dispatcher.chmod(0o755)
         for command in ('cmake', 'ctest', 'make', 'ldd', 'nm', 'gst-inspect-1.0'):

@@ -93,7 +93,7 @@ static void handoff(GstElement*, GstBuffer*, GstPad*, gpointer user) {
   ++static_cast<DrainHarness*>(user)->delivered;
 }
 
-static void assert_pipeline_drains(unsigned sources, bool idle) {
+static void assert_pipeline_drains(unsigned sources, bool idle, bool property_stop = false) {
   GstElement* pipeline = gst_pipeline_new(nullptr);
   std::vector<DrainTestSrc*> cameras;
   for (unsigned index = 0; index < sources; ++index) {
@@ -131,11 +131,22 @@ static void assert_pipeline_drains(unsigned sources, bool idle) {
       h->changed.notify_all();
     }
   });
-  // Service Maker Pipeline.stop() uses precisely this external EOS entry point.
-  g_assert_true(gst_element_send_event(pipeline, gst_event_new_eos()));
-  // Repeated operator stop/EOS must not flush or duplicate the terminal event.
-  if (!g_getenv("SQUEAKVIEW_TEST_BASESRC_EOS")) {
+  if (property_stop) {
+    // This must return even while a source is blocked in its current read.
+    // Repeat and attempt cancellation: neither may discard the current frame.
+    for (auto* src : cameras) {
+      g_object_set(src, "graceful-eos", TRUE, nullptr);
+      g_object_set(src, "graceful-eos", TRUE, nullptr);
+      g_object_set(src, "graceful-eos", FALSE, nullptr);
+      gboolean requested = FALSE;
+      g_object_get(src, "graceful-eos", &requested, nullptr);
+      g_assert_true(requested);
+    }
+  } else {
     g_assert_true(gst_element_send_event(pipeline, gst_event_new_eos()));
+    if (!g_getenv("SQUEAKVIEW_TEST_BASESRC_EOS")) {
+      g_assert_true(gst_element_send_event(pipeline, gst_event_new_eos()));
+    }
   }
   for (auto* src : cameras) {
     if (!g_getenv("SQUEAKVIEW_TEST_BASESRC_EOS")) {
@@ -237,5 +248,8 @@ int main(int argc, char** argv) {
   g_test_add_func("/flir/eos/inflight-free-running", [] { assert_pipeline_drains(1, false); });
   g_test_add_func("/flir/eos/inflight-two-cameras", [] { assert_pipeline_drains(2, false); });
   g_test_add_func("/flir/eos/idle-triggered", [] { assert_pipeline_drains(1, true); });
+  g_test_add_func("/flir/eos/property-inflight", [] { assert_pipeline_drains(1, false, true); });
+  g_test_add_func("/flir/eos/property-two-cameras", [] { assert_pipeline_drains(2, false, true); });
+  g_test_add_func("/flir/eos/property-idle-triggered", [] { assert_pipeline_drains(1, true, true); });
   return g_test_run();
 }

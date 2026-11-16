@@ -275,7 +275,14 @@ def finalize_run(
                     "capture process exit was not confirmed; recording files were not validated"
                 )
         elif capture_returncode != 0:
-            failure_reasons.append(f"inference exit code {capture_returncode}")
+            detail = f"inference exit code {capture_returncode}"
+            if capture_returncode == -signal.SIGTERM:
+                detail += (
+                    ": recording process was terminated by SIGTERM before a clean exit. "
+                    "Check Events for 'still running' and the last [CLOSE] stage; "
+                    "recording integrity is not confirmed"
+                )
+            failure_reasons.append(detail)
 
     if run_dir and capture_returncode is not None:
         if phase == RunPhase.CAPTURE_CLOSED:

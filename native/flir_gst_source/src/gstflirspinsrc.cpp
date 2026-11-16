@@ -77,6 +77,7 @@ enum {
   PROP_NATIVE_TIMING_VALIDATION,
   PROP_FAULT_AFTER_FRAMES,
   PROP_FAULT_KIND,
+  PROP_GRACEFUL_EOS,
 };
 
 struct _GstFlirSpinSrc {
@@ -1016,6 +1017,13 @@ static void gst_flir_spin_src_set_property(GObject* object, guint prop_id, const
   GstFlirSpinSrc* self = GST_FLIR_SPIN_SRC(object);
 
   switch (prop_id) {
+    case PROP_GRACEFUL_EOS:
+      // Never wait on a streaming thread here: Python callers may hold the
+      // GIL needed by downstream probes. False cannot cancel an active drain.
+      if (g_value_get_boolean(value)) {
+        g_atomic_int_set(&self->graceful_eos_requested, TRUE);
+      }
+      break;
     case PROP_CAMERA_INDEX:
       self->camera_index = g_value_get_uint(value);
       break;
@@ -1106,6 +1114,9 @@ static void gst_flir_spin_src_get_property(GObject* object, guint prop_id, GValu
   GstFlirSpinSrc* self = GST_FLIR_SPIN_SRC(object);
 
   switch (prop_id) {
+    case PROP_GRACEFUL_EOS:
+      g_value_set_boolean(value, g_atomic_int_get(&self->graceful_eos_requested));
+      break;
     case PROP_NATIVE_TIMING_VALIDATION:
       g_value_set_boolean(value, TRUE);
       break;
@@ -2145,6 +2156,13 @@ static void gst_flir_spin_src_class_init(GstFlirSpinSrcClass* klass) {
           "native-timing-validation", "Native timing validation",
           "Validates native timestamps while writing the live frame manifest",
           TRUE, static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(
+      object_class,
+      PROP_GRACEFUL_EOS,
+      g_param_spec_boolean(
+          "graceful-eos", "Graceful end of stream",
+          "Request EOS after the current frame without blocking or flushing; reset on acquisition start",
+          FALSE, static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_PLAYING)));
   g_object_class_install_property(
       object_class,
       PROP_FAULT_KIND,
