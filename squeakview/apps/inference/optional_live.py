@@ -24,6 +24,7 @@ class OptionalLiveSession:
         self._temporary = None
         self._thread = None
         self._stop = threading.Event()
+        self._stop_requested = False
         self.state = "disabled"
         self._started = 0.0
         self.status_path = artifact_path(Path(config.run_dir), "diagnostics") / "live_status.json"
@@ -128,6 +129,11 @@ class OptionalLiveSession:
                 return
 
     def request_stop(self):
+        # Capture stop and final cleanup both call this. A second SIGINT can
+        # interrupt native teardown after the worker has reported completion.
+        if self._stop_requested:
+            return
+        self._stop_requested = True
         self._stop.set()
         try:
             if self.process and self.process.is_running():

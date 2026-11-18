@@ -91,6 +91,36 @@ class OptionalLiveTests(unittest.TestCase):
                     session._watch()
                 self.assertEqual(session.state, expected)
 
+    def test_capture_stop_then_cleanup_sends_only_one_interrupt(self):
+        session = self.session()
+        session.state = 'running'
+        session.process = mock.Mock()
+        session.process.is_running.return_value = True
+        session.process.wait.return_value = 0
+        session._temporary = mock.Mock()
+
+        # Capture requests a stop first. Cleanup runs after capture drains,
+        # while the live worker may still be releasing native resources.
+        session.request_stop()
+        session.close()
+        session.close()
+
+        session.process.send_signal_group.assert_called_once_with(signal.SIGINT)
+        self.assertEqual(session.state, 'completed')
+
+    def test_cleanup_preserves_signal_exit_failure_after_completed_status(self):
+        for code in (-signal.SIGINT, -signal.SIGABRT):
+            with self.subTest(code=code):
+                session = self.session()
+                session.state = 'running'
+                session.process = mock.Mock()
+                session.process.is_running.return_value = False
+                session.process.wait.return_value = code
+                with mock.patch('squeakview.common.run_context.read_json',
+                                return_value={'state': 'completed'}):
+                    session.close()
+                self.assertEqual(session.state, 'degraded')
+
     def test_stuck_shutdown_escalates_without_unlinking_live_mapping(self):
         session = self.session()
         session.process = mock.Mock()

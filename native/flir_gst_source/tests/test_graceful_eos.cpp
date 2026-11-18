@@ -259,7 +259,24 @@ static void live_source_timing_and_eos() {
   auto* sink = gst_element_factory_make("fakesink", nullptr);
   g_object_set(sink, "sync", FALSE, "async", FALSE, "signal-handoffs", TRUE, nullptr);
   std::atomic<unsigned> delivered{0};
-  g_signal_connect(sink, "handoff", G_CALLBACK(+[](GstElement*, GstBuffer* buffer, GstPad*, gpointer value) {
+  g_signal_connect(sink, "handoff", G_CALLBACK(+[](GstElement*, GstBuffer* buffer, GstPad* pad, gpointer value) {
+    // Check negotiated caps at buffer delivery, after BaseSrc negotiation.
+    // Setting caps in start() alone can later be replaced by template minima.
+    auto* caps = gst_pad_get_current_caps(pad);
+    g_assert_nonnull(caps);
+    const auto* structure = gst_caps_get_structure(caps, 0);
+    gint width = 0;
+    gint height = 0;
+    gint fps_n = 0;
+    gint fps_d = 0;
+    g_assert_true(gst_structure_get_int(structure, "width", &width));
+    g_assert_true(gst_structure_get_int(structure, "height", &height));
+    g_assert_true(gst_structure_get_fraction(structure, "framerate", &fps_n, &fps_d));
+    g_assert_cmpint(width, ==, 4);
+    g_assert_cmpint(height, ==, 4);
+    g_assert_cmpint(fps_n, ==, 30);
+    g_assert_cmpint(fps_d, ==, 1);
+    gst_caps_unref(caps);
     g_assert_cmpuint(GST_BUFFER_PTS(buffer), ==, 123456789);
     g_assert_cmpuint(GST_BUFFER_DURATION(buffer), ==, 33333333);
     ++*static_cast<std::atomic<unsigned>*>(value);

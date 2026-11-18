@@ -25,6 +25,18 @@ static void live_get(GObject* object, guint id, GValue* value, GParamSpec*) {
     case 5: g_value_set_boolean(value, g_atomic_int_get(&self->stopping)); break;
   }
 }
+static GstCaps* live_get_caps(GstBaseSrc* base, GstCaps* filter) {
+  auto* self = reinterpret_cast<GstSqueakLiveSrc*>(base);
+  // BaseSrc negotiates again after start(). Advertise the actual mailbox
+  // geometry so it cannot fixate the broad pad template to 1x1 at 1 FPS.
+  auto* caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "GRAY8",
+      "width", G_TYPE_INT, self->width, "height", G_TYPE_INT, self->height,
+      "framerate", GST_TYPE_FRACTION, self->fps, 1, nullptr);
+  if (!filter) return caps;
+  auto* intersected = gst_caps_intersect_full(filter, caps, GST_CAPS_INTERSECT_FIRST);
+  gst_caps_unref(caps);
+  return intersected;
+}
 static gboolean live_start(GstBaseSrc* base) {
   auto* self = reinterpret_cast<GstSqueakLiveSrc*>(base);
   g_atomic_int_set(&self->stopping, FALSE);
@@ -34,12 +46,7 @@ static gboolean live_start(GstBaseSrc* base) {
     GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ, ("Cannot open live mailbox"), ("%s", exc.what()));
     return FALSE;
   }
-  auto* caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "GRAY8",
-      "width", G_TYPE_INT, self->width, "height", G_TYPE_INT, self->height,
-      "framerate", GST_TYPE_FRACTION, self->fps, 1, nullptr);
-  gboolean ok = gst_base_src_set_caps(base, caps);
-  gst_caps_unref(caps);
-  return ok;
+  return TRUE;
 }
 static gboolean live_stop(GstBaseSrc* base) {
   auto* self = reinterpret_cast<GstSqueakLiveSrc*>(base);
@@ -95,6 +102,7 @@ static void gst_squeak_live_src_class_init(GstSqueakLiveSrcClass* klass) {
   g_object_class_install_property(object, 5, g_param_spec_boolean("graceful-eos", "EOS", "Nonblocking stop", FALSE,
       static_cast<GParamFlags>(flags | GST_PARAM_MUTABLE_PLAYING)));
   auto* base = GST_BASE_SRC_CLASS(klass);
+  base->get_caps = live_get_caps;
   base->start = live_start; base->stop = live_stop; base->unlock = live_unlock;
   GST_PUSH_SRC_CLASS(klass)->create = live_create;
   auto* element = GST_ELEMENT_CLASS(klass);
