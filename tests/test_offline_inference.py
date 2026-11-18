@@ -24,6 +24,32 @@ from squeakview.apps.inference.pose_pipeline import (
 
 
 class OfflineInferenceTests(unittest.TestCase):
+    def test_replay_accepts_proven_camera_gap_and_keeps_original_timestamps(self):
+        from tests.test_camera_gap_policy import write_gap, write_health, timed_video
+        write_gap(self.root)
+        write_health(self.root)
+        (self.root / 'raw.mp4').write_bytes(timed_video())
+        path = self.root / 'frames.csv'
+        path.write_text(
+            'stream_id,source_sequence_index,raw_frame_index,camera_frame_id,'
+            'camera_timestamp_ns,pts_ns,source_width,source_height,missing_frames_before\n'
+            '0,0,0,100,1000000000,0,1440,1080,0\n'
+            '0,1,1,101,1033333333,33333333,1440,1080,0\n'
+            '0,2,2,104,1133333333,133333333,1440,1080,2\n')
+        original = path.read_bytes()
+        ledger, width, height = _load_frame_ledger(path)
+        try:
+            self.assertEqual((width, height, len(ledger)), (1440, 1080, 3))
+            self.assertEqual(ledger[2]['camera_timestamp_ns'], 1133333333)
+            self.assertEqual(ledger[2]['pts_ns'], 133333333)
+            self.assertEqual(ledger[2]['camera_frame_id'], 104)
+        finally:
+            ledger.close()
+        self.assertEqual(path.read_bytes(), original)
+        (self.root / 'raw.mp4').write_bytes(timed_video((1000, 1000, 1000)))
+        with self.assertRaisesRegex(ValueError, 'cannot validate camera gaps'):
+            _load_frame_ledger(path)
+
     def test_offline_tracker_follows_selected_sdk(self):
         from squeakview.apps.inference import offline
         from squeakview import config as runtime_config

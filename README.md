@@ -18,12 +18,17 @@ unqualified until the acceptance gates below are completed.
 SqueakView treats the compressed camera recording as scientific ground truth:
 
 - The recording branch is non-leaky. It never intentionally drops a frame.
-- Inference is downstream-leaky so slow inference cannot backpressure recording.
-- GUI preview is leaky because it is only an operator spot check.
+- Inference and preview run in a disposable process. Camera acquisition exports
+  a replaceable latest frame through a nonblocking shared-memory mailbox.
+  A slow, stalled, or crashed consumer cannot hold the recording producer's lock.
 - Every recorded frame is reconciled against a durable source audit and the
   recording admission ledger.
 - Missed live inference can be recovered later on downstream compute by
   replaying `raw.mp4`.
+- Located camera drops are warnings when source identities, native timestamps,
+  MP4 presentation timestamps, and controller counts reconcile. Stored frame
+  ordinals remain contiguous; controller mappings include the missing triggers.
+  Unexplained losses, corrupt frames, and failed raw writes remain failures.
 
 `raw.mp4` is H.264-compressed with CPU `x264enc`. It is authoritative, but not
 an uncompressed sensor dump. CPU encoding is intentional because the Orin Nano
@@ -33,7 +38,8 @@ does not provide the hardware encoder used by larger Jetson modules.
 
 The Jetson is the acquisition appliance. Normal shutdown validates the final
 MP4 sample count against the durable capture, recording-admission, and
-controller totals without rereading the multi-gigabyte ledgers. Frame-level
+controller totals without rereading the multi-gigabyte ledgers. For gapped runs,
+it additionally checks the gap locations against MP4 timestamp tables. Frame-level
 reconciliation, controller timing alignment, exploratory notebooks,
 production-scale analysis, video transcoding, and offline re-inference are
 explicit analysis work and do not block safe recording closure.
@@ -696,13 +702,16 @@ the report and command exit explicitly passed or failed.
 
 ## Live DeepStream pipeline
 
-The validated single-camera path is:
+The acquisition and optional live paths are:
 
 ```text
-flirspinsrc → GRAY8 caps → tee
-  ├─ record queue (120 frames / 4 s minimum, non-leaky)
+Capture process:
+flirspinsrc → GRAY8 caps → record queue (120 frames / 4 s minimum, non-leaky)
   │    → x264enc (native GRAY8) → h264parse → mp4mux → raw.mp4
-  └─ inference queue (32 frames, downstream-leaky)
+  └─ nonblocking latest-frame mailbox (pixels + original identity/timestamps)
+
+Optional live process:
+squeakviewlivesrc → inference queue (32 frames, downstream-leaky)
        → VIC nvvideoconvert/surface-array NVMM-NV12 → nvstreammux v2
        → nvinfer/TensorRT → Python YOLO26 pose decode
        → CUDA NvDCF → [nvosdbin → nvstreamdemux when preview is enabled]
@@ -718,7 +727,8 @@ three-second backlog fails the run before the four-second queue can fill. If CPU
 encoding cannot sustain acquisition, the run therefore stops with explicit
 evidence instead of silently producing a plausible but incomplete video.
 
-This contract proves temporal frame completeness, not pixel-lossless storage.
+This contract preserves the timing of recorded frames and explicitly locates
+known camera gaps. It does not promise pixel-lossless storage.
 The current `x264enc` profile is bitrate-controlled H.264 with one reference
 frame, adaptive quantization disabled, no B-frames, and no lookahead. It is explicitly
 recorded as `pixel_fidelity: lossy` in `run_manifest.json`. Do not use it for an
@@ -727,9 +737,11 @@ profile has been implemented and throughput-qualified.
 
 SqueakView fails a run explicitly when it cannot preserve timing and data
 integrity. It does not silently continue with an incomplete but plausible video.
-The current production candidate has completed a validated 16-hour,
+The earlier pipeline completed a validated 16-hour,
 1,707,205-frame run at 1440×1080 and 30 FPS with zero recording drops, frame
 gaps, inference skips, or TTL mismatches.
+The isolated live pipeline and gap acceptance policy require fresh Jetson
+qualification. See [the hardening checks](docs/recording-hardening.md).
 
 The GUI/runtime can construct multiple camera branches, producing `raw.mp4` for
 camera zero and `raw_camN.mp4` for additional cameras. Multi-camera inference

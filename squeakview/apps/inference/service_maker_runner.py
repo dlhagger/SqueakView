@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -130,6 +131,7 @@ class ServiceMakerApp:
         self._storage_reserve_monitor: StorageReserveMonitor | None = None
         self._force_process_exit = False
         self._recording_integrity_failed = False
+        self.live_session = None
 
     def _system_telemetry_fault(self, message: str) -> None:
         """Persist observability loss immediately without aborting recording."""
@@ -148,9 +150,12 @@ class ServiceMakerApp:
             )
 
     def _recording_fault(self, message: str) -> None:
+        if self._recording_integrity_failed:
+            return
         self._recording_integrity_failed = True
         if self.exit_code == 0:
             self.exit_code = 4
+        _safe_print(encode_child_event("fatal", run_dir=str(self.run_dir), error=message))
         self._stop_event.set()
         _safe_print(f"[{ts()}] [RECORD] FATAL: {message}")
 
@@ -288,6 +293,8 @@ class ServiceMakerApp:
                     "capture may continue but this run cannot satisfy telemetry qualification"
                 )
             self._prewarm_cuda()
+            if self.live_session is not None:
+                self.live_session.start()
             self.pipeline.start(self._on_message)
             self._pipeline_wait_thread = threading.Thread(
                 target=self._watch_pipeline_end,
@@ -352,6 +359,8 @@ class ServiceMakerApp:
         # lifecycle callback raised before the normal stop request path.
         self._stop_event.set()
         close_errors: list[str] = []
+        if self.live_session is not None:
+            self.live_session.request_stop()
 
         try:
             shutdown_timeout_s = float(
@@ -408,21 +417,10 @@ class ServiceMakerApp:
             _safe_print(f"[{ts()}] [CLOSE] completed {name}")
             return True
 
-        if self.pipeline is not None and self._recording_integrity_failed:
-            # A blocked or failed loss-intolerant recording branch may make the
-            # native Service Maker stop call retain the GIL indefinitely.  The
-            # run is already invalid at this point, so flush the Python-owned
-            # scientific ledgers/status below and terminate without entering
-            # an unsafe native drain.  ``run`` uses os._exit only after those
-            # resources have been closed or their bounded cleanup has failed.
-            self._force_process_exit = True
-            detail = (
-                "capture pipeline native shutdown bypassed after a fatal "
-                "recording-integrity failure; capture is not valid"
-            )
-            close_errors.append(detail)
-            _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
-        elif self.pipeline is not None:
+        # CapturePipeline.stop now sets source EOS atomics, including after a
+        # recording fault. Try to save the MP4 tail before bounded escalation.
+        pipeline_drained = self.pipeline is None
+        if self.pipeline is not None:
             close_pipeline_with_timeout("capture pipeline stop", self.pipeline.stop)
             if self._pipeline_wait_thread is not None:
                 _safe_print(f"[{ts()}] [CLOSE] waiting for pipeline EOS and camera release")
@@ -445,9 +443,13 @@ class ServiceMakerApp:
                         f"capture pipeline wait: {self._pipeline_wait_error}"
                     )
                 if not self._pipeline_wait_thread.is_alive() and self._pipeline_wait_error is None:
+                    pipeline_drained = True
                     _safe_print(f"[{ts()}] [CLOSE] pipeline EOS and camera release completed")
             else:
-                close_pipeline_with_timeout("capture pipeline wait", self.pipeline.wait)
+                pipeline_drained = close_pipeline_with_timeout("capture pipeline wait", self.pipeline.wait)
+        if not pipeline_drained:
+            self._force_process_exit = True
+            close_errors.append("native drain unconfirmed; callback-owned writers left open until process exit")
         # A blocked monitor or callback can hold a writer lock even after a
         # failed native drain. Bound cleanup as a whole, rather than hanging
         # forever in join()/close() and preventing the supervisor from seeing
@@ -466,16 +468,19 @@ class ServiceMakerApp:
                 "storage reserve monitor",
                 self._storage_reserve_thread.join,
             )
-        if self.observations is not None:
-            close_resource("observations", self.observations.close)
-        for index, admission in enumerate(self.record_admissions):
-            close_resource(f"record admission {index}", admission.close)
-        for index, telemetry in enumerate(self.record_telemetry):
-            close_resource(f"record telemetry {index}", telemetry.close)
-        for index, boundary in enumerate(self.preview_boundaries):
-            close_resource(f"preview boundary {index}", boundary.close)
-        if self.frames is not None:
-            close_resource("frame ledger", self.frames.close)
+        # Native callbacks may still hold these resources after a failed drain.
+        # Closing them can race a late write and abort before failure is reported.
+        if pipeline_drained:
+            if self.observations is not None:
+                close_resource("observations", self.observations.close)
+            for index, admission in enumerate(self.record_admissions):
+                close_resource(f"record admission {index}", admission.close)
+            for index, telemetry in enumerate(self.record_telemetry):
+                close_resource(f"record telemetry {index}", telemetry.close)
+            for index, boundary in enumerate(self.preview_boundaries):
+                close_resource(f"preview boundary {index}", boundary.close)
+            if self.frames is not None:
+                close_resource("frame ledger", self.frames.close)
         close_resource("system telemetry", self.system_telemetry.stop)
 
         def write_capture_status() -> None:
@@ -518,7 +523,17 @@ def run(config: InferenceConfig) -> int:
         if config.run_dir is not None
         else None,
     )
-    app = ServiceMakerApp(config)
+    from .optional_live import OptionalLiveSession
+    live = OptionalLiveSession(config, emit=_safe_print)
+    mailboxes = live.prepare()
+    capture_config = replace(config, raw_only=True, enable_infer=False,
+                             preview_sockets=(), live_mailboxes=mailboxes)
+    try:
+        app = ServiceMakerApp(capture_config)
+    except BaseException:
+        live.close()
+        raise
+    app.live_session = live
 
     def _handle_signal(sig_num, _frame) -> None:
         app.request_stop()
@@ -526,8 +541,11 @@ def run(config: InferenceConfig) -> int:
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
-    app.build()
-    result = app.run()
+    try:
+        app.build()
+        result = app.run()
+    finally:
+        live.close()
     if app._force_process_exit:
         try:
             sys.stdout.flush()

@@ -233,6 +233,8 @@ def finalize_primary_tables(run_dir, camera_count=1):
     run_dir = Path(run_dir)
     if not is_primary_layout(run_dir):
         return
+    from .capture_gaps import GapIndex
+    gaps = GapIndex(run_dir)
     mapping = ClockMapping(run_dir)
     diagnostics = artifact_path(run_dir, "diagnostics")
     diagnostics.mkdir(parents=True, exist_ok=True)
@@ -271,8 +273,8 @@ def finalize_primary_tables(run_dir, camera_count=1):
                 if anchor[2:] != first[0][1:] or (previous is not None and anchor[1] <= previous[1]):
                     raise ValueError("controller camera timing anchors cross clocks or are not monotonic")
                 previous = anchor
-            frame_count = 0
             for stream in range(camera_count):
+                frame_count = 0
                 path = artifact_path(run_dir, "frames.csv" if stream == 0 else f"frames_cam{stream}.csv")
                 if not path.is_file():
                     raise ValueError(f"recorded frame ledger is missing: {path.name}")
@@ -284,7 +286,7 @@ def finalize_primary_tables(run_dir, camera_count=1):
                     sequence = int(row["source_sequence_index"])
                     raw = int(row["raw_frame_index"])
                     if len(first) == 1 and last is not None:
-                        count = first[0][0] + raw
+                        count = first[0][0] + gaps.trigger_offset(stream, raw)
                         left = index.execute("SELECT count,us,boot,session FROM anchors WHERE count<=? ORDER BY count DESC LIMIT 1", (count,)).fetchone()
                         right = index.execute("SELECT count,us,boot,session FROM anchors WHERE count>=? ORDER BY count LIMIT 1", (count,)).fetchone()
                         if left and right and left[2:] == right[2:] and left[2:] == first[0][1:] and right[1] >= left[1]:
@@ -292,12 +294,11 @@ def finalize_primary_tables(run_dir, camera_count=1):
                             row.update(controller_time_us=value, controller_time_method="exact_anchor" if left[0]==right[0] else "piecewise_interpolated", controller_boot_id=left[2], controller_session_id=left[3])
                     timing = {name: row.get(name, "") for name in TIMING_FIELDS + ["camera_timestamp_ns", "gst_pts_ns"]}
                     index.execute("INSERT INTO frames VALUES (?,?,?)", (stream, sequence, json.dumps(timing)))
-                    if stream == 0:
-                        frame_count += 1
+                    frame_count += 1
                     return row
                 _rewrite(path, frame_time)
-            if len(first) == 1 and last is not None and last[0] - first[0][0] + 1 != frame_count:
-                raise ValueError("controller/frame timing counts disagree")
+                if len(first) == 1 and last is not None and last[0] - first[0][0] + 1 != frame_count + gaps.missing_before(stream, frame_count - 1):
+                    raise ValueError(f"controller/frame timing counts disagree for camera {stream}")
             def detection_time(row):
                 match = index.execute("SELECT timing FROM frames WHERE stream=? AND sequence=?", (int(row["stream_id"]), int(row["source_sequence_index"]))).fetchone()
                 if match is None:

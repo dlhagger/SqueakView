@@ -73,6 +73,8 @@ def camera_source_properties(
     }
     if config.camera_serials:
         properties["camera-serial"] = config.camera_serials[index]
+    if config.raw_only and config.live_mailboxes:
+        properties["live-mailbox-path"] = str(config.live_mailboxes[index])
     if (
         config.failure_plan is not None
         and config.failure_plan.target == "flir_source"
@@ -205,6 +207,7 @@ def add_camera_recording_branch(
             ),
             "qos": False,
             "sync": False,
+            "async": False,
         },
     )
     record_chain: list[str] = [tee, record_queue]

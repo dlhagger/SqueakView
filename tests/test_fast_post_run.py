@@ -14,6 +14,27 @@ from squeakview.common import run_context
 
 
 class FastPostRunTests(unittest.TestCase):
+    def test_fast_finalizer_accepts_proven_gaps_without_accepting_unexplained_loss(self):
+        from tests.test_camera_gap_policy import write_health, write_gap, timed_video
+        write_health(self.root)
+        write_gap(self.root)
+        (self.root / 'raw.mp4').write_bytes(timed_video())
+        (self.root / 'frames.csv').write_text('stream_id,camera_serial,deepstream_frame_number,source_sequence_index\n0,camera,2,2\n')
+        (self.root / 'record_admission.csv').write_text('stream_id,record_frame_index,pts_ns\n0,2,133333333\n')
+        run_context.update_status(self.root, expected_ttl_count=5)
+        result = post_run.fast_finalize_run(self.root, camera_count=1)
+        self.assertTrue(result.validation_passed)
+        self.assertTrue(result.warnings)
+        status = run_context.read_json(self.root / 'run_status.json')
+        self.assertEqual(status['recording_quality'], 'complete_with_gaps')
+        self.assertFalse(status['recording_validation']['cameras'][0]['controller_count_matches'])
+        self.assertTrue(status['recording_validation']['cameras'][0]['controller_count_reconciled'])
+        run_context.update_status(self.root, expected_ttl_count=6)
+        self.assertFalse(post_run.fast_finalize_run(self.root, camera_count=1).validation_passed)
+        run_context.update_status(self.root, expected_ttl_count=5)
+        (self.root / 'raw.mp4').write_bytes(timed_video((1000, 1000, 1000)))
+        self.assertFalse(post_run.fast_finalize_run(self.root, camera_count=1).validation_passed)
+
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory()
         self.root = Path(self._temp.name)

@@ -293,6 +293,7 @@ if [ "$CAPTURE_BACKEND" = "flir_direct" ]; then
       && printf '%s' "$FLIR_PROPERTIES" | grep -q 'camera-runtime-path' \
       && printf '%s' "$FLIR_PROPERTIES" | grep -q 'native-timing-validation' \
       && printf '%s' "$FLIR_PROPERTIES" | grep -q 'graceful-eos' \
+      && printf '%s' "$FLIR_PROPERTIES" | grep -q 'live-mailbox-path' \
       && printf '%s' "$FLIR_PROPERTIES" | grep -q 'capture-health-path'; then
       pass "GStreamer element 'flirspinsrc' supports live scientific ledgers"
     else

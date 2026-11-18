@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from squeakview.common.run_layout import artifact_path, open_artifact
 from squeakview.common.capture_health import read_capture_health, source_path, health_path
+from squeakview.common.capture_gaps import known_missing_frames
 
 import json
 import csv
@@ -134,9 +135,18 @@ def wait_for_capture_drain(
             counts[offset] == counts[offset + 1]
             for offset in range(0, len(counts), 2)
         )
-        target_reached = expected_ttl_count is None or (
-            counts_valid and all(int(count) >= expected_ttl_count for count in counts)
-        )
+        # Lost camera frames can never arrive during drain. Accept only losses
+        # explicitly located by the source; finalization verifies their clocks
+        # against the MP4. Unexplained controller deficits still time out.
+        try:
+            target_reached = expected_ttl_count is None or (
+                counts_valid and all(
+                    int(counts[2 * stream]) + known_missing_frames(run_dir, stream)
+                    == expected_ttl_count for stream in range(camera_count)
+                )
+            )
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, csv.Error):
+            target_reached = False
         if ledgers_exist and pairs_match and target_reached and snapshot == previous:
             if stable_since is None:
                 stable_since = now

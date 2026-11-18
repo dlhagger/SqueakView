@@ -368,7 +368,7 @@ def _first_frame(path: Path) -> dict[str, str]:
 
 
 def _write_frames(
-    db: sqlite3.Connection, frames_path: Path, epoch: dict[str, Any],
+    db: sqlite3.Connection, frames_path: Path, epoch: dict[str, Any], *, gaps=None,
 ) -> dict[str, Any]:
     count = missing_ttl = mismatch_count = clock_pairs = gap_count = 0
     missing_camera_frames = 0
@@ -392,6 +392,8 @@ def _write_frames(
         ):
             camera_id = _required_uint(row, "camera_frame_id", source="frames.csv")
             raw_index = _required_uint(row, "raw_frame_index", source="frames.csv")
+            if gaps is not None and camera_id - first_camera != gaps.trigger_offset(0, raw_index):
+                raise RuntimeError("frame identity disagrees with located camera gaps")
             ttl = camera_id - int(epoch["camera_frame_id_offset"])
             high = db.execute(
                 "SELECT rp, unix_us, host_unix, host_mono FROM highs "
@@ -640,7 +642,26 @@ def build_alignment(
             "first_camera_timestamp_ns": _to_int(first_frame.get("camera_timestamp_ns")),
             "first_rp2040_time_us": first_high_rp,
         }
-        frames = _write_frames(db, frames_path, epoch)
+        from squeakview.common.capture_health import health_path, read_capture_health
+        from squeakview.common.capture_gaps import GapIndex
+        from .gap_validation import validate_gaps
+        gap_report = None
+        if health_path(run_dir).exists():
+            gap_report = validate_gaps(run_dir, 0, read_capture_health(run_dir, 0)['source_frames'])
+        located = bool(gap_report and gap_report['passed'] and gap_report['missing_frames'])
+        frames = _write_frames(db, frames_path, epoch, gaps=GapIndex(run_dir) if located else None)
+        known_missing = gap_report['missing_frames'] if located else 0
+        known_tail_missing = 0
+        if located:
+            for event in gap_report['events']:
+                start = event['expected_frame_id'] - epoch['camera_frame_id_offset']
+                end = event['actual_frame_id'] - epoch['camera_frame_id_offset']
+                highs = db.execute('SELECT COUNT(*) FROM highs WHERE count>=? AND count<? AND serial_index>?',
+                                   (start, end, epoch['start_marker_index'])).fetchone()[0]
+                if highs != event['missing_frames']:
+                    raise RuntimeError('camera gap has no matching controller triggers')
+                known_tail_missing += db.execute('SELECT COUNT(*) FROM highs WHERE count>=? AND count<? AND serial_index>?',
+                                                (start, end, epoch['shutdown_marker_index'])).fetchone()[0]
         epoch_highs = int(
             db.execute(
                 "SELECT COUNT(*) FROM highs WHERE serial_index>?",
@@ -702,20 +723,23 @@ def build_alignment(
             "clock_tolerance_us": tolerance, "clock_within_tolerance": within,
             "controller_high_events_in_epoch": epoch_highs,
             "controller_high_events_unmatched": unmatched_epoch_highs,
+            "known_missing_camera_frames": known_missing,
+            "known_missing_shutdown_tail_frames": known_tail_missing,
+            "gap_timestamps_validated": located,
             "shutdown_tail_high_events": shutdown_tail_highs,
             "shutdown_tail_high_events_unmatched": unmatched_shutdown_tail_highs,
             "boundary_tail_policy": (
-                "every CAMERA_HIGH after START_SENT through end-of-serial, including "
-                "events after CAPTURE_STOP_REQUESTED, must map to one recorded camera frame"
+                "every CAMERA_HIGH must map to a recorded frame or an explicitly "
+                "located camera gap with preserved video timestamps"
             ),
             "epoch_markers_complete": True,
             "validated": (
                 frames["missing_ttl"] == 0
                 and frames["mismatch_count"] == 0
-                and frames["gap_count"] == 0
-                and frames["count"] == epoch_highs
-                and unmatched_epoch_highs == 0
-                and unmatched_shutdown_tail_highs == 0
+                and (frames["gap_count"] == 0 or located)
+                and frames["count"] + known_missing == epoch_highs
+                and unmatched_epoch_highs == known_missing
+                and unmatched_shutdown_tail_highs == known_tail_missing
                 and within is not False
             ),
         })

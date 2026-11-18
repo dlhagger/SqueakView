@@ -62,12 +62,14 @@ CAMERA_STOP        exact timestamp and final trigger count
 For the current single-camera system:
 
 ```text
-controller_count = CAMERA_EPOCH.count + source_sequence_index
+controller_count = CAMERA_EPOCH.count + source_sequence_index + cumulative_missing_frames
 ```
 
 The final value must equal `CAMERA_STOP.count`. The acquisition finalizer also
-requires that this count equal the source, recording-admission, frame-ledger,
-and MP4 sample counts.
+requires received frames plus documented missing frames to equal controller
+triggers. Source, recording-admission, frame-ledger, and MP4 sample counts must
+agree with one another. Missing-frame locations must agree with the source
+diagnostic evidence; unexplained discrepancies are rejected.
 
 Anchor timestamps are exact controller measurements. Per-frame controller
 timestamps between anchors are piecewise-linear reconstructions. Keep the
@@ -104,7 +106,7 @@ anchors.to_parquet(OUT / "controller_camera_anchors.parquet", index=False)
 `load_v2_run` verifies the finalized status, recording validation, v2 manifest,
 transport integrity summary, contiguous durable sequences, one controller boot,
 camera epoch structure, frame ordinals, and final controller/frame count. It
-then adds these columns to `frames.csv`:
+then returns the frame table with these derived columns:
 
 ```text
 controller_count
@@ -114,8 +116,17 @@ controller_anchor_left_count
 controller_anchor_right_count
 controller_anchor_span_frames
 frame_time_s
+camera_time_s                 elapsed native camera time, preserving gaps
+controller_time_s             elapsed controller time, with the method above
 video_frame_index
 ```
+
+These columns are added to the returned DataFrame, without rewriting `frames.csv`.
+`camera_time_s` is derived only by subtracting the first measured camera timestamp.
+Use it for frame-to-frame camera timing. `controller_time_s` places frames on the
+controller/event timeline and can contain estimates. For compatibility,
+`frame_time_s` remains the plotting timeline: controller time when available,
+otherwise camera time. Keep `controller_time_method` when exporting estimates.
 
 `associate_events_to_frames` maps each non-camera controller message to the
 immediately preceding reconstructed frame and retains

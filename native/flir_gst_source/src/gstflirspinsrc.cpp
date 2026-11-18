@@ -14,6 +14,7 @@
 #include <string>
 #include <stdexcept>
 #include <vector>
+#include "live_mailbox.hpp"
 
 #include "Spinnaker.h"
 #include "SpinGenApi/SpinnakerGenApi.h"
@@ -78,6 +79,7 @@ enum {
   PROP_FAULT_AFTER_FRAMES,
   PROP_FAULT_KIND,
   PROP_GRACEFUL_EOS,
+  PROP_LIVE_MAILBOX_PATH,
 };
 
 struct _GstFlirSpinSrc {
@@ -103,6 +105,8 @@ struct _GstFlirSpinSrc {
   gboolean health_active;
   gchar* frame_manifest_path;
   FILE* frame_manifest;
+  gchar* live_mailbox_path;
+  squeakview::LiveMailbox* live_mailbox;
   gchar* camera_telemetry_path;
   FILE* camera_telemetry;
   gchar* error_log_path;
@@ -134,6 +138,8 @@ struct _GstFlirSpinSrc {
   gboolean chunks_enabled;
   guint consecutive_timeouts;
   guint64 total_timeouts;
+  guint64 total_missing_frames;
+  gboolean gap_mapping_validated;
   guint64 total_incomplete;
   guint64 total_frame_gaps;
   guint64 total_crc_failures;
@@ -743,6 +749,8 @@ static bool write_capture_health(GstFlirSpinSrc* self, bool closed) {
       << ",\"state\":\"" << (closed ? "closed" : "recording") << "\""
       << ",\"source_frames\":" << self->frame_count
       << ",\"total_timeouts\":" << self->total_timeouts
+      << ",\"total_missing_frames\":" << self->total_missing_frames
+      << ",\"gap_mapping_validated\":" << (self->gap_mapping_validated ? "true" : "false")
       << ",\"total_incomplete\":" << self->total_incomplete
       << ",\"total_frame_gap_events\":" << self->total_frame_gaps
       << ",\"total_crc_failures\":" << self->total_crc_failures
@@ -764,6 +772,9 @@ static bool write_capture_health(GstFlirSpinSrc* self, bool closed) {
 }
 
 static void close_camera(GstFlirSpinSrc* self) {
+  if (self->live_mailbox) self->live_mailbox->finish();
+  delete self->live_mailbox;
+  self->live_mailbox = nullptr;
   write_capture_health(self, true);
   self->health_active = FALSE;
   g_atomic_int_set(&self->stopping, TRUE);
@@ -958,6 +969,12 @@ static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
       return FALSE;
     }
 
+    if (self->live_mailbox_path && *self->live_mailbox_path) {
+      try { self->live_mailbox = new squeakview::LiveMailbox(self->live_mailbox_path); }
+      catch (const std::exception& exc) {
+        GST_WARNING_OBJECT(self, "Optional live export unavailable: %s", exc.what());
+      }
+    }
     (*self->camera)->BeginAcquisition();
     self->acquisition_started = TRUE;
     g_atomic_int_set(&self->stopping, FALSE);
@@ -973,6 +990,8 @@ static gboolean open_camera(GstFlirSpinSrc* self, std::string& error) {
     self->have_last_frame_id = FALSE;
     self->consecutive_timeouts = 0;
     self->total_timeouts = 0;
+    self->total_missing_frames = 0;
+    self->gap_mapping_validated = TRUE;
     self->total_incomplete = 0;
     self->total_frame_gaps = 0;
     self->total_crc_failures = 0;
@@ -1017,6 +1036,10 @@ static void gst_flir_spin_src_set_property(GObject* object, guint prop_id, const
   GstFlirSpinSrc* self = GST_FLIR_SPIN_SRC(object);
 
   switch (prop_id) {
+    case PROP_LIVE_MAILBOX_PATH:
+      g_free(self->live_mailbox_path);
+      self->live_mailbox_path = g_value_dup_string(value);
+      break;
     case PROP_GRACEFUL_EOS:
       // Never wait on a streaming thread here: Python callers may hold the
       // GIL needed by downstream probes. False cannot cancel an active drain.
@@ -1114,6 +1137,9 @@ static void gst_flir_spin_src_get_property(GObject* object, guint prop_id, GValu
   GstFlirSpinSrc* self = GST_FLIR_SPIN_SRC(object);
 
   switch (prop_id) {
+    case PROP_LIVE_MAILBOX_PATH:
+      g_value_set_string(value, self->live_mailbox_path);
+      break;
     case PROP_GRACEFUL_EOS:
       g_value_set_boolean(value, g_atomic_int_get(&self->graceful_eos_requested));
       break;
@@ -1204,6 +1230,7 @@ static void gst_flir_spin_src_finalize(GObject* object) {
   g_free(self->camera_serial);
   g_free(self->metadata_profile);
   g_free(self->capture_health_path);
+  g_free(self->live_mailbox_path);
   g_free(self->frame_manifest_path);
   g_free(self->camera_telemetry_path);
   g_free(self->error_log_path);
@@ -1378,11 +1405,17 @@ static GstFlowReturn copy_image_to_buffer(
     }
   }
   guint64 missing_frames_before = 0;
+  if (!camera_frame_id || !transport_timestamp_ns ||
+      (frame_id_delta_consistent && !*frame_id_delta_consistent))
+    self->gap_mapping_validated = FALSE;
   gboolean discontinuity = FALSE;
   if (camera_frame_id && self->have_last_frame_id && *camera_frame_id != self->last_frame_id + 1) {
     const guint64 expected = self->last_frame_id + 1;
     if (*camera_frame_id > expected) {
       missing_frames_before = *camera_frame_id - expected;
+      self->total_missing_frames += missing_frames_before;
+    } else {
+      self->gap_mapping_validated = FALSE;
     }
     discontinuity = TRUE;
     ++self->total_frame_gaps;
@@ -1416,7 +1449,13 @@ static GstFlowReturn copy_image_to_buffer(
             std::to_string(expected),
             std::to_string(*camera_frame_id),
             std::string("{\"missing_frames\":") +
-                std::to_string(missing_frames_before) + "}")) {
+                std::to_string(missing_frames_before) +
+                ",\"frame_index_before\":" + std::to_string(self->frame_count - 1) +
+                ",\"frame_index_after\":" + std::to_string(self->frame_count) +
+                ",\"camera_timestamp_before_ns\":" + std::to_string(self->last_camera_timestamp_ns) +
+                ",\"camera_timestamp_after_ns\":" + std::to_string(transport_timestamp_ns.value_or(0)) +
+                ",\"pts_before_ns\":" + std::to_string(self->last_camera_timestamp_ns - self->camera_timestamp_base) +
+                ",\"pts_after_ns\":" + std::to_string(transport_timestamp_ns.value_or(0) - self->camera_timestamp_base) + "}")) {
       GST_ELEMENT_ERROR(
           self, RESOURCE, WRITE, ("Failed to write camera diagnostic event"),
           ("path=%s", self->error_log_path ? self->error_log_path : ""));
@@ -1748,6 +1787,22 @@ static GstFlowReturn copy_image_to_buffer(
     return GST_FLOW_ERROR;
   }
 
+  // The replaceable live view is isolated from recording. Never wait for its
+  // consumer, propagate its errors, or export ownership of a recording buffer.
+  if (self->live_mailbox) {
+    GstMapInfo live_map;
+    if (gst_buffer_map(buffer, &live_map, GST_MAP_READ)) {
+      try {
+        self->live_mailbox->publish(live_map.data, live_map.size, metadata.str(),
+            self->actual_width, self->actual_height, pts, self->frame_duration);
+      } catch (const std::exception& exc) {
+        GST_WARNING_OBJECT(self, "Optional live export disabled: %s", exc.what());
+        delete self->live_mailbox;
+        self->live_mailbox = nullptr;
+      }
+      gst_buffer_unmap(buffer, &live_map);
+    }
+  }
   *out_buffer = buffer;
   return GST_FLOW_OK;
 }
@@ -2163,6 +2218,9 @@ static void gst_flir_spin_src_class_init(GstFlirSpinSrcClass* klass) {
           "graceful-eos", "Graceful end of stream",
           "Request EOS after the current frame without blocking or flushing; reset on acquisition start",
           FALSE, static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_PLAYING)));
+  g_object_class_install_property(object_class, PROP_LIVE_MAILBOX_PATH,
+      g_param_spec_string("live-mailbox-path", "Live mailbox", "Optional nonblocking latest-frame export",
+          "", static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(
       object_class,
       PROP_FAULT_KIND,
@@ -2207,6 +2265,8 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   self->metadata_profile = g_strdup(DEFAULT_METADATA_PROFILE);
   self->max_consecutive_timeouts = DEFAULT_MAX_CONSECUTIVE_TIMEOUTS;
   self->capture_health_path = g_strdup("");
+  self->live_mailbox_path = g_strdup("");
+  self->live_mailbox = nullptr;
   self->health_active = FALSE;
   self->frame_manifest_path = g_strdup("");
   self->frame_manifest = nullptr;
@@ -2240,6 +2300,8 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   self->chunks_enabled = FALSE;
   self->consecutive_timeouts = 0;
   self->total_timeouts = 0;
+  self->total_missing_frames = 0;
+  self->gap_mapping_validated = TRUE;
   self->total_incomplete = 0;
   self->total_frame_gaps = 0;
   self->total_crc_failures = 0;
@@ -2266,8 +2328,11 @@ static void gst_flir_spin_src_init(GstFlirSpinSrc* self) {
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
 }
 
+#include "live_source.inc"
+
 static gboolean plugin_init(GstPlugin* plugin) {
-  return gst_element_register(plugin, "flirspinsrc", GST_RANK_NONE, GST_TYPE_FLIR_SPIN_SRC);
+  return gst_element_register(plugin, "flirspinsrc", GST_RANK_NONE, GST_TYPE_FLIR_SPIN_SRC)
+      && gst_element_register(plugin, "squeakviewlivesrc", GST_RANK_NONE, gst_squeak_live_src_get_type());
 }
 
 GST_PLUGIN_DEFINE(

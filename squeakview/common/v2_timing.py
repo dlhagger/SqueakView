@@ -179,6 +179,8 @@ def camera_time(anchors, count, *, counts=None):
 
 def verify_v2_frame_timing(run_dir: Path, *, triggered: bool, camera_count: int) -> dict:
     """Verify source sequence, native clocks, and any exported timing mappings."""
+    from .capture_gaps import GapIndex
+    gaps = GapIndex(run_dir)
     from .run_outputs import ClockMapping
     if type(camera_count) is not int or not 1 <= camera_count <= 64:
         raise ValueError("invalid camera count")
@@ -195,6 +197,7 @@ def verify_v2_frame_timing(run_dir: Path, *, triggered: bool, camera_count: int)
         path = artifact_path(run_dir, "frames.csv" if stream == 0 else f"frames_cam{stream}.csv")
         count = 0
         previous_camera = None
+        missing = 0
         for row in csv.DictReader(bounded_csv_lines(path)):
             if (_uint(row["stream_id"], "stream_id") != stream or
                 _uint(row["source_sequence_index"], "source sequence") != count or
@@ -204,12 +207,15 @@ def verify_v2_frame_timing(run_dir: Path, *, triggered: bool, camera_count: int)
             if previous_camera is not None and native <= previous_camera:
                 raise ValueError("camera clock is not strictly increasing")
             previous_camera = native
+            missing += _uint(row.get("missing_frames_before") or "0", "missing camera frames")
+            if gaps.missing_before(stream, count) != missing:
+                raise ValueError("frame gap locations disagree with diagnostic evidence")
             if native_contract and 'controller_time_method' not in row:
                 _uint(row.get('host_unix_ns'), 'native host UTC timestamp')
                 _uint(row.get('host_monotonic_ns'), 'native host monotonic timestamp')
             if "controller_time_method" in row or require_exported:
                 if triggered:
-                    value, method = camera_time(anchors, anchors[0]["count"] + count, counts=counts)
+                    value, method = camera_time(anchors, anchors[0]["count"] + count + missing, counts=counts)
                 else:
                     expected = mapping.apply({"host_unix_ns": row["host_unix_ns"]})
                     value, method = expected["controller_time_us"], expected["controller_time_method"]
@@ -218,8 +224,8 @@ def verify_v2_frame_timing(run_dir: Path, *, triggered: bool, camera_count: int)
                 if method != "unavailable" and (str(row.get("controller_boot_id")) != str(timing.boot_id) or str(row.get("controller_session_id")) != str(timing.session_id)):
                     raise ValueError("frame mapping crosses controller clocks")
             count += 1
-        if not count or (expected_count is not None and count != expected_count):
+        if not count or (expected_count is not None and count + missing != expected_count):
             raise ValueError("controller/frame count mismatch")
-        cameras.append({"stream_id": stream, "frames": count})
+        cameras.append({"stream_id": stream, "frames": count, "missing_frames": missing})
     return {"schema_version": "1.0", "passed": True, "method": "v2_sparse_anchors" if triggered else "v2_behavior_session",
             "boot_id": timing.boot_id, "session_id": timing.session_id, "cameras": cameras}

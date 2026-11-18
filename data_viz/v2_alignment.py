@@ -328,10 +328,20 @@ def controller_events(journal: pd.DataFrame, anchors: pd.DataFrame, *, timing=No
     return events
 
 
-def align_frames_v2(frames: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFrame:
-    """Map single-camera frame ordinals onto sparse v2 camera anchors."""
+def _native_camera_times(frames: pd.DataFrame) -> pd.DataFrame:
+    """Expose camera elapsed time separately from controller estimates."""
+    values = pd.to_numeric(frames["camera_timestamp_ns"], errors="raise")
+    if (not np.isfinite(values).all() or values.lt(0).any()
+            or values.mod(1).ne(0).any() or not values.diff().dropna().gt(0).all()):
+        raise ValueError("camera timestamps are missing or not strictly increasing integers")
+    frames["camera_time_s"] = (values - values.iloc[0]) / 1_000_000_000.0
+    return frames
 
-    required = {"stream_id", "source_sequence_index", "raw_frame_index"}
+
+def align_frames_v2(frames: pd.DataFrame, anchors: pd.DataFrame, *, gaps=None) -> pd.DataFrame:
+    """Map received frames, including located camera holes, onto v2 anchors."""
+
+    required = {"stream_id", "source_sequence_index", "raw_frame_index", "camera_timestamp_ns"}
     missing = required.difference(frames.columns)
     if missing:
         raise ValueError(f"frames.csv is missing columns: {sorted(missing)}")
@@ -353,6 +363,18 @@ def align_frames_v2(frames: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFrame
     )
     if not np.array_equal(raw_index.to_numpy(), expected_index):
         raise ValueError("raw_frame_index is not contiguous from zero")
+    missing = pd.to_numeric(aligned.get("missing_frames_before",
+        pd.Series(0, index=aligned.index)), errors="raise").fillna(0)
+    if (not np.isfinite(missing).all() or missing.lt(0).any() or missing.mod(1).ne(0).any()):
+        raise ValueError("missing_frames_before must contain nonnegative integers")
+    missing_total = missing.astype(np.int64).cumsum().to_numpy()
+    stream = int(aligned.iloc[0]["stream_id"])
+    located = np.zeros(len(aligned), dtype=np.int64) if gaps is None else np.fromiter(
+        (gaps.missing_before(stream, int(index)) for index in expected_index),
+        dtype=np.int64, count=len(aligned))
+    if not np.array_equal(missing_total, located):
+        raise ValueError("frame gaps lack matching located diagnostic evidence")
+    aligned = _native_camera_times(aligned)
 
     epoch_count = int(anchors.iloc[0]["count"])
     stop_count = int(anchors.iloc[-1]["count"])
@@ -360,14 +382,14 @@ def align_frames_v2(frames: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFrame
         raise ValueError("first v2 camera anchor is not CAMERA_EPOCH")
     if str(anchors.iloc[-1]["record"]) != "CAMERA_STOP":
         raise ValueError("last v2 camera anchor is not CAMERA_STOP")
-    expected_stop = epoch_count + len(aligned) - 1
+    expected_stop = epoch_count + len(aligned) + int(missing_total[-1]) - 1
     if stop_count != expected_stop:
         raise ValueError(
             "controller/frame count mismatch: "
             f"CAMERA_STOP={stop_count}, expected={expected_stop}"
         )
 
-    controller_count = epoch_count + expected_index
+    controller_count = epoch_count + expected_index + missing_total
     unique_anchors = anchors.drop_duplicates("count", keep="first")
     anchor_count = unique_anchors["count"].to_numpy(dtype=np.int64)
     anchor_time = unique_anchors["timestamp_us"].to_numpy(dtype=np.int64)
@@ -397,6 +419,7 @@ def align_frames_v2(frames: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFrame
     aligned["frame_time_s"] = (
         estimated_time - int(anchors.iloc[0]["timestamp_us"])
     ) / 1_000_000.0
+    aligned["controller_time_s"] = aligned["frame_time_s"]
     aligned["video_frame_index"] = expected_index
     return aligned
 
@@ -410,9 +433,7 @@ def align_free_running_frames(frames: pd.DataFrame, *, epoch_us: int | None = No
     for key in ("source_sequence_index", "raw_frame_index"):
         if not np.array_equal(pd.to_numeric(frames[key], errors="raise"), expected):
             raise ValueError(f"{key} is not contiguous from zero")
-    native = pd.to_numeric(frames["camera_timestamp_ns"], errors="raise")
-    if not np.isfinite(native).all() or native.lt(0).any() or not native.diff().dropna().gt(0).all():
-        raise ValueError("camera timestamps are missing or not strictly increasing")
+    frames = _native_camera_times(frames)
     methods = frames.get("controller_time_method", pd.Series("unavailable", index=frames.index))
     if not methods.isin(["host_clock_estimate", "unavailable"]).all():
         raise ValueError("free-running frames claim unsupported controller timing")
@@ -423,10 +444,12 @@ def align_free_running_frames(frames: pd.DataFrame, *, epoch_us: int | None = No
     frames["frame_controller_us"] = times
     frames["controller_count"] = pd.Series(pd.NA, dtype="Int64", index=frames.index)
     frames["video_frame_index"] = expected
-    frames["frame_time_s"] = (native - native.iloc[0]) / 1_000_000_000.0
+    frames["frame_time_s"] = frames["camera_time_s"]
+    frames["controller_time_s"] = np.nan
     if epoch_us is not None:
         valid = times.notna()
         frames.loc[valid, "frame_time_s"] = (times.loc[valid] - epoch_us) / 1_000_000.0
+        frames.loc[valid, "controller_time_s"] = frames.loc[valid, "frame_time_s"]
     return frames
 
 
@@ -532,7 +555,8 @@ def load_v2_run(run_dir: Path) -> V2RunData:
             source_frames.loc[valid, 'controller_time_method'] = 'host_clock_estimate'
             source_frames.loc[valid, 'controller_boot_id'] = str(mapping.boot)
             source_frames.loc[valid, 'controller_session_id'] = str(mapping.session)
-    frames = (align_frames_v2(source_frames, anchors) if triggered else
+    from squeakview.common.capture_gaps import GapIndex
+    frames = (align_frames_v2(source_frames, anchors, gaps=GapIndex(run_dir)) if triggered else
               align_free_running_frames(source_frames, epoch_us=timing.start_us))
     events = controller_events(journal, anchors, timing=timing)
     from squeakview.common.lick_recovery import load_lick_recovery_gaps, observation_valid

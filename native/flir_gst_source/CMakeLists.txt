@@ -55,7 +55,12 @@ set_target_properties(gstflirspinsrc PROPERTIES
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(live_mailbox_test tests/test_live_mailbox.cpp)
+  target_compile_options(live_mailbox_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+  add_test(NAME live_mailbox_isolation COMMAND live_mailbox_test)
+  set_tests_properties(live_mailbox_isolation PROPERTIES TIMEOUT 10)
   add_executable(flir_source_eos_test tests/test_graceful_eos.cpp)
+  add_dependencies(flir_source_eos_test live_mailbox_test)
   target_include_directories(flir_source_eos_test SYSTEM PRIVATE
     /opt/spinnaker/include
     "${DEEPSTREAM_INCLUDES}"

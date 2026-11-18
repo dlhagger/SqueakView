@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from squeakview.common.run_layout import artifact_path
+from squeakview.common import run_context
 
 """Qt-free presentation policy and bounded readers for live run artifacts."""
 
@@ -44,6 +45,7 @@ class CaptureHealthSnapshot:
     waiting: int
     in_flight: int
     sensor_temperature_c: float | None
+    live_degraded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +84,13 @@ def present_finalization(status: dict[str, Any]) -> FinalizationPresentation:
         "finalized",
     }
     if passed and terminal_success:
+        warnings = list(status.get("recording_warnings") or [])
+        live = status.get("live_services") or {}
+        if live.get("state") == "degraded":
+            warnings.append("Live inference/preview unavailable; raw capture saved")
+        if warnings:
+            return FinalizationPresentation(True, "complete", "Complete with warnings",
+                                           "Capture saved · " + "; ".join(warnings), "warning")
         return FinalizationPresentation(
             True,
             "complete",
@@ -227,6 +236,8 @@ def scan_capture_health(run_path: Path) -> CaptureHealthSnapshot:
         waiting=_nonnegative_int(recording.get("waiting_for_record_admission")),
         in_flight=_nonnegative_int(recording.get("encoder_in_flight")),
         sensor_temperature_c=temperature_value,
+        live_degraded=(run_context.read_json(
+            artifact_path(Path(run_path), "run_status.json")).get("live_services") or {}).get("state") == "degraded",
     )
 
 
@@ -235,8 +246,9 @@ def present_capture_health(
     *,
     disk_text: str,
 ) -> CaptureHealthPresentation:
-    issues = snapshot.gaps + snapshot.incomplete + snapshot.dropped + snapshot.lost
-    level = "error" if issues else "warning" if snapshot.waiting >= 30 else "ok"
+    errors = snapshot.incomplete
+    warnings = snapshot.gaps + snapshot.dropped + snapshot.lost
+    level = "error" if errors else "warning" if warnings or snapshot.waiting >= 30 or snapshot.live_degraded else "ok"
     frame_text = f"{snapshot.frames:,}" if snapshot.frames > 0 else "--"
     temp_text = (
         f"{snapshot.sensor_temperature_c:.1f}°C"
@@ -246,7 +258,8 @@ def present_capture_health(
     return CaptureHealthPresentation(
         f"Frames {frame_text}  ·  Gaps {snapshot.gaps}  ·  "
         f"Queue {snapshot.waiting}/{snapshot.in_flight}  ·  "
-        f"Cam {temp_text}  ·  Disk {disk_text}",
+        f"Cam {temp_text}  ·  Disk {disk_text}"
+        + ("  ·  Live processing unavailable; raw recording continues" if snapshot.live_degraded else ""),
         level,
     )
 

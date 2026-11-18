@@ -448,6 +448,8 @@ class ObservationOperator(BatchMetadataOperator):
 
     def handle_metadata(self, batch_meta) -> None:
         with self._lock:
+            if self._closed:
+                return  # Optional live teardown may retire callbacks after failure.
             for frame_meta in batch_meta.frame_items:
                 frame_number = int(frame_meta.frame_number)
                 stream_id = int(getattr(frame_meta, "source_id", frame_meta.pad_index))

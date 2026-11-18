@@ -412,6 +412,9 @@ class RunManifestService:
             },
             "process_topology": {
                 "acquisition_owner": context.acquisition_owner,
+                "live_processing": "isolated_optional_process",
+                "live_transport": "nonblocking_latest_frame_mailbox",
+                "live_failure_policy": "continue_raw_video_and_controller_acquisition",
                 "gui_loss_policy": (
                     "continue_acquisition_and_recover_gui"
                     if context.acquisition_owner == DURABLE_SUPERVISOR_OWNER
@@ -522,7 +525,8 @@ class RunManifestService:
                     "rate_control": "bitrate-controlled",
                     "pixel_fidelity": "lossy",
                 },
-                "scientific_claim": "temporal_frame_completeness",
+                "scientific_claim": "timestamp_preserving_recording_with_explicit_camera_gaps",
+                "camera_gap_policy": "warn_if_located_and_timestamps_validated",
                 "record_queue_capacity_frames": buffer_policy.record_queue_frames,
                 "backpressure_warning_frames": buffer_policy.record_warning_frames,
                 "backpressure_failure_frames": buffer_policy.record_failure_frames,

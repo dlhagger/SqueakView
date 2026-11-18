@@ -233,4 +233,81 @@ def read_video_sample_table(path: Path) -> VideoSampleTable:
         return video_tables[0]
 
 
-__all__ = ["VideoSampleTable", "read_video_sample_table"]
+def read_video_timestamps(path: Path, indices: set[int]) -> tuple[int, dict[int, int]]:
+    """Read selected presentation timestamps in media ticks, without decoding.
+
+    This supplements structural validation for recordings with located gaps.
+    Edit lists do not affect differences between timestamps in the same track.
+    Both decode-time runs and composition offsets are accounted for.
+    """
+    if not indices or min(indices) < 0:
+        raise ValueError("timestamp sample indices must be nonnegative")
+    with Path(path).open("rb") as handle:
+        top = tuple(_boxes(handle, 0, Path(path).stat().st_size, depth=0))
+        moov = _one(top, b"moov", "movie box")
+        videos = []
+        for track in _children(handle, moov, depth=1):
+            if track.kind != b"trak":
+                continue
+            mdia = _one(_children(handle, track, depth=2), b"mdia", "track media box")
+            media = _children(handle, mdia, depth=3)
+            if _handler_type(handle, _one(media, b"hdlr", "handler")) == b"vide":
+                videos.append(media)
+        if len(videos) != 1:
+            raise ValueError("MP4 must contain exactly one video track")
+        media = videos[0]
+        mdhd = _one(media, b"mdhd", "media header")
+        version = _read_exact(handle, mdhd.payload_start, 1)[0]
+        offset = {0: 12, 1: 20}.get(version)
+        if offset is None or mdhd.payload_start + offset + 4 > mdhd.end:
+            raise ValueError("invalid MP4 media clock")
+        scale = struct.unpack(">I", _read_exact(handle, mdhd.payload_start + offset, 4))[0]
+        if scale == 0:
+            raise ValueError("MP4 media clock has zero timescale")
+        minf = _one(media, b"minf", "media information")
+        stbl = _one(_children(handle, minf, depth=4), b"stbl", "sample table")
+        boxes = _children(handle, stbl, depth=5)
+        stts = _one(boxes, b"stts", "decode timestamps")
+        total = _stts_count(handle, stts)
+        if max(indices) >= total:
+            raise ValueError("gap references a nonexistent video frame")
+        wanted = iter(sorted(indices))
+        target = next(wanted, None)
+        result = {}
+        sample, ticks = 0, 0
+        entries = (stts.end - stts.payload_start - 8) // 8
+        for entry in range(entries):
+            count, delta = struct.unpack(">II", _read_exact(handle, stts.payload_start + 8 + entry * 8, 8))
+            while target is not None and target < sample + count:
+                result[target] = ticks + (target - sample) * delta
+                target = next(wanted, None)
+            sample += count
+            ticks += count * delta
+        composition = [box for box in boxes if box.kind == b"ctts"]
+        if len(composition) > 1:
+            raise ValueError("duplicate MP4 composition timestamps")
+        if composition:
+            ctts = composition[0]
+            if ctts.end - ctts.payload_start < 8:
+                raise ValueError("truncated MP4 composition timestamps")
+            version = _read_exact(handle, ctts.payload_start, 1)[0]
+            entries = struct.unpack(">I", _read_exact(handle, ctts.payload_start + 4, 4))[0]
+            if version not in (0, 1) or ctts.end - ctts.payload_start != 8 + entries * 8:
+                raise ValueError("invalid MP4 composition timestamps")
+            wanted = iter(sorted(indices))
+            target = next(wanted, None)
+            sample = 0
+            for entry in range(entries):
+                count, offset = struct.unpack(">Ii" if version else ">II", _read_exact(handle, ctts.payload_start + 8 + entry * 8, 8))
+                if count == 0:
+                    raise ValueError("empty MP4 composition run")
+                while target is not None and target < sample + count:
+                    result[target] += offset
+                    target = next(wanted, None)
+                sample += count
+            if sample != total:
+                raise ValueError("MP4 composition sample count disagrees")
+        return scale, result
+
+
+__all__ = ["VideoSampleTable", "read_video_sample_table", "read_video_timestamps"]

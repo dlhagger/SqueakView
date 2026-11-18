@@ -7,11 +7,13 @@ from .run_layout import artifact_path
 from .run_outputs import ClockMapping
 from . import run_context
 from .v2_timing import read_v2_timing, camera_time
+from .capture_gaps import GapIndex
 
 
 class RowTiming:
     """Load synchronization evidence once, then map any number of CSV rows."""
     def __init__(self, run_dir):
+        self.gaps = GapIndex(run_dir)
         self.clock = ClockMapping(run_dir)
         path = artifact_path(run_dir, 'run_manifest.json')
         manifest = run_context.read_json_required(path) if path.exists() else {}
@@ -29,7 +31,8 @@ class RowTiming:
             raw = original.get('raw_frame_index', original.get('source_sequence_index'))
             if isinstance(raw, bool) or not str(raw).isascii() or not str(raw).isdecimal():
                 raise ValueError('frame row has no valid source sequence')
-            value, method = camera_time(self.anchors, self.anchors[0]['count'] + int(raw), counts=self.counts)
+            offset = self.gaps.trigger_offset(int(original.get('stream_id', 0)), int(raw))
+            value, method = camera_time(self.anchors, self.anchors[0]['count'] + offset, counts=self.counts)
             row.update(controller_time_us=value, controller_time_method=method,
                        controller_boot_id=self.timing.boot_id, controller_session_id=self.timing.session_id)
             for name in ('controller_time_us', 'controller_time_method', 'controller_boot_id', 'controller_session_id'):

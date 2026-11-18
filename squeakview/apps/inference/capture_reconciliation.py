@@ -210,6 +210,8 @@ def iter_admission_pts(path: Path, stream_id: int) -> Iterator[int]:
 def iter_native_capture_payloads(run_dir: Path, stream_id: int) -> Iterator[dict]:
     """Audit canonical frame identities/clocks without a second per-frame ledger."""
     from squeakview.common.bounded_csv import bounded_csv_lines
+    from squeakview.common.capture_gaps import GapIndex
+    gaps = GapIndex(run_dir)
     path = artifact_path(run_dir, "frames.csv" if stream_id == 0 else f"frames_cam{stream_id}.csv")
     previous_id = previous_pts = previous_time = None
     with_error = f"invalid canonical frame CSV: {path.name}"
@@ -227,12 +229,15 @@ def iter_native_capture_payloads(run_dir: Path, stream_id: int) -> Iterator[dict
                       ('payload_crc_valid', 'metadata_status')}
             if values['stream_id'] != stream_id or values['source_sequence_index'] != sequence:
                 raise ValueError('stream/sequence mismatch')
-            if (previous_id is not None and values['camera_frame_id'] != previous_id + 1
+            missing = values['missing_frames_before']
+            if missing != gaps.missing_before(stream_id, sequence) - gaps.missing_before(stream_id, sequence - 1):
+                raise ValueError('gap location disagrees with source diagnostics')
+            if (previous_id is not None and values['camera_frame_id'] != previous_id + 1 + missing
                     or previous_pts is not None and values['gst_pts_ns'] <= previous_pts
                     or previous_time is not None and values['camera_timestamp_ns'] <= previous_time):
                 raise ValueError('noncontiguous identity or nonincreasing clock')
             if (row['payload_crc_valid'] not in ('', '1', 'True')
-                    or values['missing_frames_before'] or row['metadata_status'] != 'ok'):
+                    or row['metadata_status'] != 'ok'):
                 raise ValueError('camera integrity fault')
         except (ValueError, KeyError, TypeError) as exc:
             raise RuntimeError(f'{with_error}:{sequence + 2}: {exc}') from exc

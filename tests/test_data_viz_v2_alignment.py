@@ -76,6 +76,46 @@ class LatestRunSelectionTests(unittest.TestCase):
 
 
 class V2AlignmentTests(unittest.TestCase):
+    def test_documented_camera_drop_preserves_native_times_and_skips_controller_trigger(self):
+        import csv
+        path = self.run_dir / 'frames.csv'
+        frames = pd.read_csv(path).iloc[[0, 2, 3]].copy()
+        frames['source_sequence_index'] = [0, 1, 2]
+        frames['raw_frame_index'] = [0, 1, 2]
+        frames['missing_frames_before'] = [0, 1, 0]
+        frames.to_csv(path, index=False)
+        original = path.read_bytes()
+        with (self.run_dir / 'diagnostics/errors.csv').open('w') as f:
+            writer = csv.writer(f)
+            writer.writerow(['event_type', 'stream_id', 'expected_frame_id', 'actual_frame_id', 'details'])
+            writer.writerow(['camera_frame_gap', 0, 102, 103, json.dumps(
+                dict(missing_frames=1, frame_index_before=0, frame_index_after=1))])
+        run = load_v2_run(self.run_dir)
+        self.assertEqual(run.frames['controller_count'].tolist(), [1, 3, 4])
+        self.assertEqual(run.frames['frame_controller_us'].tolist(), [1000, 3000, 4000])
+        self.assertEqual(run.frames['camera_timestamp_ns'].tolist(), [10, 30, 40])
+        self.assertEqual(run.frames['gst_pts_ns'].tolist(), [0, 2000000, 3000000])
+        self.assertEqual(run.frames['camera_time_s'].tolist(), [0, 20e-9, 30e-9])
+        self.assertEqual(run.frames['controller_time_s'].tolist(), [0, .002, .003])
+        self.assertEqual(path.read_bytes(), original)
+        (self.run_dir / 'diagnostics/errors.csv').unlink()
+        with self.assertRaisesRegex(ValueError, 'gap locations disagree'):
+            load_v2_run(self.run_dir)
+
+    def test_camera_elapsed_time_does_not_change_with_controller_interpolation(self):
+        run = load_v2_run(self.run_dir)
+        self.assertEqual(run.frames['camera_time_s'].tolist(), [0, 10e-9, 20e-9, 30e-9])
+        self.assertEqual(run.frames['controller_time_s'].tolist(), [0, .001, .002, .003])
+        self.assertEqual(run.frames['controller_time_method'].iloc[1], 'piecewise_interpolated')
+
+    def test_camera_elapsed_time_preserves_small_intervals_on_large_native_clock(self):
+        path = self.run_dir / 'frames.csv'
+        frames = pd.read_csv(path)
+        frames['camera_timestamp_ns'] = [2**60 + offset for offset in (0, 1, 3, 7)]
+        frames.to_csv(path, index=False)
+        run = load_v2_run(self.run_dir)
+        self.assertEqual(run.frames['camera_time_s'].tolist(), [0, 1e-9, 3e-9, 7e-9])
+
     def test_replay_reorders_analysis_without_rewriting_receipt_evidence(self) -> None:
         self.rows = [self.rows[i] for i in (0, 2, 3, 1, 4)]
         self._write_journal()

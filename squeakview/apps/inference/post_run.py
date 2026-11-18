@@ -43,6 +43,7 @@ from .inference_reconciliation import (
     open_index as _open_index,
 )
 from .video_probe import probe_video_frames
+from .gap_validation import validate_gaps
 
 
 PROGRESS_FILENAME = "post_run_progress.json"
@@ -267,7 +268,7 @@ def _durable_frame_manifest_counts(run_dir: Path, camera_count: int) -> dict[int
     return counts
 
 
-def _bounded_acquisition_integrity(run_dir: Path, camera_count: int) -> tuple[dict, bool]:
+def _bounded_acquisition_integrity(run_dir: Path, camera_count: int, gaps: dict | None = None) -> tuple[dict, bool]:
     """Validate source-owned cumulative fault counters from final ledger rows."""
 
     cameras: list[dict[str, object]] = []
@@ -301,7 +302,10 @@ def _bounded_acquisition_integrity(run_dir: Path, camera_count: int) -> tuple[di
                 "stream_id": stream_id,
                 **counters,
                 "native_timing_validated": payload.get('native_timing_validated') is True,
-                "passed": not any(counters.values()),
+                "passed": (counters["total_incomplete"] == 0
+                           and counters["total_crc_failures"] == 0
+                           and (counters["total_frame_gap_events"] == 0
+                                or bool(gaps and gaps[stream_id]["passed"]))),
             }
         )
     passed = bool(cameras) and all(camera["passed"] is True for camera in cameras)
@@ -309,7 +313,7 @@ def _bounded_acquisition_integrity(run_dir: Path, camera_count: int) -> tuple[di
         {
             "schema_version": "2.0",
             "validation_tier": "source_cumulative_counters",
-            "policy": "no_incomplete_frames_frame_gaps_or_payload_crc_failures",
+            "policy": "located_timestamp_preserving_gaps_allowed_no_corrupt_frames",
             "cameras": cameras,
             "passed": passed,
         },
@@ -366,6 +370,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
         cameras: list[dict[str, object]] = []
         source_counts: dict[int, int] = {}
         recorded_counts: dict[int, int] = {}
+        gaps: dict[int, dict] = {}
         for stream_id in range(camera_count):
             source_count, admitted_count = counts[stream_id]
             manifest_count = manifest_counts[stream_id]
@@ -373,6 +378,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
             recorded_counts[stream_id] = admitted_count
             video_path = artifact_path(run_dir, "raw.mp4" if stream_id == 0 else f"raw_cam{stream_id}.mp4")
             before = _video_metadata_identity(video_path)
+            gaps[stream_id] = validate_gaps(run_dir, stream_id, source_count)
             probe = probe_video_frames(video_path, expected_frames=admitted_count)
             after = _video_metadata_identity(video_path)
             raw_video_count = probe.get("count")
@@ -385,13 +391,16 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
             source_matches = source_count == admitted_count
             manifest_matches = manifest_count == admitted_count
             controller_matches = expected_ttl is None or source_count == expected_ttl
+            controller_reconciled = (gaps[stream_id]["passed"] and (
+                expected_ttl is None or source_count + gaps[stream_id]["missing_frames"] == expected_ttl))
             count_matches = video_count == admitted_count if video_count is not None else None
             error = probe.get("error")
             if not unchanged:
                 error = "recording changed during sample-count validation"
-            elif not controller_matches:
-                error = (
-                    f"camera metadata count {source_count} does not match "
+            elif not controller_reconciled:
+                error = gaps[stream_id]["error"] or (
+                    f"camera metadata count {source_count} plus known missing frames "
+                    f"{gaps[stream_id]['missing_frames']} does not match "
                     f"controller count {expected_ttl}"
                 )
             cameras.append(
@@ -405,6 +414,9 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
                     "source_count_matches": source_matches,
                     "frame_manifest_count_matches": manifest_matches,
                     "controller_count_matches": controller_matches,
+                    "controller_count_reconciled": controller_reconciled,
+                    "known_missing_frames": gaps[stream_id]["missing_frames"],
+                    "gap_timestamps_validated": gaps[stream_id]["passed"],
                     "nonzero_frame_count": bool(
                         source_count > 0 and admitted_count > 0 and (video_count or 0) > 0
                     ),
@@ -422,7 +434,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
             camera["exists"] is True
             and camera["source_count_matches"] is True
             and camera["frame_manifest_count_matches"] is True
-            and camera["controller_count_matches"] is True
+            and camera["controller_count_reconciled"] is True
             and camera["nonzero_frame_count"] is True
             and camera["frame_count_matches"] is True
             and camera["frame_count_error"] is None
@@ -440,7 +452,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
             "passed": recording_passed,
         }
         integrity_report, integrity_passed = _bounded_acquisition_integrity(
-            run_dir, camera_count
+            run_dir, camera_count, gaps
         )
         passed = recording_passed and integrity_passed
         reconciliation = {
@@ -459,6 +471,9 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
             ),
         }
         total = sum(recorded_counts.values())
+        missing = sum(gap["missing_frames"] for gap in gaps.values())
+        warnings = ([f"{missing} camera frame(s) missing; locations and video timestamps validated"]
+                    if missing and passed else [])
         run_context.write_status(
             run_dir,
             "capture_validated",
@@ -468,6 +483,17 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
             recording_validation_passed=recording_passed,
             recording_validation=recording_report,
             acquisition_integrity=integrity_report,
+            # The complete event list remains in the source diagnostic CSV.
+            # Keep the manifest bounded even for a long run with many holes.
+            frame_gaps={"schema_version": 1, "cameras": [
+                {**{key: value for key, value in gap.items() if key != "events"},
+                 "event_count": len(gap["events"]), "events_sample": gap["events"][:20],
+                 "events_artifact": str(artifact_path(run_dir, "diagnostics/errors.csv" if stream_id == 0
+                     else f"diagnostics/errors_cam{stream_id}.csv").relative_to(run_dir))}
+                for stream_id, gap in gaps.items()],
+                        "missing_frames": missing, "passed": all(g["passed"] for g in gaps.values())},
+            recording_quality=("complete_with_gaps" if missing else "complete") if passed else "invalid",
+            recording_warnings=warnings,
             overall_validation_passed=passed,
             capture_reconciliation=reconciliation,
             analysis_complete=False,
@@ -497,6 +523,7 @@ def fast_finalize_run(run_dir: Path, *, camera_count: int) -> FinalizationResult
                 "method": primary.get("frame_count_method"),
                 "error": primary.get("frame_count_error"),
             },
+            warnings=warnings,
         )
     except Exception as exc:
         run_context.write_status(run_dir, "finalization_failed", error=str(exc), overall_validation_passed=False)
@@ -538,6 +565,11 @@ def finalize_run(
         {"stage": "capture_reconciliation", "frames_processed": 0},
     )
     native_health = health_path(run_dir).exists()
+    native_validation = fast_finalize_run(run_dir, camera_count=camera_count) if native_health else None
+    if native_validation is not None and not native_validation.validation_passed:
+        return native_validation
+    native_status = run_context.read_json(artifact_path(run_dir, "run_status.json")) if native_health else {}
+    validated_gaps = {gap["stream_id"]: gap for gap in native_status.get("frame_gaps", {}).get("cameras", [])}
     initial_recording_evidence = capture_recording_evidence(
         run_dir, camera_count
     )
@@ -545,10 +577,15 @@ def finalize_run(
     stats = {stream_id: StreamStats() for stream_id in range(camera_count)}
     index = None
     operator = None
+    inference_error = None
     try:
         index = _open_index(temp_dir / "post_run.sqlite")
         if enable_infer:
-            _index_inference_frames(index, artifact_path(run_dir, "inference/frames.csv"))
+            try:
+                _index_inference_frames(index, artifact_path(run_dir, "inference/frames.csv"))
+            except Exception as exc:
+                inference_error = f"live inference evidence unavailable: {exc}"
+                enable_infer = False
         operator = FrameCsvOperator(
             temp_dir / "frames.csv",
             meta_type=0,
@@ -639,7 +676,7 @@ def finalize_run(
             for stream_id, (source_count, admitted_count) in _durable_ledger_counts(run_dir, camera_count).items():
                 if source_counts[stream_id] != source_count or recorded_counts[stream_id] != admitted_count:
                     raise RuntimeError('canonical frames/admission counts disagree with capture health')
-            if not _bounded_acquisition_integrity(run_dir, camera_count)[1]:
+            if not _bounded_acquisition_integrity(run_dir, camera_count, validated_gaps)[1]:
                 raise RuntimeError("capture health reports acquisition faults")
         reconciliation = {
             "schema_version": "1.0",
@@ -654,13 +691,17 @@ def finalize_run(
                 "recording branch"
             ),
         }
-        inference_summary = None
+        inference_summary = {"passed": False, "error": inference_error} if inference_error else None
         if enable_infer:
             run_context.write_status(run_dir, "finalizing", stage="inference_admission")
             qualification_barrier.wait_at_barrier(
                 run_dir, "finalizer:inference_admission"
             )
-            inference_summary = _summarize_inference_admission(index, recorded_counts)
+            try:
+                inference_summary = _summarize_inference_admission(index, recorded_counts)
+            except Exception as exc:
+                inference_error = f"live inference reconciliation unavailable: {exc}"
+                inference_summary = {"passed": False, "error": inference_error}
         if not native_health:
             _promote(
                 temp_dir,
@@ -743,8 +784,9 @@ def finalize_run(
             evidence=initial_recording_evidence,
         )
         report, recording_passed = result.to_dict(), result.passed
-        integrity_report, integrity_passed = _validate_acquisition_integrity(
-            run_dir, camera_count
+        integrity_report, integrity_passed = (
+            _bounded_acquisition_integrity(run_dir, camera_count, validated_gaps) if native_health
+            else _validate_acquisition_integrity(run_dir, camera_count)
         )
         # The finalizer does not make recording validity depend on optional
         # preview evidence. A missing/corrupt manifest is rejected later by
@@ -758,13 +800,21 @@ def finalize_run(
             else {}
         )
         preview_required = inference_manifest.get("preview_enabled") is True
-        preview_report = preview_attribution.reconcile_preview(
-            run_dir, camera_count, required=preview_required
-        )
+        try:
+            preview_report = preview_attribution.reconcile_preview(
+                run_dir, camera_count, required=preview_required
+            )
+        except Exception as exc:
+            preview_report = {"passed": False, "error": f"live preview evidence unavailable: {exc}"}
         inference_passed = bool(
             inference_summary is None or inference_summary.get("passed") is True
         )
-        passed = recording_passed and integrity_passed and inference_passed
+        passed = recording_passed and integrity_passed
+        warnings = list(native_validation.warnings) if native_validation else []
+        if not inference_passed:
+            warnings.append(inference_error or "Live inference reconciliation failed; raw capture remains valid")
+        if preview_required and preview_report.get("passed") is not True:
+            warnings.append(preview_report.get("error") or "Live preview reconciliation failed; raw capture remains valid")
         _update_progress(
             run_dir,
             stage=("recording_validation_complete" if passed else "recording_validation_failed"),
@@ -784,6 +834,7 @@ def finalize_run(
             capture_reconciliation=reconciliation,
             inference_admission=inference_summary,
             preview_attribution=preview_report,
+            recording_warnings=warnings,
         )
         level = "PASS" if passed else "ERROR"
         print(
@@ -803,6 +854,7 @@ def finalize_run(
             processed,
             passed,
             video_validation,
+            warnings=warnings,
         )
     except Exception as exc:
         run_context.write_status(run_dir, "finalization_failed", error=str(exc))
@@ -872,10 +924,10 @@ def align_run(
         ):
             failures.append("controller trigger epoch")
         if (
-            frame_alignment.get("controller_high_events_unmatched") != 0
-            or frame_alignment.get("shutdown_tail_high_events_unmatched") != 0
+            frame_alignment.get("controller_high_events_unmatched") != frame_alignment.get("known_missing_camera_frames", 0)
+            or frame_alignment.get("shutdown_tail_high_events_unmatched") != frame_alignment.get("known_missing_shutdown_tail_frames", 0)
             or frame_alignment.get("controller_high_events_in_epoch")
-            != counts.get("recorded_frames")
+            != (counts.get("recorded_frames", 0) + frame_alignment.get("known_missing_camera_frames", 0))
         ):
             failures.append("controller trigger/frame bijection")
         if validation.get("video_frame_count_matches_frames_csv") is not True:
@@ -888,7 +940,7 @@ def align_run(
         ):
             if int(validation.get(key) or 0) != 0:
                 failures.append(key)
-        if int(counts.get("frame_gaps_detected") or 0) != 0:
+        if int(counts.get("frame_gaps_detected") or 0) != 0 and frame_alignment.get("gap_timestamps_validated") is not True:
             failures.append("frame gaps")
         if failures:
             raise RuntimeError(f"alignment validation failed: {', '.join(failures)}")

@@ -1,0 +1,167 @@
+"""Disposable inference/preview process; acquisition never waits for its frames."""
+from __future__ import annotations
+
+from dataclasses import asdict
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+
+from squeakview.common import run_context
+from squeakview.common.run_layout import artifact_path
+
+
+class OptionalLiveSession:
+    def __init__(self, config, emit=print):
+        self.config = config
+        self.emit = emit
+        self.mailboxes: tuple[Path, ...] = ()
+        self.process = None
+        self._temporary = None
+        self._thread = None
+        self._stop = threading.Event()
+        self.state = "disabled"
+        self._started = 0.0
+        self.status_path = artifact_path(Path(config.run_dir), "diagnostics") / "live_status.json"
+
+    def _emit(self, message):
+        try:
+            self.emit(message)
+        except Exception:
+            pass
+
+    def _report(self, state, error=None):
+        self.state = state
+        payload = {"state": state, "error": error, "isolated_process": True,
+                   "inference_requested": self.config.enable_infer,
+                   "preview_requested": bool(self.config.preview_sockets),
+                   "recoverable_offline": True}
+        try:
+            run_context.update_status(Path(self.config.run_dir), live_services=payload)
+        except Exception as exc:
+            self._emit(f"[LIVE] WARN: cannot persist live service status: {exc}")
+        if error:
+            self._emit(f"[LIVE] WARN: {error}; raw video and controller acquisition continue")
+
+    def prepare(self):
+        if not (self.config.enable_infer or self.config.preview_sockets):
+            return self.mailboxes
+        try:
+            pixels = self.config.width * self.config.height
+            if not 0 < pixels <= 64 * 1024 * 1024:
+                raise ValueError("live frame exceeds mailbox capacity")
+            self._temporary = tempfile.TemporaryDirectory(prefix="squeakview-live-", dir="/dev/shm")
+            root = Path(self._temporary.name)
+            paths = []
+            for index in range(self.config.num_cameras):
+                path = root / f"camera{index}"
+                with path.open("xb") as handle:
+                    os.chmod(path, 0o600)
+                    # Allocate before triggers start. Never mmap sparse tmpfs
+                    # pages that could SIGBUS in the acquisition process.
+                    os.posix_fallocate(handle.fileno(), 0, 4096 + 65536 + pixels)
+                paths.append(path)
+            self.mailboxes = tuple(paths)
+            values = asdict(self.config)
+            values.update(raw_only=False, live_mailboxes=[str(path) for path in paths], failure_plan=None)
+            (root / "config.json").write_text(json.dumps(values, default=str))
+            self._report("starting")
+        except Exception as exc:
+            self.mailboxes = ()
+            self._report("degraded", f"live processing could not start: {exc}")
+        return self.mailboxes
+
+    def start(self):
+        if not self.mailboxes:
+            return
+        try:
+            self.status_path.parent.mkdir(parents=True, exist_ok=True)
+            self.status_path.unlink(missing_ok=True)
+            # ProcessHandle bounds diagnostic output and drains it independently
+            # of the operator GUI. Its output is NOT capture protocol input.
+            from squeakview.apps.operator.backend.supervision import spawn
+            self.process = spawn(
+                "squeakview.apps.inference.live_worker",
+                ["--config", str(Path(self._temporary.name) / "config.json")],
+                lambda _line: None, "optional live", workspace=Path(__file__).resolve().parents[3],
+                output_log_path=self.status_path.with_name("live_processing.log"),
+                parent_death_signal=signal.SIGKILL, keep_stdin_open=True,
+            )
+            self._started = time.monotonic()
+            self._thread = threading.Thread(target=self._watch, daemon=True, name="optional-live-watch")
+            self._thread.start()
+        except Exception as exc:
+            self._report("degraded", f"live processing launch failed: {exc}")
+            if self.process and self.process.is_running():
+                self.process.send_signal_group(signal.SIGKILL)
+
+    def _watch(self):
+        while not self._stop.wait(0.5):
+            try:
+                status = run_context.read_json(self.status_path)
+                if not self.process.is_running():
+                    code = self.process.wait(timeout=0)
+                    # A source EOS just before normal capture shutdown is okay.
+                    # Native teardown can still abort after writing that status.
+                    if code == 0 and status.get("state") == "completed":
+                        self._report("completed")
+                    else:
+                        self._report("degraded", f"live process exited ({code}): {status.get('error') or 'see live_processing.log'}")
+                    return
+                now = time.monotonic()
+                heartbeat = status.get("heartbeat_monotonic")
+                if status.get("state") == "running" and self.state == "starting":
+                    self._report("running")
+                if ((heartbeat is None and now - self._started > 60)
+                        or (heartbeat is not None and now - float(heartbeat) > 10)):
+                    self._report("degraded", "live processing stopped responding")
+                    self.process.send_signal_group(signal.SIGKILL)
+                    return
+            except Exception as exc:
+                self._report("degraded", f"live processing monitor failed: {exc}")
+                if self.process and self.process.is_running():
+                    self.process.send_signal_group(signal.SIGKILL)
+                return
+
+    def request_stop(self):
+        self._stop.set()
+        try:
+            if self.process and self.process.is_running():
+                self.process.send_signal_group(signal.SIGINT)
+        except Exception as exc:
+            self._report("degraded", f"live stop request failed: {exc}")
+
+    def close(self):
+        # Optional teardown must not mask the capture result, even when its
+        # status/log filesystem or child process handle has failed.
+        try:
+            self._close()
+        except Exception as exc:
+            self._report("degraded", f"live cleanup failed: {exc}")
+
+    def _close(self):
+        self.request_stop()
+        if self._thread:
+            self._thread.join(timeout=1)
+        if self.process:
+            for sig, timeout in ((None, 1), (signal.SIGTERM, 1), (signal.SIGKILL, 0.5)):
+                if sig and self.process.is_running():
+                    self.process.send_signal_group(sig)
+                try:
+                    code = self.process.wait(timeout=timeout)
+                    if code and self.state != "degraded":
+                        self._report("degraded", f"live processing needed forced shutdown ({code})")
+                    elif self.state not in {"degraded", "disabled"}:
+                        self._report("completed")
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            else:
+                self._report("degraded", "live process exit remains unconfirmed")
+                return  # Do not remove mapped storage while the consumer lives.
+        if self._temporary:
+            self._temporary.cleanup()

@@ -35,6 +35,9 @@ class InferenceConfig:
     enable_infer: bool = True
     run_dir: Path | None = None
     failure_plan: FailurePlan | None = None
+    # Internal graph roles. The public runner always isolates live processing.
+    raw_only: bool = False
+    live_mailboxes: tuple[Path, ...] = ()
 
 
 def _config_text(config_path: Path) -> str:
@@ -157,6 +160,8 @@ def validate_config(config: InferenceConfig) -> None:
             f"({len(config.preview_sockets)}) does not match camera count "
             f"({config.num_cameras})"
         )
+    if config.live_mailboxes and len(config.live_mailboxes) != config.num_cameras:
+        raise ValueError("live mailbox count must match camera count")
     if config.failure_plan is not None:
         validate_failure_plan(config.failure_plan)
         if config.failure_plan.stream_id >= config.num_cameras:

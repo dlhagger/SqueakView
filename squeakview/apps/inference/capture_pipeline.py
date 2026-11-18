@@ -18,7 +18,7 @@ class CapturePipeline(Pipeline):
 
     def add(self, type_name, name, properties=None):
         super().add(type_name, name, properties)
-        if type_name == "flirspinsrc":
+        if type_name in {"flirspinsrc", "squeakviewlivesrc"}:
             # Reject stale plugins before recording starts, not at Stop.
             if self[name].get("graceful-eos") is not False:
                 raise RuntimeError(

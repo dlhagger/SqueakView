@@ -175,6 +175,9 @@ class OfflineFrameLedger(Mapping[int, dict[str, int | None]]):
 
 
 def _load_frame_ledger(path: Path) -> tuple[OfflineFrameLedger, int, int]:
+    from squeakview.common.capture_gaps import GapIndex
+    gaps = GapIndex(path.parent)
+    missing_total = 0
     ledger = OfflineFrameLedger()
     width: int | None = None
     height: int | None = None
@@ -239,11 +242,15 @@ def _load_frame_ledger(path: Path) -> tuple[OfflineFrameLedger, int, int]:
                 raise ValueError(
                     "frames.csv row is missing camera FrameID, camera timestamp, or PTS"
                 )
+            missing = _int_value(row, "missing_frames_before") or 0
+            missing_total += missing
+            if missing_total != gaps.missing_before(0, ordinal):
+                raise ValueError("frames.csv camera gaps disagree with located diagnostic evidence")
             if (
                 previous_camera_frame_id is not None
-                and camera_frame_id != previous_camera_frame_id + 1
+                and camera_frame_id != previous_camera_frame_id + 1 + missing
             ):
-                raise ValueError("frames.csv camera FrameIDs are not contiguous")
+                raise ValueError("frames.csv camera FrameIDs have an unexplained gap or regression")
             if previous_camera_timestamp is not None and camera_timestamp <= previous_camera_timestamp:
                 raise ValueError("frames.csv camera timestamps are not strictly increasing")
             if previous_pts is not None and pts_ns <= previous_pts:
@@ -265,6 +272,11 @@ def _load_frame_ledger(path: Path) -> tuple[OfflineFrameLedger, int, int]:
             ledger.insert_many(batch)
         if not len(ledger) or width is None or height is None:
             raise ValueError(f"frame ledger is empty: {path}")
+        if missing_total:
+            from .gap_validation import validate_gaps
+            report = validate_gaps(path.parent, 0, len(ledger))
+            if not report["passed"]:
+                raise ValueError(f"offline replay cannot validate camera gaps: {report['error']}")
         return ledger, width, height
     except Exception:
         ledger.close()
@@ -326,7 +338,7 @@ class OfflineInferenceApp:
         self.video_path = artifact_path(self.run_dir, "raw.mp4")
         self.frames_path = artifact_path(self.run_dir, "frames.csv")
         self.serial_path = artifact_path(self.run_dir, "serial.csv")
-        self.errors_path = artifact_path(self.run_dir, "diagnostics") / "errors.csv"
+        self.errors_path = artifact_path(self.run_dir, "diagnostics/errors.csv")
         manifest_path = artifact_path(self.run_dir, "run_manifest.json")
         manifest = _read_json(manifest_path) if manifest_path.exists() else {}
         serial = manifest.get("serial", {})
@@ -336,6 +348,9 @@ class OfflineInferenceApp:
         if serial.get("enabled", True) and serial.get("controller_protocol", "legacy") not in {"legacy", "watchdog_v1_experimental", "v2"}:
             raise ValueError("unsupported controller protocol for offline replay")
         self.timing_inputs = {"run_manifest": manifest_path}
+        from squeakview.common.capture_health import health_path
+        if health_path(self.run_dir).exists():
+            self.timing_inputs['capture_health'] = health_path(self.run_dir)
         if serial.get("enabled", True) and serial.get("controller_protocol") == "v2":
             for name in ("controller_v2.jsonl", "controller_v2_summary.json", "clock_validation.json"):
                 self.timing_inputs[name] = artifact_path(self.run_dir, "diagnostics/" + name)

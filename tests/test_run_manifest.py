@@ -229,7 +229,7 @@ class RunManifestServiceTests(unittest.TestCase):
         self.assertIsNone(result["expected_outputs"]["alignment_summary"])
         self.assertEqual(
             result["recording"]["scientific_claim"],
-            "temporal_frame_completeness",
+            "timestamp_preserving_recording_with_explicit_camera_gaps",
         )
         self.assertEqual(result["actual_outputs"], {"inventory": "snapshot"})
         self.assertEqual(result["bottles"], {"complete": True})

@@ -31,6 +31,33 @@ from squeakview.common.failure_injection import FailurePlan
 from tests.support.service_maker_runner import ServiceMakerCase, FakePipeline
 
 class CaptureGraphTests(ServiceMakerCase):
+    def test_raw_graph_does_not_construct_inference_preview_or_gpu_mux(self):
+        app, pipeline = self.build(self.config(raw_only=True, enable_infer=False,
+                                               live_mailboxes=(self.root / 'mailbox',)))
+        try:
+            kinds = {node[0] for node in pipeline.nodes.values()}
+            self.assertFalse(kinds & {'nvstreammux', 'nvinfer', 'nvtracker', 'nvunixfdsink', 'squeakviewlivesrc'})
+            self.assertIn('flirspinsrc', kinds)
+            self.assertIn('mp4mux', kinds)
+            self.assertEqual(app._ready_origin, 'record_sink0')
+            self.assertFalse(pipeline.nodes['record_sink0'][1]['async'])
+            self.assertIsNone(app.frames)
+            self.assertEqual(pipeline.nodes['flirsrc0'][1]['live-mailbox-path'], str(self.root / 'mailbox'))
+        finally:
+            app.stop()
+
+    def test_live_graph_cannot_open_cameras_or_write_raw_recordings(self):
+        with mock.patch.object(frame_audit, '_flir_frame_meta_type', return_value=1):
+            app, pipeline = self.build(self.config(enable_infer=False, live_mailboxes=(self.root / 'mailbox',)))
+        try:
+            kinds = {node[0] for node in pipeline.nodes.values()}
+            self.assertIn('squeakviewlivesrc', kinds)
+            self.assertFalse(kinds & {'flirspinsrc', 'x264enc', 'mp4mux', 'filesink'})
+            self.assertEqual(app.record_admissions, [])
+            self.assertEqual(app.record_telemetry, [])
+        finally:
+            app.stop()
+
     def test_live_tracker_and_metadata_loader_follow_selected_sdk(self):
         from squeakview import config as runtime_config
         for version in ('9.1', '9.2'):

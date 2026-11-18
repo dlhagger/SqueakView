@@ -87,7 +87,7 @@ class CaptureShutdownTests(unittest.TestCase):
             self.assertTrue(self.app._force_process_exit)
             status = run_context.read_json(self.app.run_dir / "run_status.json")
             errors = status["capture_close_errors"]
-            self.assertTrue(any("record admission 0" in error and "timed out" in error for error in errors))
+            self.assertTrue(any("native drain unconfirmed" in error for error in errors))
             self.assertNotEqual(status["capture_exit_code"], 0)
         finally:
             release.set()

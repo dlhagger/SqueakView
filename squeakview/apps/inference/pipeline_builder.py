@@ -33,7 +33,7 @@ class PipelineResources:
 
     pipeline: object
     ready_origin: str
-    frames: FrameCsvOperator
+    frames: FrameCsvOperator | None
     observations: ObservationOperator | None
     admissions: tuple[RecordingAdmissionOperator, ...]
     recording_telemetry: tuple[RecordingPathTelemetry, ...]
@@ -59,6 +59,16 @@ def build_pipeline(
     observations: ObservationOperator | None = None
     try:
         pipeline = pipeline_factory("squeakview")
+        if config.raw_only:
+            for index in range(config.num_cameras):
+                add_camera_recording_branch(
+                    pipeline, config, run_dir, primary_raw_video, index,
+                    probe_factory=probe_factory, on_recording_fault=on_recording_fault,
+                    register_admission=admissions.append,
+                    register_telemetry=telemetry.append,
+                )
+            return PipelineResources(pipeline, "record_sink0", None, None,
+                                     tuple(admissions), tuple(telemetry), ())
         pipeline.add(
             "nvstreammux",
             "mux",
@@ -78,6 +88,14 @@ def build_pipeline(
             },
         )
         for index in range(config.num_cameras):
+            if config.live_mailboxes:
+                source = f"live_source{index}"
+                pipeline.add("squeakviewlivesrc", source, {
+                    "mailbox-path": str(config.live_mailboxes[index]),
+                    "width": config.width, "height": config.height, "fps": config.fps,
+                })
+                add_inference_input_branch(pipeline, config, index, source)
+                continue
             recording = add_camera_recording_branch(
                 pipeline,
                 config,

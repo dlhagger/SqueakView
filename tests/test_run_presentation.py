@@ -126,7 +126,7 @@ class RunPresentationPolicyTests(unittest.TestCase):
         self.assertEqual(snapshot.lost, 1)
         self.assertEqual(snapshot.dropped, 0)
         self.assertIsNone(snapshot.sensor_temperature_c)
-        self.assertEqual(presentation.level, "error")
+        self.assertEqual(presentation.level, "warning")
         self.assertIn("Frames --", presentation.text)
 
     def test_concurrent_partial_rows_fall_back_to_latest_complete_samples(self) -> None:

@@ -31,6 +31,17 @@ from squeakview.common.failure_injection import FailurePlan
 from tests.support.service_maker_runner import ServiceMakerCase, FakePipeline
 
 class CaptureShutdownTests(ServiceMakerCase):
+    def test_failed_native_wait_does_not_close_writers_under_live_callbacks(self):
+        app = runner.ServiceMakerApp(self.config(enable_infer=False))
+        app.pipeline = mock.Mock()
+        app.pipeline.wait.side_effect = RuntimeError('native wait failed')
+        admission = mock.Mock()
+        app.record_admissions = [admission]
+        app.stop()
+        admission.close.assert_not_called()
+        self.assertTrue(app._force_process_exit)
+        self.assertNotEqual(app.exit_code, 0)
+
     def test_safe_print_cannot_break_shutdown_when_parent_pipe_is_closed(self) -> None:
         with mock.patch("builtins.print", side_effect=BrokenPipeError):
             runner._safe_print("shutdown")
@@ -126,21 +137,26 @@ class CaptureShutdownTests(ServiceMakerCase):
         self.assertIn("timed out", status["capture_close_error"])
 
 
-    def test_recording_integrity_fault_bypasses_native_pipeline_shutdown(self) -> None:
+    def test_recording_integrity_fault_notifies_supervisor_and_drains_video(self) -> None:
         app = runner.ServiceMakerApp(self.config(enable_infer=False))
         pipeline = mock.Mock()
         app.pipeline = pipeline
 
-        app._recording_fault("recording queue backlog reached fatal threshold")
-        app.stop()
+        with mock.patch.object(runner, "_safe_print") as output:
+            app._recording_fault("recording queue backlog reached fatal threshold")
+            app._recording_fault("duplicate fault")
+            app.stop()
 
-        pipeline.stop.assert_not_called()
-        pipeline.wait.assert_not_called()
+        pipeline.stop.assert_called_once_with()
+        pipeline.wait.assert_called_once_with()
         self.assertEqual(app.exit_code, 4)
-        self.assertTrue(app._force_process_exit)
+        self.assertFalse(app._force_process_exit)
         status = run_context.read_json(app.run_dir / "run_status.json")
         self.assertEqual(status["capture_exit_code"], 4)
-        self.assertIn("native shutdown bypassed", status["capture_close_error"])
+        events = [decode_child_event(call.args[0]) for call in output.call_args_list]
+        fatal = [event for event in events if event is not None and event.type == "fatal"]
+        self.assertEqual(len(fatal), 1)
+        self.assertIn("recording queue", fatal[0].payload["error"])
 
 
     def test_storage_reserve_fault_uses_normal_pipeline_drain(self) -> None:

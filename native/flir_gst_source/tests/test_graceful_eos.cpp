@@ -218,6 +218,7 @@ static void compact_capture_health_contract() {
   // A whole day's count still occupies one bounded object, not a ledger.
   src->frame_count = 2592000;
   src->total_crc_failures = 1;
+  src->total_missing_frames = 2;
   close_camera(src);
   g_assert_true(g_file_get_contents(path, &data, &length, nullptr));
   g_assert_cmpuint(length, <, 1024);
@@ -225,6 +226,8 @@ static void compact_capture_health_contract() {
   g_assert_nonnull(std::strstr(data, "\"source_frames\":2592000"));
   g_assert_nonnull(std::strstr(data, "\"total_crc_failures\":1"));
   g_assert_nonnull(std::strstr(data, "\"native_timing_validated\":true"));
+  g_assert_nonnull(std::strstr(data, "\"gap_mapping_validated\":true"));
+  g_assert_nonnull(std::strstr(data, "\"total_missing_frames\":2"));
   g_assert_null(std::strstr(data, "camera_timestamp_ns"));
   g_free(data);
   // Failed checkpoint publication is reported; no partial file is published.
@@ -239,12 +242,55 @@ static void compact_capture_health_contract() {
   g_free(directory);
 }
 
+static void live_source_timing_and_eos() {
+  gchar* path = nullptr;
+  int fd = g_file_open_tmp("squeakview-live-source-XXXXXX", &path, nullptr);
+  g_assert_cmpint(fd, >=, 0);
+  g_assert_cmpint(posix_fallocate(fd, 0, squeakview::LIVE_HEADER_CAPACITY +
+      squeakview::LIVE_METADATA_CAPACITY + 16), ==, 0);
+  close(fd);
+  squeakview::LiveMailbox publisher(path);
+  uint8_t pixels[16]{};
+  g_assert_true(publisher.publish(pixels, 16, "{\"source_sequence_index\":42}",
+                                4, 4, 123456789, 33333333));
+  auto* pipeline = gst_pipeline_new(nullptr);
+  auto* source = GST_ELEMENT(g_object_new(gst_squeak_live_src_get_type(),
+      "mailbox-path", path, "width", 4U, "height", 4U, nullptr));
+  auto* sink = gst_element_factory_make("fakesink", nullptr);
+  g_object_set(sink, "sync", FALSE, "async", FALSE, "signal-handoffs", TRUE, nullptr);
+  std::atomic<unsigned> delivered{0};
+  g_signal_connect(sink, "handoff", G_CALLBACK(+[](GstElement*, GstBuffer* buffer, GstPad*, gpointer value) {
+    g_assert_cmpuint(GST_BUFFER_PTS(buffer), ==, 123456789);
+    g_assert_cmpuint(GST_BUFFER_DURATION(buffer), ==, 33333333);
+    ++*static_cast<std::atomic<unsigned>*>(value);
+  }), &delivered);
+  gst_bin_add_many(GST_BIN(pipeline), source, sink, nullptr);
+  g_assert_true(gst_element_link(source, sink));
+  g_assert_cmpint(gst_element_set_state(pipeline, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!delivered && std::chrono::steady_clock::now() < deadline) g_usleep(1000);
+  g_assert_cmpuint(delivered.load(), ==, 1);
+  g_object_set(source, "graceful-eos", TRUE, nullptr);
+  auto* bus = gst_element_get_bus(pipeline);
+  auto* message = gst_bus_timed_pop_filtered(bus, 3 * GST_SECOND,
+      static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+  g_assert_nonnull(message);
+  g_assert_cmpint(GST_MESSAGE_TYPE(message), ==, GST_MESSAGE_EOS);
+  gst_message_unref(message);
+  gst_object_unref(bus);
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_object_unref(pipeline);
+  unlink(path);
+  g_free(path);
+}
+
 int main(int argc, char** argv) {
   gst_init(&argc, &argv);
   g_test_init(&argc, &argv, nullptr);
   g_test_add_func("/flir/timing/live-native-validation", native_timestamp_contract);
   g_test_add_func("/flir/health/compact-checkpoint-and-close", compact_capture_health_contract);
   g_test_add_func("/flir/eos/production-boundary", production_eos_boundary);
+  g_test_add_func("/live/source/timestamps-and-eos", live_source_timing_and_eos);
   g_test_add_func("/flir/eos/inflight-free-running", [] { assert_pipeline_drains(1, false); });
   g_test_add_func("/flir/eos/inflight-two-cameras", [] { assert_pipeline_drains(2, false); });
   g_test_add_func("/flir/eos/idle-triggered", [] { assert_pipeline_drains(1, true); });
