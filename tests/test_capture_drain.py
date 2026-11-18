@@ -98,6 +98,7 @@ class CaptureDrainCoordinatorTests(unittest.TestCase):
             expected_ttl_count=10,
             quiet_s=0.5,
             timeout_s=8.0,
+            maximum_s=60.0,
         )
         self.assertEqual(write_status.call_count, 2)
         self.assertEqual(write_status.call_args_list[0].args, (run_dir, "capture_draining"))

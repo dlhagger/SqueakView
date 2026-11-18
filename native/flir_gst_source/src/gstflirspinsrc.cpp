@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <vector>
 #include "live_mailbox.hpp"
+#include "pipeline_state.hpp"
 
 #include "Spinnaker.h"
 #include "SpinGenApi/SpinnakerGenApi.h"
@@ -80,6 +81,7 @@ enum {
   PROP_FAULT_KIND,
   PROP_GRACEFUL_EOS,
   PROP_LIVE_MAILBOX_PATH,
+  PROP_PIPELINE_NULL,
 };
 
 struct _GstFlirSpinSrc {
@@ -1137,6 +1139,9 @@ static void gst_flir_spin_src_get_property(GObject* object, guint prop_id, GValu
   GstFlirSpinSrc* self = GST_FLIR_SPIN_SRC(object);
 
   switch (prop_id) {
+    case PROP_PIPELINE_NULL:
+      g_value_set_boolean(value, owning_pipeline_is_null(GST_ELEMENT(self)));
+      break;
     case PROP_LIVE_MAILBOX_PATH:
       g_value_set_string(value, self->live_mailbox_path);
       break;
@@ -2211,6 +2216,10 @@ static void gst_flir_spin_src_class_init(GstFlirSpinSrcClass* klass) {
           "native-timing-validation", "Native timing validation",
           "Validates native timestamps while writing the live frame manifest",
           TRUE, static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(object_class, PROP_PIPELINE_NULL,
+      g_param_spec_boolean("pipeline-null", "Pipeline NULL",
+          "Owning pipeline reached NULL with no pending transition", FALSE,
+          static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(
       object_class,
       PROP_GRACEFUL_EOS,

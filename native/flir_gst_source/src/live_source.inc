@@ -23,6 +23,7 @@ static void live_get(GObject* object, guint id, GValue* value, GParamSpec*) {
     case 3: g_value_set_uint(value, self->height); break;
     case 4: g_value_set_uint(value, self->fps); break;
     case 5: g_value_set_boolean(value, g_atomic_int_get(&self->stopping)); break;
+    case 6: g_value_set_boolean(value, owning_pipeline_is_null(GST_ELEMENT(self))); break;
   }
 }
 static GstCaps* live_get_caps(GstBaseSrc* base, GstCaps* filter) {
@@ -101,6 +102,9 @@ static void gst_squeak_live_src_class_init(GstSqueakLiveSrcClass* klass) {
   g_object_class_install_property(object, 4, g_param_spec_uint("fps", "FPS", "Nominal FPS; native PTS preserved", 1, 1000, 30, flags));
   g_object_class_install_property(object, 5, g_param_spec_boolean("graceful-eos", "EOS", "Nonblocking stop", FALSE,
       static_cast<GParamFlags>(flags | GST_PARAM_MUTABLE_PLAYING)));
+  g_object_class_install_property(object, 6, g_param_spec_boolean("pipeline-null", "Pipeline NULL",
+      "Owning pipeline reached NULL with no pending transition", FALSE,
+      static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
   auto* base = GST_BASE_SRC_CLASS(klass);
   base->get_caps = live_get_caps;
   base->start = live_start; base->stop = live_stop; base->unlock = live_unlock;

@@ -10,13 +10,13 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from .recording import RecordingActivity
+from .recording_activity import RecordingActivity
 
 
 class RecordingActivitySource(Protocol):
     stream_id: int
 
-    def activity(self) -> RecordingActivity: ...
+    def try_activity(self) -> RecordingActivity | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,17 +71,28 @@ class RecordingLivenessMonitor:
         self._monotonic_ns = monotonic_ns
 
     def run(self) -> None:
+        unavailable_since: dict[int, int] = {}
         while not self._stop_event.wait(self.policy.poll_interval_s):
             now_ns = self._monotonic_ns()
             for source in self._sources:
                 try:
-                    activity = source.activity()
+                    activity = source.try_activity()
                 except Exception as exc:
                     self._on_fatal(
                         "recording liveness telemetry failed on stream "
                         f"{source.stream_id}: {type(exc).__name__}: {exc}"
                     )
                     return
+                if activity is None:
+                    since = unavailable_since.setdefault(source.stream_id, now_ns)
+                    if now_ns - since >= self.policy.effective_timeout_ns:
+                        self._on_fatal(
+                            f"recording telemetry snapshot unavailable for {self.policy.configured_timeout_s:.1f}s "
+                            f"on stream {source.stream_id}; a recording callback may be blocked"
+                        )
+                        return
+                    continue
+                unavailable_since.pop(source.stream_id, None)
                 last_source = activity.last_source_monotonic_ns
                 if (
                     activity.source_count > 0

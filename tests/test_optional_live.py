@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 from squeakview.apps.inference.contracts import InferenceConfig
 from squeakview.apps.inference.optional_live import OptionalLiveSession
@@ -107,6 +108,43 @@ class OptionalLiveTests(unittest.TestCase):
 
         session.process.send_signal_group.assert_called_once_with(signal.SIGINT)
         self.assertEqual(session.state, 'completed')
+
+    def test_fresh_heartbeat_but_stalled_output_kills_only_optional_worker(self):
+        session = self.session()
+        session.prepare()
+        session.process = mock.Mock()
+        session.process.is_running.return_value = True
+        session.process.wait.return_value = -9
+        session._stop = mock.Mock()
+        session._stop.wait.return_value = False
+        statuses = [{'state': 'running', 'heartbeat_monotonic': now, 'frames_processed': [0]}
+                    for now in (0, 5, 10)]
+        with mock.patch('squeakview.common.run_context.read_json', side_effect=statuses), \
+             mock.patch('squeakview.apps.inference.optional_live.mailbox_sequence', side_effect=[10, 20, 30]), \
+             mock.patch('squeakview.apps.inference.optional_live.time.monotonic', side_effect=[0, 5, 10]):
+            session._watch()
+        self.assertEqual(session.state, 'degraded')
+        session.process.send_signal_group.assert_called_once_with(signal.SIGKILL)
+
+    def test_capture_progress_detects_stall_even_when_mailbox_publication_is_stuck(self):
+        session = self.session()
+        session.prepare()
+        source = mock.Mock()
+        source.try_activity.side_effect = [SimpleNamespace(source_count=n) for n in (10, 20)]
+        session.recording_sources = (source,)
+        session.process = mock.Mock()
+        session.process.is_running.return_value = True
+        session.process.wait.return_value = -9
+        session._stop = mock.Mock()
+        session._stop.wait.return_value = False
+        with mock.patch('squeakview.common.run_context.read_json', side_effect=[
+                {'state': 'running', 'heartbeat_monotonic': now, 'frames_processed': [0]}
+                for now in (0, 10)]), \
+             mock.patch('squeakview.apps.inference.optional_live.mailbox_sequence', return_value=0), \
+             mock.patch('squeakview.apps.inference.optional_live.time.monotonic', side_effect=[0, 10]):
+            session._watch()
+        self.assertEqual(session.state, 'degraded')
+        session.process.send_signal_group.assert_called_once_with(signal.SIGKILL)
 
     def test_cleanup_preserves_signal_exit_failure_after_completed_status(self):
         for code in (-signal.SIGINT, -signal.SIGABRT):

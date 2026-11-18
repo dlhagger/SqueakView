@@ -160,7 +160,7 @@ def add_camera_recording_branch(
         source_caps,
         probe_factory(f"record_ingress{index}", RecordingIngressOperator(telemetry)),
     )
-    admission = RecordingAdmissionOperator(admission_path, index, telemetry)
+    admission = RecordingAdmissionOperator(admission_path, index, telemetry, on_fatal=on_recording_fault)
     register_admission(admission)
     pipeline.attach(
         record_queue,
@@ -218,7 +218,7 @@ def add_camera_recording_branch(
             fault_name,
             probe_factory(
                 f"fault_record_queue_stall{index}",
-                RecordingStallOperator(failure.after_frames, failure.delay_us),
+                RecordingStallOperator(failure.after_frames, failure.delay_us, on_fatal=on_recording_fault),
             ),
         )
         record_chain.append(fault_name)

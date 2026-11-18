@@ -301,9 +301,32 @@ static void live_source_timing_and_eos() {
   g_free(path);
 }
 
+static void pipeline_null_state_contract() {
+  for (GType type : {GST_TYPE_FLIR_SPIN_SRC, gst_squeak_live_src_get_type()}) {
+    GstElement* pipeline = gst_pipeline_new(nullptr);
+    GstElement* source = GST_ELEMENT(g_object_new(type, nullptr));
+    gboolean confirmed = TRUE;
+    // An orphaned source cannot prove anything about pipeline closure.
+    g_object_get(source, "pipeline-null", &confirmed, nullptr);
+    g_assert_false(confirmed);
+    gst_bin_add(GST_BIN(pipeline), source);
+    g_object_get(source, "pipeline-null", &confirmed, nullptr);
+    g_assert_true(confirmed);
+    // READY does not acquire a camera or open a mailbox.
+    g_assert_cmpint(gst_element_set_state(pipeline, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+    g_object_get(source, "pipeline-null", &confirmed, nullptr);
+    g_assert_false(confirmed);
+    g_assert_cmpint(gst_element_set_state(pipeline, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+    g_object_get(source, "pipeline-null", &confirmed, nullptr);
+    g_assert_true(confirmed);
+    gst_object_unref(pipeline);
+  }
+}
+
 int main(int argc, char** argv) {
   gst_init(&argc, &argv);
   g_test_init(&argc, &argv, nullptr);
+  g_test_add_func("/capture/pipeline-null", pipeline_null_state_contract);
   g_test_add_func("/flir/timing/live-native-validation", native_timestamp_contract);
   g_test_add_func("/flir/health/compact-checkpoint-and-close", compact_capture_health_contract);
   g_test_add_func("/flir/eos/production-boundary", production_eos_boundary);

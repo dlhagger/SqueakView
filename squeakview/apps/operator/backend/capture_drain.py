@@ -5,6 +5,7 @@ from __future__ import annotations
 from squeakview.common.run_layout import artifact_path, open_artifact
 from squeakview.common.capture_health import read_capture_health, source_path, health_path
 from squeakview.common.capture_gaps import known_missing_frames
+from squeakview.common.shutdown_progress import ProgressDeadline
 
 import json
 import csv
@@ -114,20 +115,24 @@ def wait_for_capture_drain(
     expected_ttl_count: int | None,
     quiet_s: float,
     timeout_s: float,
+    maximum_s: float | None = None,
     poll_s: float = 0.05,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> DrainResult:
-    """Wait for equal source/admission counts and a stable quiet window."""
+    """Wait for reconciled counts, extending only while frame counts advance."""
 
-    deadline = monotonic() + timeout_s
+    budget = ProgressDeadline(timeout_s, maximum_s if maximum_s is not None else max(60.0, timeout_s),
+                              monotonic=monotonic)
     previous: tuple[int, ...] | None = None
     stable_since: float | None = None
     snapshot: tuple[int, ...] = ()
     counts: tuple[int | None, ...] = ()
-    while monotonic() < deadline:
+    while budget.remaining_s() > 0:
         snapshot = ledger_size_snapshot(run_dir, camera_count)
         counts = ledger_frame_counts(run_dir, camera_count)
+        budget.observe({f"ledger_{i}_frames": count for i, count in enumerate(counts)
+                        if type(count) is int})
         now = monotonic()
         ledgers_exist = bool(snapshot) and all(size >= 0 for size in snapshot)
         counts_valid = bool(counts) and all(count is not None for count in counts)
@@ -157,13 +162,14 @@ def wait_for_capture_drain(
         else:
             stable_since = now if ledgers_exist else None
         previous = snapshot
-        sleep(poll_s)
+        sleep(min(poll_s, budget.remaining_s()))
     return DrainResult(
         False,
         snapshot,
         counts,
         expected_ttl_count,
-        "capture ledgers did not reconcile and become quiet before timeout",
+        f"capture ledgers did not reconcile and become quiet: {budget.report()['limit']} timeout; "
+        f"idle {budget.report()['idle_s']:.1f}s, elapsed {budget.report()['elapsed_s']:.1f}s",
     )
 
 
@@ -185,11 +191,18 @@ class CaptureDrainCoordinator:
         hooks: CaptureDrainHooks,
     ) -> bool:
         quiet_s, timeout_s = self._timings()
+        try:
+            maximum_s = float(self._environ.get("SQUEAKVIEW_CAPTURE_DRAIN_MAX_S", "60"))
+        except (TypeError, ValueError):
+            maximum_s = max(60.0, timeout_s)
+        if not math.isfinite(maximum_s) or not timeout_s <= maximum_s <= MAX_DRAIN_TIMEOUT_S:
+            maximum_s = max(60.0, timeout_s)
         hooks.write_status(
             request.run_dir,
             "capture_draining",
             quiet_period_s=quiet_s,
             timeout_s=timeout_s,
+            maximum_s=maximum_s,
             expected_ttl_count=request.expected_ttl_count,
         )
         if request.phase == RunPhase.STOPPING:
@@ -201,6 +214,7 @@ class CaptureDrainCoordinator:
             expected_ttl_count=request.expected_ttl_count,
             quiet_s=quiet_s,
             timeout_s=timeout_s,
+            maximum_s=maximum_s,
         )
         common = {
             "ledger_sizes": list(result.ledger_sizes),

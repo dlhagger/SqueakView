@@ -13,6 +13,7 @@ import time
 
 from squeakview.common import run_context
 from squeakview.common.run_layout import artifact_path
+from .live_progress import LiveProgressWatchdog, mailbox_sequence
 
 
 class OptionalLiveSession:
@@ -20,6 +21,7 @@ class OptionalLiveSession:
         self.config = config
         self.emit = emit
         self.mailboxes: tuple[Path, ...] = ()
+        self.recording_sources = ()
         self.process = None
         self._temporary = None
         self._thread = None
@@ -101,6 +103,7 @@ class OptionalLiveSession:
                 self.process.send_signal_group(signal.SIGKILL)
 
     def _watch(self):
+        progress = LiveProgressWatchdog(self.config.num_cameras)
         while not self._stop.wait(0.5):
             try:
                 status = run_context.read_json(self.status_path)
@@ -117,6 +120,19 @@ class OptionalLiveSession:
                 heartbeat = status.get("heartbeat_monotonic")
                 if status.get("state") == "running" and self.state == "starting":
                     self._report("running")
+                if status.get("state") == "running":
+                    inputs = [mailbox_sequence(path) for path in self.mailboxes]
+                    # Prefer capture counters: a stuck mailbox reader may hold
+                    # its shared lock and prevent publication of newer frames.
+                    for index, source in enumerate(self.recording_sources):
+                        activity = source.try_activity()
+                        if activity is not None:
+                            inputs[index] = activity.source_count
+                    error = progress.check(inputs, status.get("frames_processed"), now)
+                    if error:
+                        self._report("degraded", error)
+                        self.process.send_signal_group(signal.SIGKILL)
+                        return
                 if ((heartbeat is None and now - self._started > 60)
                         or (heartbeat is not None and now - float(heartbeat) > 10)):
                     self._report("degraded", "live processing stopped responding")

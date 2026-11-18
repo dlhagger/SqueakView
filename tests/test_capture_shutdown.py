@@ -52,7 +52,7 @@ class CaptureShutdownTests(unittest.TestCase):
         worker = threading.Thread(target=callback, daemon=True)
         worker.start()
         self.assertTrue(entered.wait(1))
-        self.app.pipeline = SimpleNamespace(stop=release.set, wait=lambda: worker.join(2))
+        self.app.pipeline = SimpleNamespace(closure_confirmed=True, stop=release.set, wait=lambda: worker.join(2))
         original_close = admission.close
         def checked_close():
             self.assertTrue(finished.is_set(), "writer closed before in-flight callback drained")
@@ -78,7 +78,7 @@ class CaptureShutdownTests(unittest.TestCase):
         worker = threading.Thread(target=lambda: admission.handle_buffer(SimpleNamespace(timestamp=123)), daemon=True)
         worker.start()
         self.assertTrue(entered.wait(1))
-        self.app.pipeline = SimpleNamespace(stop=lambda: release.wait(2), wait=lambda: worker.join(2))
+        self.app.pipeline = SimpleNamespace(closure_confirmed=True, stop=lambda: release.wait(2), wait=lambda: worker.join(2))
         started = time.monotonic()
         try:
             with mock.patch.dict("os.environ", {"SQUEAKVIEW_PIPELINE_SHUTDOWN_TIMEOUT_S": "0.1"}):
@@ -113,7 +113,7 @@ class CaptureShutdownTests(unittest.TestCase):
         for value in ("inf", "nan", "1e300"):
             with self.subTest(value=value):
                 app = runner.ServiceMakerApp(runner.InferenceConfig(run_dir=Path(self.temp.name) / value, enable_infer=False))
-                app.pipeline = SimpleNamespace(stop=lambda: time.sleep(0.005), wait=lambda: None)
+                app.pipeline = SimpleNamespace(closure_confirmed=True, stop=lambda: time.sleep(0.005), wait=lambda: None)
                 with mock.patch.dict("os.environ", {"SQUEAKVIEW_PIPELINE_SHUTDOWN_TIMEOUT_S": value}):
                     app.stop()
                 self.assertEqual(app.exit_code, 0)

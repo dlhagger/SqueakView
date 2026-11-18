@@ -1,9 +1,8 @@
-"""DeepStream 9.1 inference runner built on the PyServiceMaker Pipeline API."""
+"""DeepStream 9.1/9.2 capture runner built on the PyServiceMaker Pipeline API."""
 from __future__ import annotations
 
 from squeakview.common.run_layout import artifact_path
 
-import math
 import os
 import signal
 import sys
@@ -22,6 +21,7 @@ from pyservicemaker import (
 )
 
 from squeakview.common import run_context
+from squeakview.common.shutdown_policy import CLOSURE_FILENAME
 from squeakview.common.child_events import encode_child_event
 from squeakview.common.diagnostics.crash import install_crash_diagnostics
 from squeakview.common.diagnostics.system_telemetry import SystemTelemetryRecorder
@@ -32,6 +32,7 @@ from .contracts import (
     _validate_config,
 )
 from .capture_pipeline import CapturePipeline
+from .capture_shutdown import stop_capture
 from .frame_audit import (
     FLIR_FRAME_META_DESCRIPTOR,
     FrameCsvOperator,
@@ -100,6 +101,9 @@ class ServiceMakerApp:
         else:
             self.run_dir = Path(config.run_dir).expanduser()
             self.run_dir.mkdir(parents=True, exist_ok=True)
+        # A new capture attempt must never inherit another process's closure
+        # evidence, including when a diagnostic invocation reuses a directory.
+        artifact_path(self.run_dir, CLOSURE_FILENAME).unlink(missing_ok=True)
         self.artifacts = run_context.run_artifacts(self.run_dir)
         if config.failure_plan is not None:
             run_context.update_status(
@@ -155,8 +159,8 @@ class ServiceMakerApp:
         self._recording_integrity_failed = True
         if self.exit_code == 0:
             self.exit_code = 4
-        _safe_print(encode_child_event("fatal", run_dir=str(self.run_dir), error=message))
         self._stop_event.set()
+        _safe_print(encode_child_event("fatal", run_dir=str(self.run_dir), error=message))
         _safe_print(f"[{ts()}] [RECORD] FATAL: {message}")
 
     def _storage_reserve_fault(self, message: str) -> None:
@@ -294,6 +298,7 @@ class ServiceMakerApp:
                 )
             self._prewarm_cuda()
             if self.live_session is not None:
+                self.live_session.recording_sources = tuple(self.record_telemetry)
                 self.live_session.start()
             self.pipeline.start(self._on_message)
             self._pipeline_wait_thread = threading.Thread(
@@ -352,169 +357,7 @@ class ServiceMakerApp:
         self._stop_event.set()
 
     def stop(self) -> None:
-        if self._stopped:
-            return
-        self._stopped = True
-        # Wake every capture-owned monitor even when pipeline.start() or a
-        # lifecycle callback raised before the normal stop request path.
-        self._stop_event.set()
-        close_errors: list[str] = []
-        if self.live_session is not None:
-            self.live_session.request_stop()
-
-        try:
-            shutdown_timeout_s = float(
-                os.environ.get("SQUEAKVIEW_PIPELINE_SHUTDOWN_TIMEOUT_S", "")
-                or (5.0 if self.config.failure_plan is not None else 20.0)
-            )
-        except ValueError:
-            shutdown_timeout_s = 20.0
-        if not math.isfinite(shutdown_timeout_s) or shutdown_timeout_s > threading.TIMEOUT_MAX:
-            shutdown_timeout_s = 20.0
-        shutdown_timeout_s = max(0.1, shutdown_timeout_s)
-        stage_deadline = time.monotonic() + shutdown_timeout_s
-        stage_budget_s = shutdown_timeout_s
-
-        def close_pipeline_with_timeout(
-            name: str, close_fn: Callable[[], object]
-        ) -> bool:
-            _safe_print(f"[{ts()}] [CLOSE] beginning {name}")
-            completed = threading.Event()
-            failure: list[BaseException] = []
-
-            def invoke() -> None:
-                try:
-                    close_fn()
-                except BaseException as exc:  # preserve native binding failures
-                    failure.append(exc)
-                finally:
-                    completed.set()
-
-            threading.Thread(
-                target=invoke,
-                daemon=True,
-                name=f"squeakview-{name.replace(' ', '-')}",
-            ).start()
-            remaining_s = max(0.0, stage_deadline - time.monotonic())
-            if not completed.wait(remaining_s):
-                if self.exit_code == 0:
-                    self.exit_code = 1
-                self._force_process_exit = True
-                detail = (
-                    f"{name}: timed out within {stage_budget_s:.1f}s shutdown budget; "
-                    "capture is not valid"
-                )
-                close_errors.append(detail)
-                _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
-                return False
-            if failure:
-                self.exit_code = 1
-                exc = failure[0]
-                detail = f"{name}: {type(exc).__name__}: {exc}"
-                close_errors.append(detail)
-                _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
-                return False
-            _safe_print(f"[{ts()}] [CLOSE] completed {name}")
-            return True
-
-        # CapturePipeline.stop now sets source EOS atomics, including after a
-        # recording fault. Try to save the MP4 tail before bounded escalation.
-        pipeline_drained = self.pipeline is None
-        if self.pipeline is not None:
-            close_pipeline_with_timeout("capture pipeline stop", self.pipeline.stop)
-            if self._pipeline_wait_thread is not None:
-                _safe_print(f"[{ts()}] [CLOSE] waiting for pipeline EOS and camera release")
-                self._pipeline_wait_thread.join(
-                    timeout=max(0.0, stage_deadline - time.monotonic())
-                )
-                if self._pipeline_wait_thread.is_alive():
-                    if self.exit_code == 0:
-                        self.exit_code = 1
-                    self._force_process_exit = True
-                    detail = (
-                        "capture pipeline wait: timed out after "
-                        f"{shutdown_timeout_s:.1f}s; capture is not valid"
-                    )
-                    close_errors.append(detail)
-                    _safe_print(f"[{ts()}] [RECORD] ERROR closing {detail}")
-                if self._pipeline_wait_error is not None:
-                    self.exit_code = 1
-                    close_errors.append(
-                        f"capture pipeline wait: {self._pipeline_wait_error}"
-                    )
-                if not self._pipeline_wait_thread.is_alive() and self._pipeline_wait_error is None:
-                    pipeline_drained = True
-                    _safe_print(f"[{ts()}] [CLOSE] pipeline EOS and camera release completed")
-            else:
-                pipeline_drained = close_pipeline_with_timeout("capture pipeline wait", self.pipeline.wait)
-        if not pipeline_drained:
-            self._force_process_exit = True
-            close_errors.append("native drain unconfirmed; callback-owned writers left open until process exit")
-        # A blocked monitor or callback can hold a writer lock even after a
-        # failed native drain. Bound cleanup as a whole, rather than hanging
-        # forever in join()/close() and preventing the supervisor from seeing
-        # the capture failure. Healthy pipelines still finish EOS/wait above
-        # before any scientific writer is closed.
-        stage_budget_s = min(5.0, shutdown_timeout_s)
-        stage_deadline = time.monotonic() + stage_budget_s
-        close_resource = close_pipeline_with_timeout
-        if self._recording_liveness_thread is not None:
-            close_resource(
-                "recording liveness monitor",
-                self._recording_liveness_thread.join,
-            )
-        if self._storage_reserve_thread is not None:
-            close_resource(
-                "storage reserve monitor",
-                self._storage_reserve_thread.join,
-            )
-        # Native callbacks may still hold these resources after a failed drain.
-        # Closing them can race a late write and abort before failure is reported.
-        if pipeline_drained:
-            if self.observations is not None:
-                close_resource("observations", self.observations.close)
-            for index, admission in enumerate(self.record_admissions):
-                close_resource(f"record admission {index}", admission.close)
-            for index, telemetry in enumerate(self.record_telemetry):
-                close_resource(f"record telemetry {index}", telemetry.close)
-            for index, boundary in enumerate(self.preview_boundaries):
-                close_resource(f"preview boundary {index}", boundary.close)
-            if self.frames is not None:
-                close_resource("frame ledger", self.frames.close)
-        close_resource("system telemetry", self.system_telemetry.stop)
-
-        def write_capture_status() -> None:
-            run_context.write_status(
-                self.run_dir,
-                "capture_closed",
-                capture_exit_code=self.exit_code,
-                capture_close_error=close_errors[0] if close_errors else None,
-                capture_close_errors=close_errors,
-                system_telemetry={
-                    "path": str(self.system_telemetry.path),
-                    "sample_count": self.system_telemetry.sample_count,
-                    "error": self.system_telemetry.last_error,
-                },
-            )
-        # Keep failure reporting bounded even if the filesystem is stalled.
-        # The supervisor receives the terminal event and owns final run status
-        # when this best-effort local status write cannot complete.
-        stage_budget_s = min(1.0, shutdown_timeout_s)
-        stage_deadline = time.monotonic() + stage_budget_s
-        close_resource("capture status", write_capture_status)
-
-        _safe_print(
-            encode_child_event(
-                "capture_closed",
-                run_dir=str(self.run_dir),
-                exit_code=self.exit_code,
-                close_errors=close_errors,
-            )
-        )
-        _safe_print(
-            f"[{ts()}] [CAPTURE] closed; post-run audit is handled independently"
-        )
-        _safe_print(f"[{ts()}] [INFO] done. Files in: {self.run_dir}")
+        stop_capture(self, emit=_safe_print)
 
 def run(config: InferenceConfig) -> int:
     install_crash_diagnostics(

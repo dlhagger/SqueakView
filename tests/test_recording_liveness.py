@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from squeakview.apps.inference.recording import RecordingActivity
+from squeakview.apps.inference.recording_activity import RecordingActivity
 from squeakview.apps.inference.recording_liveness import (
     RecordingLivenessMonitor,
     RecordingLivenessPolicy,
@@ -45,7 +45,7 @@ class RecordingLivenessTests(unittest.TestCase):
     def test_source_with_no_frames_is_not_reported_as_stalled(self) -> None:
         source = SimpleNamespace(
             stream_id=0,
-            activity=lambda: RecordingActivity(0, 0, 0, None, None, None),
+            try_activity=lambda: RecordingActivity(0, 0, 0, None, None, None),
         )
         failures: list[str] = []
         monitor = RecordingLivenessMonitor(
@@ -62,7 +62,7 @@ class RecordingLivenessTests(unittest.TestCase):
     def test_stalled_source_reports_counts_and_stream(self) -> None:
         source = SimpleNamespace(
             stream_id=4,
-            activity=lambda: RecordingActivity(10, 9, 8, 1, 2, 3),
+            try_activity=lambda: RecordingActivity(10, 9, 8, 1, 2, 3),
         )
         failures: list[str] = []
         monitor = RecordingLivenessMonitor(
@@ -82,7 +82,7 @@ class RecordingLivenessTests(unittest.TestCase):
         def fail():
             raise OSError("snapshot unavailable")
 
-        source = SimpleNamespace(stream_id=2, activity=fail)
+        source = SimpleNamespace(stream_id=2, try_activity=fail)
         failures: list[str] = []
         monitor = RecordingLivenessMonitor(
             [source],

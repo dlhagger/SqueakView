@@ -4,23 +4,14 @@ from __future__ import annotations
 import atexit
 from collections import OrderedDict
 import csv
-from dataclasses import dataclass
 import threading
 import time
 from pathlib import Path
 from typing import Callable
 
 from pyservicemaker import BufferOperator
-
-
-@dataclass(frozen=True, slots=True)
-class RecordingActivity:
-    source_count: int
-    admission_count: int
-    egress_count: int
-    last_source_monotonic_ns: int | None
-    last_admission_monotonic_ns: int | None
-    last_egress_monotonic_ns: int | None
+from .recording_activity import RecordingActivity
+from .callback_guard import NativeCallbackGuard
 
 
 class RecordingAdmissionOperator(BufferOperator):
@@ -33,6 +24,7 @@ class RecordingAdmissionOperator(BufferOperator):
         path: Path,
         stream_id: int,
         telemetry: "RecordingPathTelemetry | None" = None,
+        on_fatal: Callable[[str], None] | None = None,
     ):
         super().__init__()
         self.path = path
@@ -46,9 +38,14 @@ class RecordingAdmissionOperator(BufferOperator):
         self._lock = threading.Lock()
         self._closed = False
         self._telemetry = telemetry
+        self._guard = NativeCallbackGuard(f"recording admission stream {self.stream_id}",
+            on_fatal if on_fatal is not None else getattr(telemetry, 'on_fatal', None))
         atexit.register(self.close)
 
     def handle_buffer(self, buffer) -> bool:
+        return self._guard.call(lambda: self._admit(buffer))
+
+    def _admit(self, buffer):
         with self._lock:
             if self._closed:
                 return False
@@ -65,8 +62,11 @@ class RecordingAdmissionOperator(BufferOperator):
             if self._closed:
                 return
             self._closed = True
-            self._file.flush()
-            self._file.close()
+            try:
+                self._file.flush()
+            finally:
+                self._file.close()
+        self._guard.check()
 
 
 class RecordingStallOperator(BufferOperator):
@@ -78,14 +78,19 @@ class RecordingStallOperator(BufferOperator):
         delay_us: int,
         *,
         sleep: Callable[[float], None] = time.sleep,
+        on_fatal: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__()
         self.after_frames = max(1, int(after_frames))
         self.delay_s = max(1, int(delay_us)) / 1_000_000.0
         self._sleep = sleep
         self._count = 0
+        self._guard = NativeCallbackGuard('qualification recording stall', on_fatal)
 
     def handle_buffer(self, _buffer) -> bool:
+        return self._guard.call(self._delay)
+
+    def _delay(self):
         if self._count >= self.after_frames:
             self._sleep(self.delay_s)
         self._count += 1
@@ -134,6 +139,8 @@ class RecordingPathTelemetry:
         )
         self.max_pending = max(self.warning_depth, int(max_pending))
         self.on_fatal = on_fatal
+        self.guard = NativeCallbackGuard(f"recording telemetry stream {self.stream_id}", on_fatal)
+        self.diagnostic_error: str | None = None
         # The GUI tails this low-rate telemetry during acquisition. Keep rows
         # visible without waiting for the capture child to close the file.
         self._file = path.open("w", newline="", buffering=1)
@@ -168,6 +175,24 @@ class RecordingPathTelemetry:
                 last_egress_monotonic_ns=self._last_egress_ns,
             )
 
+    def try_activity(self) -> RecordingActivity | None:
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            return RecordingActivity(self._source_count, self._admission_count, self._egress_count,
+                                     self._last_source_ns, self._last_admission_ns, self._last_egress_ns)
+        finally:
+            self._lock.release()
+
+    def shutdown_progress(self) -> tuple[int, int, int] | None:
+        """Sample real work without waiting on a stuck callback/file writer."""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            return self._source_count, self._admission_count, self._egress_count
+        finally:
+            self._lock.release()
+
     def _write(
         self,
         event: str,
@@ -178,6 +203,19 @@ class RecordingPathTelemetry:
         queue_wait_ms="",
         encoder_latency_ms="",
     ) -> None:
+        if self.diagnostic_error is not None:
+            return
+        try:
+            self._write_row(
+                event, now_ns, pts_ns, egress_timestamp_ns, encoder_correlation,
+                queue_wait_ms, encoder_latency_ms)
+        except Exception as exc:
+            # These sampled diagnostics are optional. Keep activity counters
+            # running even when their CSV cannot be written.
+            self.diagnostic_error = f"{type(exc).__name__}: {exc}"
+
+    def _write_row(self, event, now_ns, pts_ns, egress_timestamp_ns, encoder_correlation,
+                   queue_wait_ms, encoder_latency_ms):
         self._writer.writerow(
             [
                 time.time_ns(),
@@ -322,8 +360,12 @@ class RecordingPathTelemetry:
                 return
             self._closed = True
             self._write("closed", time.monotonic_ns(), "")
-            self._file.flush()
-            self._file.close()
+            for close in (self._file.flush, self._file.close):
+                try:
+                    close()
+                except Exception as exc:
+                    self.diagnostic_error = self.diagnostic_error or f"{type(exc).__name__}: {exc}"
+        self.guard.check()
 
 
 class RecordingEgressOperator(BufferOperator):
@@ -332,8 +374,7 @@ class RecordingEgressOperator(BufferOperator):
         self.telemetry = telemetry
 
     def handle_buffer(self, buffer) -> bool:
-        self.telemetry.egress(int(buffer.timestamp))
-        return True
+        return self.telemetry.guard.call(lambda: self.telemetry.egress(int(buffer.timestamp)))
 
 
 class RecordingIngressOperator(BufferOperator):
@@ -342,5 +383,4 @@ class RecordingIngressOperator(BufferOperator):
         self.telemetry = telemetry
 
     def handle_buffer(self, buffer) -> bool:
-        self.telemetry.source(int(buffer.timestamp))
-        return True
+        return self.telemetry.guard.call(lambda: self.telemetry.source(int(buffer.timestamp)))

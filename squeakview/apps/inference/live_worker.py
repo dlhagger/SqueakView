@@ -35,6 +35,7 @@ def main():
     finished = threading.Event()
     ready = threading.Event()
     errors = []
+    processed = [0] * config.num_cameras
     resources = None
     wait_thread = None
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -42,15 +43,21 @@ def main():
 
     def status(state, error=None):
         run_context.atomic_write_json(status_path, {"state": state, "error": error,
-            "heartbeat_monotonic": time.monotonic()})
+            "heartbeat_monotonic": time.monotonic(), "frames_processed": list(processed)})
+
+    def live_fault(error):
+        errors.append(error)
+        stop.set()
 
     try:
         from pyservicemaker import Probe, EOSMessage, StateTransitionMessage, PipelineState
         from .capture_pipeline import CapturePipeline
         from .pipeline_builder import build_pipeline
+        from .live_progress_probe import attach_live_progress
         resources = build_pipeline(config, config.run_dir, config.run_dir / "unused.mp4",
             pipeline_factory=CapturePipeline, probe_factory=Probe,
             on_recording_fault=lambda reason: (_ for _ in ()).throw(RuntimeError(reason)))
+        attach_live_progress(resources.pipeline, config, processed, live_fault)
         if config.enable_infer:
             import torch
             torch.arange(16, device="cuda").cpu()
@@ -91,10 +98,12 @@ def main():
                 resources.pipeline.stop()
                 if wait_thread and not finished.wait(2):
                     errors.append("live pipeline did not drain")
-                elif wait_thread:
+                elif wait_thread and resources.pipeline.closure_confirmed is True:
                     for closer in [resources.observations, resources.frames, *resources.preview_boundaries]:
                         if closer is not None:
                             closer.close()
+                else:
+                    errors.append("live pipeline EOS/NULL closure was not confirmed")
             except Exception as exc:
                 errors.append(f"live cleanup: {exc}")
         status("degraded" if errors else "completed", "; ".join(errors) or None)

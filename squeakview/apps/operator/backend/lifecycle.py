@@ -21,6 +21,7 @@ from typing import Any, Callable, Mapping, Protocol
 from squeakview.apps.operator.backend.events import RunPhase
 from squeakview.common import run_context
 from squeakview.common.failure_injection import FailurePlan
+from squeakview.common.shutdown_policy import capture_exit_grace_s, has_clean_capture_closure
 
 
 class CaptureHandle(Protocol):
@@ -220,7 +221,11 @@ def finalize_run(
     if stopping_capture and capture is not None:
         # Capture owns EOS/MP4 closure.  Validation can only begin after its
         # concrete process exit has been observed.
-        capture.terminate_group_graceful(signal.SIGINT, 30.0, True)
+        capture.terminate_group_graceful(
+            signal.SIGINT,
+            capture_exit_grace_s(failure_injection=request.failure_plan is not None),
+            True,
+        )
         try:
             if _injected(request, "capture_exit_unconfirmed"):
                 raise subprocess.TimeoutExpired("capture", 2.0)
@@ -268,6 +273,7 @@ def finalize_run(
         failure_reasons.append(capture_exit_error)
     if serial_integrity_error:
         failure_reasons.append(serial_integrity_error)
+    late_exit_warning: str | None = None
     if final_state == "finalized":
         if capture_returncode is None:
             if capture is not None and not capture_exit_error:
@@ -282,7 +288,15 @@ def finalize_run(
                     "Check Events for 'still running' and the last [CLOSE] stage; "
                     "recording integrity is not confirmed"
                 )
-            failure_reasons.append(detail)
+            if run_dir is not None and has_clean_capture_closure(Path(run_dir)):
+                # Do not clear any controller/drain/serial errors. This only
+                # defers the exit-code verdict until independent validation.
+                late_exit_warning = (
+                    f"Capture process exited with code {capture_returncode} after "
+                    "confirmed recording closure; saved data passed validation"
+                )
+            else:
+                failure_reasons.append(detail)
 
     if run_dir and capture_returncode is not None:
         if phase == RunPhase.CAPTURE_CLOSED:
@@ -336,7 +350,14 @@ def finalize_run(
                     and finalizer_status.get("alignment_validated") is True
                 ),
                 "outputs": dict(hooks.run_output_snapshot(run_dir)),
+                "capture_returncode": capture_returncode,
             }
+            shutdown_warnings = list(finalizer_status.get("shutdown_warnings") or [])
+            if late_exit_warning and final_state == "finalized":
+                shutdown_warnings.append(late_exit_warning)
+                hooks.log(f"[BACKEND] WARN: {late_exit_warning}")
+            updates["shutdown_warnings"] = shutdown_warnings
+            updates["shutdown_degraded"] = bool(shutdown_warnings)
             if error:
                 updates["error"] = error
             run_context.write_status(run_dir, final_state, **updates)

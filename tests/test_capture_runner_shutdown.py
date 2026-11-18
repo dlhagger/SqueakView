@@ -33,7 +33,7 @@ from tests.support.service_maker_runner import ServiceMakerCase, FakePipeline
 class CaptureShutdownTests(ServiceMakerCase):
     def test_failed_native_wait_does_not_close_writers_under_live_callbacks(self):
         app = runner.ServiceMakerApp(self.config(enable_infer=False))
-        app.pipeline = mock.Mock()
+        app.pipeline = mock.Mock(closure_confirmed=True)
         app.pipeline.wait.side_effect = RuntimeError('native wait failed')
         admission = mock.Mock()
         app.record_admissions = [admission]
@@ -88,7 +88,7 @@ class CaptureShutdownTests(ServiceMakerCase):
 
     def test_stop_attempts_every_closer_and_persists_all_errors(self) -> None:
         app = runner.ServiceMakerApp(self.config(enable_infer=False))
-        pipeline = mock.Mock()
+        pipeline = mock.Mock(closure_confirmed=True)
         pipeline.stop.side_effect = OSError("pipeline stop failed")
         observations = mock.Mock()
         observations.close.side_effect = OSError("observation flush failed")
@@ -122,7 +122,7 @@ class CaptureShutdownTests(ServiceMakerCase):
     def test_pipeline_shutdown_timeout_returns_and_marks_capture_invalid(self) -> None:
         release = threading.Event()
         app = runner.ServiceMakerApp(self.config(enable_infer=False))
-        pipeline = mock.Mock()
+        pipeline = mock.Mock(closure_confirmed=True)
         pipeline.stop.side_effect = release.wait
         app.pipeline = pipeline
 
@@ -139,7 +139,7 @@ class CaptureShutdownTests(ServiceMakerCase):
 
     def test_recording_integrity_fault_notifies_supervisor_and_drains_video(self) -> None:
         app = runner.ServiceMakerApp(self.config(enable_infer=False))
-        pipeline = mock.Mock()
+        pipeline = mock.Mock(closure_confirmed=True)
         app.pipeline = pipeline
 
         with mock.patch.object(runner, "_safe_print") as output:
@@ -161,7 +161,7 @@ class CaptureShutdownTests(ServiceMakerCase):
 
     def test_storage_reserve_fault_uses_normal_pipeline_drain(self) -> None:
         app = runner.ServiceMakerApp(self.config(enable_infer=False))
-        pipeline = mock.Mock()
+        pipeline = mock.Mock(closure_confirmed=True)
         app.pipeline = pipeline
 
         with mock.patch.object(runner, "_safe_print") as safe_print:

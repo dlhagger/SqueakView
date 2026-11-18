@@ -85,6 +85,7 @@ def present_finalization(status: dict[str, Any]) -> FinalizationPresentation:
     }
     if passed and terminal_success:
         warnings = list(status.get("recording_warnings") or [])
+        warnings.extend(status.get("shutdown_warnings") or [])
         live = status.get("live_services") or {}
         if live.get("state") == "degraded":
             warnings.append("Live inference/preview unavailable; raw capture saved")

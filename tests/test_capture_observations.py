@@ -31,6 +31,24 @@ from squeakview.common.failure_injection import FailurePlan
 from tests.support.service_maker_runner import ServiceMakerCase, FakePipeline
 
 class CaptureObservationsTests(ServiceMakerCase):
+    def test_shutdown_progress_does_not_wait_for_telemetry_writer_lock(self):
+        telemetry = runner.RecordingPathTelemetry(self.root / 'progress.csv', stream_id=0)
+        self.addCleanup(telemetry.close)
+        telemetry.source(10)
+        telemetry.admit(10)
+        telemetry.egress(10)
+        self.assertEqual(telemetry.shutdown_progress(), (1, 1, 1))
+        sampled = []
+        reader = threading.Thread(target=lambda: sampled.append(telemetry.shutdown_progress()), daemon=True)
+        with telemetry._lock:
+            reader.start()
+            reader.join(.5)
+            blocked = reader.is_alive()
+        reader.join(1)
+        self.assertFalse(blocked)
+        self.assertEqual(sampled, [None])
+        self.assertEqual(telemetry.shutdown_progress(), (1, 1, 1))
+
     def test_recording_telemetry_schema_matches_every_row(self) -> None:
         output = self.root / "recording_schema.csv"
         telemetry = runner.RecordingPathTelemetry(output, stream_id=0)

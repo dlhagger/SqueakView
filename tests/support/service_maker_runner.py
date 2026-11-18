@@ -37,6 +37,7 @@ class FakePipeline:
         self.stopped = False
         self.waited = False
         self.started = False
+        self.closure_confirmed = False
 
     def add(self, type_name: str, name: str, properties: dict | None = None):
         self.nodes[name] = (type_name, properties or {})
@@ -60,6 +61,7 @@ class FakePipeline:
 
     def wait(self):
         self.waited = True
+        self.closure_confirmed = True
         return self
 
 
