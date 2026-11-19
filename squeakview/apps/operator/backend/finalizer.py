@@ -114,7 +114,7 @@ def run_capture_finalizer(
             # shutdown still did not complete validation in time.
             return 124
 
-        progress = run_context.read_json(artifact_path(run_dir, "post_run_progress.json"))
+        progress = run_context.read_live_snapshot(artifact_path(run_dir, "post_run_progress.json"))
         processed = _progress_count(progress)
         if processed >= last_reported + 100_000:
             emit(

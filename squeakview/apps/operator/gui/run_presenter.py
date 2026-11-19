@@ -218,8 +218,8 @@ class RunLifecycleController(QtCore.QObject):
         if run_dir is None:
             return
         run_path = Path(run_dir)
-        status = run_context.read_json(artifact_path(run_path, "run_status.json"))
-        progress = run_context.read_json(artifact_path(run_path, "post_run_progress.json"))
+        status = run_context.read_live_snapshot(artifact_path(run_path, "run_status.json"))
+        progress = run_context.read_live_snapshot(artifact_path(run_path, "post_run_progress.json"))
         self.view.stop_overlay.update_progress(status, progress)
         if self.capture_closed_for_weights:
             presentation = present_stop_progress(status, progress)
@@ -537,7 +537,7 @@ class RunLifecycleController(QtCore.QObject):
         view.preview.show_hint(True)
         view.preview.set_preview_enabled(True)
         run_dir = view.backend.current_snapshot.run_dir
-        status = run_context.read_json(artifact_path(Path(run_dir), "run_status.json")) if run_dir else {}
+        status = run_context.read_live_snapshot(artifact_path(Path(run_dir), "run_status.json")) if run_dir else {}
         presentation = present_finalization(status)
         view._set_run_state(presentation.badge_state)
         view.preview.set_status(presentation.preview_status)

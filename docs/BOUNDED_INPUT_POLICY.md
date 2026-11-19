@@ -36,8 +36,9 @@ and JSON writers reject NaN and Infinity.
 
 ## Intentional streaming and pseudo-file exceptions
 
-The live `controller_v2_summary.json` embedded in manifest updates is published
-exclusively by atomic replacement. Its dedicated `read_atomic_json_snapshot`
+Live controller summaries, camera health, worker status, run-status presentation,
+and finalizer progress are published exclusively by atomic replacement.
+Their dedicated `read_atomic_json_snapshot`
 reader pins one complete version through an open descriptor, tolerating a newer
 version at the pathname. It retains the regular-file, size, strict UTF-8,
 duplicate-key, finite-number and in-place-content-change checks. This exception

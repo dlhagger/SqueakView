@@ -17,6 +17,29 @@ from squeakview.common.bounded_input import (
 
 
 class BoundedInputTests(unittest.TestCase):
+    def test_atomic_snapshot_keeps_complete_version_during_replacement(self) -> None:
+        from squeakview.common import run_context
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'live.json'
+            path.write_text('{"count":1}')
+            replacement = path.with_suffix('.next')
+            replacement.write_text('{"count":2}')
+            original_fstat = os.fstat
+            replaced = False
+
+            def publish_during_read(fd):
+                nonlocal replaced
+                result = original_fstat(fd)
+                if not replaced:
+                    replaced = True
+                    replacement.replace(path)
+                return result
+
+            with mock.patch('squeakview.common.bounded_input.os.fstat',
+                            side_effect=publish_during_read):
+                self.assertEqual(run_context.read_live_snapshot(path), {'count': 1})
+            self.assertEqual(run_context.read_live_snapshot(path), {'count': 2})
+
     def test_atomic_snapshot_retains_strict_content_and_file_checks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "live.json"

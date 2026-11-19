@@ -31,6 +31,8 @@ def main():
     values["camera_serials"] = tuple(values["camera_serials"])
     config = InferenceConfig(**values)
     status_path = artifact_path(config.run_dir, "diagnostics") / "live_status.json"
+    from .live_diagnostics import LiveWorkerDiagnostics
+    diagnostics = LiveWorkerDiagnostics(status_path.parent)
     stop = threading.Event()
     finished = threading.Event()
     ready = threading.Event()
@@ -43,13 +45,16 @@ def main():
 
     def status(state, error=None):
         run_context.atomic_write_json(status_path, {"state": state, "error": error,
-            "heartbeat_monotonic": time.monotonic(), "frames_processed": list(processed)})
+            "heartbeat_monotonic": None if state == 'initializing' else time.monotonic(),
+            "frames_processed": list(processed), "stack_dump_ready": diagnostics.ready,
+            "stack_dump_error": diagnostics.error})
 
     def live_fault(error):
         errors.append(error)
         stop.set()
 
     try:
+        status('initializing')
         from pyservicemaker import Probe, EOSMessage, StateTransitionMessage, PipelineState
         from .capture_pipeline import CapturePipeline
         from .pipeline_builder import build_pipeline

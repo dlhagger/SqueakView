@@ -1,6 +1,8 @@
 import tempfile
+import os
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from squeakview.apps.operator.backend.first_frames import wait_for_first_frames
 from squeakview.common.capture_health import health_path, COUNTERS
@@ -48,6 +50,27 @@ class FirstFrameTests(unittest.TestCase):
         self.health(1, 3)
         self.assertEqual(self.confirm(), {0: 2, 1: 3})
         self.assertEqual(self.now, 100)
+
+    def test_health_replacement_during_read_does_not_abort_startup(self):
+        self.health(0, 2)
+        path = health_path(self.run, 0)
+        replacement = path.with_suffix('.next')
+        replacement.write_bytes(path.read_bytes())
+        original_fstat = os.fstat
+        replaced = False
+
+        def publish_during_read(fd):
+            nonlocal replaced
+            result = original_fstat(fd)
+            if not replaced:
+                replaced = True
+                replacement.replace(path)
+            return result
+
+        with mock.patch('squeakview.common.bounded_input.os.fstat',
+                        side_effect=publish_during_read):
+            self.assertEqual(self.confirm(count=1), {0: 2})
+        self.assertTrue(replaced)
 
     def test_camera_arriving_during_wait_succeeds(self):
         self.health(0, 1)

@@ -503,6 +503,23 @@ def read_json_required_with_identity(
     )
 
 
+def read_live_snapshot(path: Path) -> dict[str, Any]:
+    """Best-effort bounded read of runtime JSON published by atomic replacement.
+
+    Polling consumers may see a complete previous version while a newer one is
+    published. Configuration, provenance and final validation use the strict
+    readers instead. Callers must handle unavailable snapshots explicitly.
+    """
+    from squeakview.common.bounded_input import read_atomic_json_snapshot
+
+    try:
+        return read_atomic_json_snapshot(
+            path, max_bytes=MAX_RUN_METADATA_BYTES, label=Path(path).name
+        )
+    except (OSError, ValueError):
+        return {}
+
+
 def read_json(path: Path) -> dict[str, Any]:
     """Best-effort bounded metadata read for presentation and initial creation.
 

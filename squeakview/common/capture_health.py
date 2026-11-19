@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .run_layout import artifact_path
-from .run_context import read_json_required
+from .bounded_input import read_atomic_json_snapshot
 from .ledger_tail import last_complete_line
 
 COUNTERS = ('total_timeouts', 'total_incomplete', 'total_frame_gap_events', 'total_crc_failures')
@@ -26,7 +26,7 @@ def read_capture_health(run_dir: Path, stream_id: int = 0) -> dict:
     if not path.exists():
         raw = last_complete_line(source_path(run_dir, stream_id), run_dir=run_dir)
         return json.loads(raw or '{}')
-    payload = read_json_required(path, max_bytes=16384)
+    payload = read_atomic_json_snapshot(path, max_bytes=16384, label=path.name)
     if (type(payload.get('schema_version')) is not int or payload['schema_version'] != 1
             or type(payload.get('camera_index')) is not int or payload['camera_index'] != stream_id
             or payload.get('state') not in ('recording', 'closed')

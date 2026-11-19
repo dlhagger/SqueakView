@@ -1,5 +1,6 @@
 """Optional process failures must never escape into acquisition control."""
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import signal
 import subprocess
@@ -79,6 +80,71 @@ class OptionalLiveTests(unittest.TestCase):
             session.close()
         self.assertEqual(session.state, 'degraded')
 
+    def test_transient_empty_status_read_does_not_kill_healthy_worker(self):
+        session = self.session()
+        session.prepare()
+        session.state = 'running'
+        session._started = 0
+        session.process = mock.Mock()
+        session.process.is_running.return_value = True
+        session._stop = mock.Mock()
+        session._stop.wait.side_effect = [False, False, False, True]
+        snapshots = [
+            {'state': 'running', 'heartbeat_monotonic': 100,
+             'frames_processed': [10], 'stack_dump_ready': True},
+            {},  # Atomic replacement raced the strict status-file reader.
+            {'state': 'running', 'heartbeat_monotonic': 101,
+             'frames_processed': [11], 'stack_dump_ready': True},
+        ]
+        with mock.patch('squeakview.common.run_context.read_live_snapshot', side_effect=snapshots), \
+             mock.patch('squeakview.apps.inference.optional_live.time.monotonic',
+                        side_effect=[100, 100.5, 101]):
+            session._watch()
+        session.process.send_signal_group.assert_not_called()
+        self.assertEqual(session.state, 'running')
+        session._stop.wait.side_effect = None
+
+    def test_persistently_unreadable_status_expires_and_retains_dump_handshake(self):
+        session = self.session()
+        session.prepare()
+        session._started = 0
+        session.process = mock.Mock()
+        session.process.is_running.return_value = True
+        session._stop = mock.Mock()
+        session._stop.wait.return_value = False
+        last_good = {'state': 'running', 'heartbeat_monotonic': 100,
+                     'frames_processed': [10], 'stack_dump_ready': True}
+        with mock.patch('squeakview.common.run_context.read_live_snapshot',
+                        side_effect=[last_good, {}, {}]), \
+             mock.patch('squeakview.apps.inference.optional_live.time.monotonic',
+                        side_effect=[100, 105, 111]), \
+             mock.patch.object(session, '_kill_stalled') as kill:
+            session._watch()
+        kill.assert_called_once_with('live processing stopped responding', last_good)
+
+    def test_atomic_status_replacement_can_return_empty_read(self):
+        session = self.session()
+        path = session.status_path
+        path.parent.mkdir(parents=True)
+        first = {'state': 'running', 'heartbeat_monotonic': 100}
+        latest = {'state': 'running', 'heartbeat_monotonic': 101}
+        path.write_text(json.dumps(first))
+        replacement = path.with_suffix('.next')
+        replacement.write_text(json.dumps(latest))
+        original_open = Path.open
+
+        @contextmanager
+        def replace_after_read(target, *args, **kwargs):
+            with original_open(target, *args, **kwargs) as handle:
+                yield handle
+            if target == path:
+                replacement.replace(path)
+
+        from squeakview.common import run_context
+        with mock.patch.object(Path, 'open', replace_after_read):
+            self.assertEqual(run_context.read_json(path), {})
+        self.assertEqual(run_context.read_json(path), latest)
+
     def test_completed_status_does_not_hide_native_teardown_crash(self):
         for code, expected in ((0, 'completed'), (-6, 'degraded')):
             with self.subTest(code=code):
@@ -88,7 +154,7 @@ class OptionalLiveTests(unittest.TestCase):
                 session.process.wait.return_value = code
                 session._stop = mock.Mock()
                 session._stop.wait.return_value = False
-                with mock.patch('squeakview.common.run_context.read_json', return_value={'state': 'completed'}):
+                with mock.patch('squeakview.common.run_context.read_live_snapshot', return_value={'state': 'completed'}):
                     session._watch()
                 self.assertEqual(session.state, expected)
 
@@ -119,7 +185,7 @@ class OptionalLiveTests(unittest.TestCase):
         session._stop.wait.return_value = False
         statuses = [{'state': 'running', 'heartbeat_monotonic': now, 'frames_processed': [0]}
                     for now in (0, 5, 10)]
-        with mock.patch('squeakview.common.run_context.read_json', side_effect=statuses), \
+        with mock.patch('squeakview.common.run_context.read_live_snapshot', side_effect=statuses), \
              mock.patch('squeakview.apps.inference.optional_live.mailbox_sequence', side_effect=[10, 20, 30]), \
              mock.patch('squeakview.apps.inference.optional_live.time.monotonic', side_effect=[0, 5, 10]):
             session._watch()
@@ -137,7 +203,7 @@ class OptionalLiveTests(unittest.TestCase):
         session.process.wait.return_value = -9
         session._stop = mock.Mock()
         session._stop.wait.return_value = False
-        with mock.patch('squeakview.common.run_context.read_json', side_effect=[
+        with mock.patch('squeakview.common.run_context.read_live_snapshot', side_effect=[
                 {'state': 'running', 'heartbeat_monotonic': now, 'frames_processed': [0]}
                 for now in (0, 10)]), \
              mock.patch('squeakview.apps.inference.optional_live.mailbox_sequence', return_value=0), \
@@ -154,7 +220,7 @@ class OptionalLiveTests(unittest.TestCase):
                 session.process = mock.Mock()
                 session.process.is_running.return_value = False
                 session.process.wait.return_value = code
-                with mock.patch('squeakview.common.run_context.read_json',
+                with mock.patch('squeakview.common.run_context.read_live_snapshot',
                                 return_value={'state': 'completed'}):
                     session.close()
                 self.assertEqual(session.state, 'degraded')

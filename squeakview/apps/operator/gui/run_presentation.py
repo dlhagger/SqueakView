@@ -237,7 +237,7 @@ def scan_capture_health(run_path: Path) -> CaptureHealthSnapshot:
         waiting=_nonnegative_int(recording.get("waiting_for_record_admission")),
         in_flight=_nonnegative_int(recording.get("encoder_in_flight")),
         sensor_temperature_c=temperature_value,
-        live_degraded=(run_context.read_json(
+        live_degraded=(run_context.read_live_snapshot(
             artifact_path(Path(run_path), "run_status.json")).get("live_services") or {}).get("state") == "degraded",
     )
 

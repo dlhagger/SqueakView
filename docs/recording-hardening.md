@@ -14,6 +14,19 @@ and timestamps can be proven; an unexplained discrepancy is still a failure.
   output goes to `_metadata/diagnostics/live_processing.log`. State and errors are
   recorded in the run status's `live_services`; its heartbeat is in
   `_metadata/diagnostics/live_status.json`.
+- Before killing a stalled worker, the watchdog requests a Python thread dump
+  using a native signal handler that does not need the GIL. Evidence goes to
+  `_metadata/diagnostics/live_stacks.log`; `live_hang.json` retains the last
+  heartbeat, frame counters, reason, and available Linux thread wait/syscall
+  information. Fatal live-worker crashes go to `live_crash.log`. Diagnostic
+  collection adds at most 0.5 seconds before forced termination; unavailable
+  kernel stacks or a blocked evidence write do not prevent termination. These
+  Python stacks identify the calling Python code, not a full C++/CUDA backtrace.
+  Runtime polling pins a complete published snapshot through its descriptor,
+  so atomic replacement does not invalidate the read. Other transient read
+  failures retain the last valid heartbeat and dump registration; the watchdog
+  waits for that heartbeat to expire rather than treating one unavailable
+  snapshot as a worker that never started.
 - Native gap events now include received-frame indices on each side, missing
   frame counts, and native/PTS timestamps. Finalization checks those timestamps
   against MP4 `stts`/`ctts` tables, and checks received + missing = controller

@@ -271,7 +271,7 @@ class RunManifestService:
     def output_snapshot(self, run_dir: Path) -> dict[str, Any]:
         artifacts = run_context.run_artifacts(run_dir)
         diagnostics_dir = artifact_path(run_dir, "diagnostics")
-        status = run_context.read_json(artifacts.status_json)
+        status = run_context.read_live_snapshot(artifacts.status_json)
         bottle_summary = run_context.bottle_summary(run_dir)
         video_files = sorted(run_dir.glob("raw*.mp4"))
         snapshot = {

@@ -104,9 +104,17 @@ class OptionalLiveSession:
 
     def _watch(self):
         progress = LiveProgressWatchdog(self.config.num_cameras)
+        last_status = {}
         while not self._stop.wait(0.5):
             try:
-                status = run_context.read_json(self.status_path)
+                status = run_context.read_live_snapshot(self.status_path)
+                # One unavailable read is not a dead worker.
+                # Keep its last heartbeat (and dump-handler handshake) until
+                # that heartbeat actually expires; never refresh it locally.
+                if status:
+                    last_status = status
+                else:
+                    status = last_status
                 if not self.process.is_running():
                     code = self.process.wait(timeout=0)
                     # A source EOS just before normal capture shutdown is okay.
@@ -130,19 +138,50 @@ class OptionalLiveSession:
                             inputs[index] = activity.source_count
                     error = progress.check(inputs, status.get("frames_processed"), now)
                     if error:
-                        self._report("degraded", error)
-                        self.process.send_signal_group(signal.SIGKILL)
+                        self._kill_stalled(error, status)
                         return
                 if ((heartbeat is None and now - self._started > 60)
                         or (heartbeat is not None and now - float(heartbeat) > 10)):
-                    self._report("degraded", "live processing stopped responding")
-                    self.process.send_signal_group(signal.SIGKILL)
+                    self._kill_stalled("live processing stopped responding", status)
                     return
             except Exception as exc:
                 self._report("degraded", f"live processing monitor failed: {exc}")
                 if self.process and self.process.is_running():
                     self.process.send_signal_group(signal.SIGKILL)
                 return
+
+    def _kill_stalled(self, reason, status):
+        self._report('degraded', reason)
+        # Only signal workers that confirmed registration. SIGUSR1's default
+        # action would otherwise terminate a worker still importing Python.
+        try:
+            if status.get('stack_dump_ready') is True:
+                self.process.send_signal_group(signal.SIGUSR1)
+            from .live_diagnostics import save_hang_evidence
+            completed = threading.Event()
+
+            def collect():
+                try:
+                    pid = getattr(getattr(self.process, 'p', None), 'pid', None)
+                    save_hang_evidence(self.status_path.parent, pid, reason, status)
+                except Exception as exc:
+                    self._emit(f'[LIVE] WARN: hang evidence could not be saved: {exc}')
+                finally:
+                    completed.set()
+
+            threading.Thread(target=collect, daemon=True, name='live-hang-evidence').start()
+            completed.wait(0.25)
+            if status.get('stack_dump_ready') is True:
+                try:
+                    self.process.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    pass
+            self._emit('[LIVE] Hang evidence: diagnostics/live_hang.json and live_stacks.log')
+        except Exception as exc:
+            self._emit(f'[LIVE] WARN: hang diagnostics failed: {exc}')
+        finally:
+            if self.process.is_running():
+                self.process.send_signal_group(signal.SIGKILL)
 
     def request_stop(self):
         # Capture stop and final cleanup both call this. A second SIGINT can
