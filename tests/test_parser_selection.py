@@ -10,7 +10,7 @@ class ParserSelectionTests(unittest.TestCase):
     def test_headers_and_version_follow_installed_sdk_layout(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for version, layout in (('9.1.0', 'sources/includes'), ('9.2.0', 'includes')):
+            for version, layout in (('9.2.0', 'includes'), ('9.2.3', 'includes')):
                 sdk = root / version
                 (sdk / layout).mkdir(parents=True)
                 (sdk / 'version').write_text(f'Version: {version}\n')
@@ -20,12 +20,10 @@ class ParserSelectionTests(unittest.TestCase):
                 self.assertEqual(sdk_headers(sdk), sdk / layout)
                 self.assertEqual(sdk_version(sdk), version)
 
-    def test_supported_versions_select_distinct_libraries(self):
+    def test_supported_patches_select_the_modern_library(self):
         with tempfile.TemporaryDirectory() as directory:
             sdk = Path(directory)
             for version, variant, suffix in (
-                ('9.1.0', 'legacy', 'nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so'),
-                ('9.1.4', 'legacy', 'nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so'),
                 ('9.2.0', 'yolo26', 'yolo26_pose_parser/build/libnvdsinfer_squeakview_pose.so'),
                 ('9.2.3', 'yolo26', 'yolo26_pose_parser/build/libnvdsinfer_squeakview_pose.so'),
             ):
@@ -39,7 +37,7 @@ class ParserSelectionTests(unittest.TestCase):
             sdk = Path(directory)
             with self.assertRaises(ValueError):
                 parser_variant(sdk)
-            for text in ('Version: 9.3.0\n', 'Version: 10.0.0\n', 'invalid\n'):
+            for text in ('Version: 9.1.0\n', 'Version: 9.1.4\n', 'Version: 9.3.0\n', 'Version: 10.0.0\n', 'invalid\n'):
                 (sdk / 'version').write_text(text)
                 with self.assertRaises(ValueError):
                     parser_variant(sdk)

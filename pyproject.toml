@@ -29,6 +29,7 @@ dependencies = [
 ]
 
 [project.scripts]
+squeakview = "squeakview.launcher:main"
 mousehouse-protocol-v2-test = "squeakview.tools.mousehouse_protocol_v2_test:main"
 
 [build-system]

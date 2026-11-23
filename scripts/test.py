@@ -38,8 +38,7 @@ def run_python_suite(suite, *, stream=sys.stderr):
 def native_suites(build_dir):
     for source, name, target in (
         ('native/flir_gst_source', 'flir', 'flir_source_eos_test'),
-        ('native/nvdsinfer_custom_impl_yolo/tests', 'pose', 'test_pose_parser'),
-        ('native/yolo26_pose_parser', 'pose_modern', 'pose_parser_boundary'),
+        ('native/yolo26_pose_parser', 'pose', 'pose_parser_boundary'),
     ):
         build = Path(build_dir) / name
         for command in (

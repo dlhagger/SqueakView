@@ -27,7 +27,6 @@ __pycache__/
 native/flir_gst_source/build/
 native/yolo26_pose_parser/build/
 native/yolo26_pose_parser/build-comparison/
-native/nvdsinfer_custom_impl_yolo/.build-config*
 native/**/*.o
 native/**/*.so
 build/

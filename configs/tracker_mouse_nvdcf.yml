@@ -1,4 +1,4 @@
-# DeepStream 9.1 NvDCF starting profile for laboratory mice on Jetson Orin Nano.
+# DeepStream 9.2 NvDCF starting profile for laboratory mice on Jetson Orin Nano.
 # Orin Nano does not expose a PVA device. Use the stable CUDA NvDCF tracker
 # instead of the alpha VPI tracker, which probes PVA and logs a device-node
 # failure on this platform. Tune association values from annotated SqueakView

@@ -2,10 +2,10 @@
 set -euo pipefail
 
 APP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BASELINE="${SQUEAKVIEW_POSE_BASELINE:-$APP_ROOT/native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so}"
+BASELINE="${SQUEAKVIEW_POSE_BASELINE:-}"
 if [ ! -f "$BASELINE" ]; then
   printf '[FAIL] Baseline parser missing: %s\n' "$BASELINE" >&2
-  printf 'Build the legacy parser first or set SQUEAKVIEW_POSE_BASELINE to a model-package parser.\n' >&2
+  printf 'Set SQUEAKVIEW_POSE_BASELINE to an accepted model-package parser.\n' >&2
   exit 1
 fi
 BUILD_DIR="$APP_ROOT/native/yolo26_pose_parser/build-comparison"

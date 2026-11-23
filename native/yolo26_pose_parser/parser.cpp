@@ -1,4 +1,4 @@
-// Parser-only YOLO26 end-to-end detector callback for DeepStream 9.1/9.2.
+// Parser-only YOLO26 end-to-end detector callback for DeepStream 9.2.
 // Pose keypoints are decoded frame-by-frame from output tensor metadata by PyServiceMaker.
 
 #include <algorithm>
@@ -183,10 +183,9 @@ static bool decode_yolo26_pose(const NvDsInferLayerInfo& L,
     objects.emplace_back(o);
   }
 
-  // DeepStream Service Maker consumes output-tensor-meta frame by frame.
-  // Do not publish YOLO26 poses through the legacy process-global cache; the
-  // parser remains enabled only to preserve nvinfer's detector contract for
-  // nvtracker, and its generated objects are filtered before downstream use.
+  // Service Maker consumes output-tensor-meta frame by frame. This callback
+  // provides nvinfer's detector contract for nvtracker; its generated objects
+  // are filtered before downstream use.
   return true;
 }
 extern "C" __attribute__((visibility("default"))) bool NvDsInferParseYolo26Pose(

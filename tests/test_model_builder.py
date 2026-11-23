@@ -15,6 +15,7 @@ from squeakview.model_builder import (
     _export_arguments,
     _prepare_export_environment,
     _require_vendor_tensorrt,
+    _require_supported_tensorrt,
     _validate_export_metadata,
     BuildResult,
     discover_model_sources,
@@ -105,8 +106,13 @@ class ModelBuilderTests(unittest.TestCase):
     def test_build_rejects_tensor_rt_shadowing_inside_venv(self) -> None:
         with mock.patch.object(sys, "prefix", "/project/.venv"), mock.patch.object(sys, "base_prefix", "/usr"):
             _require_vendor_tensorrt("/usr/lib/python3.12/dist-packages/tensorrt/__init__.py")
+            _require_vendor_tensorrt(
+                "/project/.venv/vendor/tensorrt-10.16.2.10/usr/lib/python3.12/dist-packages/tensorrt/__init__.py"
+            )
             with self.assertRaisesRegex(RuntimeError, "instead of JetPack"):
                 _require_vendor_tensorrt("/project/.venv/lib/python3.12/site-packages/tensorrt/__init__.py")
+            with self.assertRaisesRegex(RuntimeError, "instead of JetPack"):
+                _require_vendor_tensorrt("/project/.venv/vendor/tensorrt-11/usr/lib/tensorrt/__init__.py")
 
     def test_export_contract_is_explicit_for_both_precisions(self) -> None:
         for precision, quantize in (("fp16", 16), ("fp32", 32)):
@@ -117,6 +123,14 @@ class ModelBuilderTests(unittest.TestCase):
             self.assertIs(args["dynamic"], False)
             self.assertEqual(args["max_det"], 300)
             self.assertEqual(args["quantize"], quantize)
+
+    def test_builder_rejects_incompatible_system_tensorrt_before_export(self) -> None:
+        for version in ("10.16.1.7", "10.16.2.10"):
+            _require_supported_tensorrt(version)
+        for version in ("11.4.1.31", "10.15.0", "unknown"):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(RuntimeError, "requires TensorRT 10.16"):
+                    _require_supported_tensorrt(version)
 
     def test_export_metadata_rejects_head_and_shape_or_precision_mismatch(self) -> None:
         import copy

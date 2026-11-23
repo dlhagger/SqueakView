@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from squeakview.model_package import ModelPackageInfo, validate_model_package
+from squeakview.common.tensorrt_runtime import trtexec_executable
 
 
 RENAME_EXCHANGE = 2
@@ -50,6 +51,8 @@ def run_trtexec_validation(
             f"trtexec output limit must be between 1 and "
             f"{MAX_TRTEXEC_OUTPUT_BYTES} bytes"
         )
+    if executable == "trtexec":
+        executable = trtexec_executable()
     command = (
         executable,
         f"--loadEngine={engine}",

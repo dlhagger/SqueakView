@@ -22,5 +22,3 @@ DEEPSTREAM_SDK_ROOT = _resolve_deepstream_sdk()
 NATIVE_ROOT = APP_ROOT / "native"
 FLIR_GST_SOURCE_ROOT = NATIVE_ROOT / "flir_gst_source"
 FLIR_GST_PLUGIN_DIR = FLIR_GST_SOURCE_ROOT / "build"
-# Legacy-library location only; SDK-specific defaults use common.parser_selection.
-CUSTOM_YOLO_LIB = NATIVE_ROOT / "nvdsinfer_custom_impl_yolo" / "libnvdsinfer_custom_impl_Yolo.so"

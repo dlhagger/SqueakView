@@ -156,6 +156,21 @@ class ModelBuildPromotionTests(unittest.TestCase):
         self.assertIn("--infStreams=1", evidence["command"])
         self.assertNotIn("--streams=1", evidence["command"])
 
+    def test_default_validation_uses_private_tool_without_path_activation(self) -> None:
+        bundle = Path(self.temp_dir.name) / "private-tensorrt"
+        executable = bundle / "usr/bin/trtexec"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\nprintf 'private TensorRT tool'\nexit 0\n")
+        executable.chmod(0o755)
+        engine = Path(self.temp_dir.name) / "model.engine"
+        engine.write_bytes(b"engine")
+        with mock.patch(
+            "squeakview.common.tensorrt_runtime.bundled_tensorrt_root", return_value=bundle
+        ), mock.patch.dict(os.environ, {"PATH": "/no-system-tools"}):
+            evidence = model_build.run_trtexec_validation(engine)
+        self.assertTrue(evidence["passed"])
+        self.assertEqual(evidence["command"][0], str(executable))
+
     def test_trtexec_stdout_handle_is_closed_after_success(self) -> None:
         executable = Path(self.temp_dir.name) / "fake-trtexec"
         executable.write_text("#!/bin/sh\nprintf 'ok\\n'\n")

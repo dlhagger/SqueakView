@@ -84,8 +84,8 @@ def _prepend_env_path(env: dict[str, str], key: str, paths: list[Path]) -> None:
 
 
 def _deepstream_runtime_env() -> dict[str, str]:
-    # DeepStream 9.1 still selects Stream multiplexer 2 through this
-    # compatibility switch.  Pin it rather than inheriting a login-shell
+    # DeepStream 9.2 selects Stream multiplexer 2 through this
+    # environment switch.  Pin it rather than inheriting a login-shell
     # value so acquisition and post-run replay use the same mux implementation.
     env: dict[str, str] = {"USE_NEW_NVSTREAMMUX": "yes"}
     sdk = squeakview_config.DEEPSTREAM_SDK_ROOT

@@ -357,11 +357,11 @@ class OperatorBackend:
                 ).start()
                 return
         if not bool(getattr(self.launch_cfg, "serial_enabled", False)):
-            self._log("[BACKEND] inference ready; waiting for first camera frames")
+            self._log("[BACKEND] capture ready; waiting for first camera frames")
         elif not bool(getattr(self.launch_cfg, "trigger_on", False)):
-            self._log("[BACKEND] inference ready; waiting for behavioral controller START acknowledgement")
+            self._log("[BACKEND] capture ready; waiting for behavioral controller START acknowledgement")
         else:
-            self._log("[BACKEND] inference ready; waiting for controller START and first TTL")
+            self._log("[BACKEND] capture ready; waiting for controller START and first TTL")
         self._inference_ready.set()
 
     def _confirm_recording(self) -> bool:

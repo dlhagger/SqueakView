@@ -25,9 +25,8 @@ The setup application starts a separate worker process which:
 6. atomically publishes the complete package; and
 7. selects it as the project default.
 
-New model packages bundle the parser-only library on DeepStream 9.2 and the
-legacy library on 9.1. Native setup and model packaging share the same installed
-SDK-version selector. Existing model packages keep their own parser artifact.
+New model packages bundle the parser-only library on DeepStream 9.2.
+Native setup and model packaging reject other SDK versions. Existing model packages keep their own parser artifact.
 
 The builder disables Ultralytics automatic dependency installation before importing
 it (`YOLO_AUTOINSTALL=false`) and requires JetPack's system TensorRT rather than

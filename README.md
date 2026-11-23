@@ -2,8 +2,9 @@
 
 SqueakView is a scientific FLIR capture, behavior logging, and YOLO26 pose
 inference application for the NVIDIA Jetson Orin Nano. The current platform is
-JetPack 7.2.1, CUDA 13.2, TensorRT 10.16, and DeepStream 9.1 using the
-PyServiceMaker Pipeline API.
+JetPack 7.2.2, CUDA 13.2, released DeepStream 9.2.0, and private TensorRT
+10.16.2.10 build tools using the PyServiceMaker Pipeline API. JetPack's system
+TensorRT 11 can remain installed; SqueakView uses DeepStream's TensorRT 10 runtime.
 
 The current development baseline is one FLIR camera at 1440×1080 and 30 FPS,
 with optional RP2040 serial triggering/logging and a batch-1 TensorRT pose
@@ -57,7 +58,7 @@ future release and is not part of the initial workflow.
 build_engine/                    Project Setup model-builder documentation
 configs/                         Runtime tracker configuration
 native/flir_gst_source/          Scientific Spinnaker GStreamer source
-native/nvdsinfer_custom_impl_yolo/ DeepStream YOLO26 detector parser
+native/yolo26_pose_parser/     DeepStream YOLO26 detector parser
 resources/project_template/      New-project tasks, qualification, and model seeds
 squeakview/apps/inference/        Live and offline PyServiceMaker pipelines
 squeakview/apps/operator/         Qt operator GUI and run lifecycle
@@ -113,6 +114,20 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s tests
 bash squeakview.sh
 ```
 
+You can also launch from the UV environment:
+
+```bash
+uv run --locked squeakview
+# Or open a particular project:
+uv run --locked squeakview "$HOME/Documents/SqueakView Projects/My Project"
+```
+
+This uses the same durable supervisor as `bash squeakview.sh` and keeps the GUI,
+model builder and acquisition workers on UV's Python interpreter. The environment
+must first be provisioned with `scripts/setup_jetson.sh` for the Jetson system
+packages and private TensorRT 10 tools. `uv run --locked python -m squeakview`
+is also supported.
+
 Routine application updates do not require a reboot. Git, dependency, and
 native-build operations never target `~/Documents/SqueakView Projects`, so they
 cannot replace scientific data. See [the project workflow](docs/PROJECT_WORKFLOW.md)
@@ -140,8 +155,8 @@ It builds the FLIR GStreamer source and DeepStream YOLO parser, adds the user to
 `dialout`, and creates `~/Documents/SqueakView Projects` if absent.
 
 Setup detects the installed DeepStream version and headers before changing the
-system: 9.1 selects the legacy parser and 9.2 selects the parser-only build.
-Both use the same SDK root throughout setup. Missing headers or unsupported
+system: only DeepStream 9.2 is supported, using the parser-only build.
+Setup uses the same SDK root throughout. Missing headers or unsupported
 versions stop setup with an error. This provisions SqueakView against the SDK
 already installed; it does not upgrade or replace JetPack/DeepStream.
 
@@ -176,12 +191,12 @@ components without sudo through `bash scripts/build_native.sh`.
 
 Install these before setting up the repository:
 
-- JetPack 7.2.1 with CUDA/TensorRT
-- NVIDIA DeepStream 9.1 or 9.2 at `/opt/nvidia/deepstream/deepstream`
+- JetPack 7.2.2 with CUDA 13.2 and the TensorRT 10 runtime packages provisioned by setup
+- Released NVIDIA DeepStream 9.2.0 at `/opt/nvidia/deepstream/deepstream`
 - FLIR/Teledyne Spinnaker SDK at `/opt/spinnaker`
 - [Spinnaker for the JetPack 7.2 series](https://teledyne.app.box.com/s/ccj73r4xu8rusbnu12pytcisbexdchfa)
   is currently distributed as a beta build by Teledyne and is deployed here on
-  JetPack 7.2.1.
+  JetPack 7.2.2. Earlier qualification records retain their recorded platform versions.
 - GStreamer runtime and development headers
 - Jetson Orin Nano specific install of FFmpeg (`scripts/setup_jetson.sh` installs it)
 - CMake, a C++ compiler, and `uv`
@@ -198,13 +213,12 @@ Expected vendor paths:
 ```text
 /opt/spinnaker/include
 /opt/spinnaker/lib
-/opt/nvidia/deepstream/deepstream/includes  # 9.2; sources/includes on 9.1
+/opt/nvidia/deepstream/deepstream/includes
 /usr/local/cuda-13.2
 ```
 
-Native builds detect both the DeepStream 9.1 (`sources/includes`) and 9.2
-(`includes`) header layouts. This does not establish full application runtime
-compatibility with 9.2. Override the DeepStream root when necessary:
+Native builds require DeepStream 9.2 and its `includes/` header layout.
+Override the DeepStream root when necessary:
 
 ```bash
 export SQUEAKVIEW_DEEPSTREAM_SDK=/opt/nvidia/deepstream/deepstream
@@ -254,34 +268,28 @@ standalone camera smoke tests and complete metadata contract.
 
 ### DeepStream YOLO parser
 
-Native setup and the model builder select the parser from the installed SDK:
+Native setup and the model builder require DeepStream 9.2 and use
+`native/yolo26_pose_parser/build/libnvdsinfer_squeakview_pose.so`, the parser-only
+C++17 build with no deprecated TensorRT plugins. DeepStream 9.1 and its legacy
+parser build are no longer supported.
 
-- **DeepStream 9.2:** `native/yolo26_pose_parser/build/libnvdsinfer_squeakview_pose.so`,
-  the validated parser-only C++17 build with no deprecated TensorRT plugins.
-- **DeepStream 9.1:** `native/nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so`,
-  the retained legacy implementation.
+Run `bash scripts/build_native.sh` after SDK changes. Setup, native builds,
+model packaging, and acquisition preflight reject unsupported SDK versions.
+Existing model packages retain their bundled parser; changing the build default
+does not rewrite them or require rebuilding an accepted engine. Newly built
+model packages receive the parser-only library.
 
-Run `bash scripts/build_native.sh` after SDK changes. Both scripts read the SDK
-`version` file through the same selector and reject unknown versions. Existing
-model packages retain their bundled parser; changing the build default does not
-rewrite them or require rebuilding an accepted engine. Newly built model
-packages receive the library selected for the installed SDK.
-
-Native builds refresh the header layout for the selected SDK. Legacy builds
-also track SDK identity, ABI headers, CUDA selection, and build flags so a
-changed environment rebuilds the parser instead of reusing stale objects.
-Optional parser comparison builds use a separate `build-comparison` directory;
-normal setup does not depend on a previously selected comparison library.
+The parser and its boundary tests are self-contained under
+`native/yolo26_pose_parser/`. Optional equivalence tests use a separate
+`build-comparison` directory and require `SQUEAKVIEW_POSE_BASELINE` to point to
+an accepted model-package parser. Normal setup needs no comparison baseline.
+Run `bash scripts/build_pose_parser.sh` after setting that variable.
 
 Run provenance records the selected SDK root and build version. Qualification
-requires the matching installed `deepstream-9.1` or `deepstream-9.2` package
-identity, including the patch version when the recorded build supplies it.
-Having both packages installed does not require both for the selected runtime.
-Archived evidence is validated from its recorded identity without rewriting it.
+validates the matching installed DeepStream package identity, including the
+patch version when the recorded build supplies it. Historical 9.1 evidence
+remains readable and is validated from its recorded identity without rewriting it.
 
-For explicit legacy builds, run
-`make -C native/nvdsinfer_custom_impl_yolo CUDA_VER=13.2 -j`.
-For parser-only equivalence testing, run `bash scripts/build_pose_parser.sh`.
 See [parser validation and compatibility limits](native/yolo26_pose_parser/README.md).
 
 The library satisfies DeepStream's detector parser ABI for the YOLO26
@@ -294,6 +302,38 @@ Rebuild both native components after JetPack, CUDA, TensorRT, DeepStream, or
 Spinnaker upgrades.
 
 ## Build a YOLO26 pose model package
+
+Released DeepStream 9.2 uses TensorRT 10.16. SqueakView pins NVIDIA's ARM64
+TensorRT **10.16.2.10** Python bindings and `trtexec` in `.venv/vendor`, with
+SHA256-verified packages from NVIDIA's Jetson repository. This lets JetPack
+7.2.2 retain its system TensorRT 11 packages while SqueakView builds and checks
+engines using TensorRT 10. The three major-versioned TensorRT 10 runtime
+packages remain OS dependencies; `scripts/setup_jetson.sh` provisions them and
+installs the private tools automatically.
+
+On an already provisioned Jetson with the matching TensorRT 10 runtimes, run:
+
+```bash
+python3 scripts/install_tensorrt10.py
+.venv/bin/python -c 'import tensorrt; print(tensorrt.__version__, tensorrt.__file__)'
+```
+
+The reported version must be `10.16.2.10` and its path must be under
+`.venv/vendor/tensorrt-10.16.2.10`. Restart SqueakView after installing this bundle
+so existing workers release previously imported bindings. Recreate the bundle
+after replacing `.venv`. TensorRT is intentionally not a UV/PyPI dependency;
+the private bindings use the same NVIDIA TensorRT 10 runtime as DeepStream.
+The model validator selects the bundled `trtexec` directly, regardless of the
+system `PATH`. No system TensorRT downgrade, ModelOpt install, or development
+DeepStream SDK is needed for this path.
+
+Version, Debian package names and tool checksums are maintained in
+`squeakview/common/tensorrt_runtime.py`. Setup and the private installer read
+that same definition. If the bundled `trtexec` is missing, model validation
+stops with repair instructions rather than selecting the system tool.
+
+Rebuild model packages after a Jetson Linux update: the existing package
+identity check still requires the recorded OS/device identity to match.
 
 Fresh projects contain model inputs but no generated TensorRT packages. Launch
 SqueakView normally:
@@ -389,7 +429,7 @@ SERIAL_PORT=/dev/ttyACM0 PYTHON_BIN=.venv/bin/python bash scripts/preflight.sh
 Preflight checks the DeepStream install, required GStreamer elements, the FLIR
 plugin and capture-ledger API, NvDCF dependencies, the selected model package,
 Jetson memory state, `ffprobe`, and Python imports. It exercises DeepStream
-9.1 Stream multiplexer 2 through the same VIC-to-surface-array NVMM path used
+9.2 Stream multiplexer 2 through the same VIC-to-surface-array NVMM path used
 by acquisition. Before every recording, it also
 creates a temporary 30-frame H.264 clip and fully decodes it through the same
 isolated `nvv4l2decoder` used for anomaly escalation. Acquisition is

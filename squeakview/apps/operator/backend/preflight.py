@@ -226,7 +226,7 @@ def failure_message(output: str) -> str:
         or "[fail] legacy nvstreammux" in lowered
     ):
         return (
-            "DeepStream 9.1 Stream multiplexer 2 could not process the required "
+            "DeepStream 9.2 Stream multiplexer 2 could not process the required "
             "Jetson VIC/NVMM path.\n\nRun sudo apt update && sudo apt "
             "full-upgrade, reboot, and run scripts/preflight.sh again."
         )

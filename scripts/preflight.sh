@@ -207,7 +207,7 @@ check_new_streammux_path() {
     *"config-file-path"*) ;;
     *)
       printf '[FAIL] DeepStream new nvstreammux could not be selected.\n'
-      printf '       SqueakView requires DeepStream 9.1 Stream multiplexer 2.\n'
+      printf '       SqueakView requires DeepStream 9.2 Stream multiplexer 2.\n'
       fail=1
       return 0
       ;;
@@ -232,7 +232,7 @@ check_new_streammux_path() {
       ! mux.sink_0 2>&1)"; then
     printf '[FAIL] DeepStream new nvstreammux VIC/NVMM self-test failed: %s\n' \
       "$mux_probe_detail"
-    printf '       Verify the DeepStream 9.1 and Jetson multimedia packages, then reboot.\n'
+    printf '       Verify the DeepStream 9.2 and Jetson multimedia packages, then reboot.\n'
     fail=1
     return 0
   fi
@@ -265,6 +265,11 @@ if [ -d "$DEEPSTREAM_SDK" ]; then
 else
   printf '[FAIL] DeepStream SDK directory missing: %s\n' "$DEEPSTREAM_SDK"
   fail=1
+fi
+
+if ! "$PYTHON_BIN" "$ROOT/squeakview/common/parser_selection.py" --sdk "$DEEPSTREAM_SDK" --version; then
+  printf '[FAIL] SqueakView requires DeepStream 9.2.\n'
+  exit 1
 fi
 
 export LD_LIBRARY_PATH="$DEEPSTREAM_SDK/lib:${LD_LIBRARY_PATH:-}"
@@ -316,7 +321,7 @@ if [ "$INFERENCE_ENABLED" -eq 1 ]; then
   elif ldd "$TRACKER_LIB" 2>/dev/null | grep -q 'not found'; then
     printf '[FAIL] DeepStream tracker has unresolved runtime dependencies:\n'
     ldd "$TRACKER_LIB" 2>/dev/null | grep 'not found'
-    printf '       Install the DeepStream 9.1 prerequisites (including libmosquitto1).\n'
+    printf '       Install the DeepStream 9.2 prerequisites (including libmosquitto1).\n'
     fail=1
   else
     pass "DeepStream tracker runtime dependencies resolved"

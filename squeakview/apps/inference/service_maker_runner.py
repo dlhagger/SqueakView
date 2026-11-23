@@ -1,4 +1,4 @@
-"""DeepStream 9.1/9.2 capture runner built on the PyServiceMaker Pipeline API."""
+"""DeepStream 9.2 capture runner built on the PyServiceMaker Pipeline API."""
 from __future__ import annotations
 
 from squeakview.common.run_layout import artifact_path
@@ -228,8 +228,7 @@ class ServiceMakerApp:
         self.record_telemetry = list(resources.recording_telemetry)
         self.preview_boundaries = list(resources.preview_boundaries)
         print(
-            f"[{ts()}] [INFO] PyServiceMaker pipeline built: cameras={self.config.num_cameras} "
-            f"inference={'on' if self.config.enable_infer else 'off'} "
+            f"[{ts()}] [CAPTURE] PyServiceMaker recording pipeline built: cameras={self.config.num_cameras} "
             f"run_dir={self.run_dir}",
             flush=True,
         )
@@ -250,7 +249,7 @@ class ServiceMakerApp:
                     ready_origin=self._ready_origin,
                 )
             )
-            _safe_print(f"[{ts()}] [READY] inference playing")
+            _safe_print(f"[{ts()}] [READY] capture playing")
         elif isinstance(message, EOSMessage):
             if not self._explicit_stop_requested and self.exit_code == 0:
                 self.exit_code = 1

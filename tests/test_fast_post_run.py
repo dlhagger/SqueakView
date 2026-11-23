@@ -19,7 +19,12 @@ class FastPostRunTests(unittest.TestCase):
         write_health(self.root)
         write_gap(self.root)
         (self.root / 'raw.mp4').write_bytes(timed_video())
-        (self.root / 'frames.csv').write_text('stream_id,camera_serial,deepstream_frame_number,source_sequence_index\n0,camera,2,2\n')
+        row = [""] * len(FrameCsvOperator.HEADERS)
+        row[:4] = ["0", "camera", "2", "2"]
+        with (self.root / 'frames.csv').open('w', newline='') as handle:
+            writer = csv.writer(handle)
+            writer.writerow(FrameCsvOperator.HEADERS)
+            writer.writerow(row)
         (self.root / 'record_admission.csv').write_text('stream_id,record_frame_index,pts_ns\n0,2,133333333\n')
         run_context.update_status(self.root, expected_ttl_count=5)
         result = post_run.fast_finalize_run(self.root, camera_count=1)

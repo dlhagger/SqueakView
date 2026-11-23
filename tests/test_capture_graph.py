@@ -413,6 +413,7 @@ class CaptureGraphTests(ServiceMakerCase):
                                 "location": str(expected_video),
                                 "qos": False,
                                 "sync": False,
+                                "async": False,
                             },
                         ),
                     )

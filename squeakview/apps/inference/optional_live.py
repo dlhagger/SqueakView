@@ -38,11 +38,18 @@ class OptionalLiveSession:
             pass
 
     def _report(self, state, error=None):
+        changed = self.state != state
         self.state = state
         payload = {"state": state, "error": error, "isolated_process": True,
                    "inference_requested": self.config.enable_infer,
                    "preview_requested": bool(self.config.preview_sockets),
                    "recoverable_offline": True}
+        if changed:
+            self._emit(
+                f"[LIVE] inference/preview worker {state}: "
+                f"inference_requested={'yes' if self.config.enable_infer else 'no'} "
+                f"preview_requested={'yes' if self.config.preview_sockets else 'no'}"
+            )
         try:
             run_context.update_status(Path(self.config.run_dir), live_services=payload)
         except Exception as exc:

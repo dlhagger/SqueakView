@@ -21,6 +21,7 @@ class JetsonSetupTests(unittest.TestCase):
         common = self.app / 'squeakview/common'
         common.mkdir(parents=True)
         shutil.copy(REPO / 'squeakview/common/parser_selection.py', common)
+        shutil.copy(REPO / 'squeakview/common/tensorrt_runtime.py', common)
         self.sdk = self.root / 'sdk'
         (self.sdk / 'includes').mkdir(parents=True)
         (self.sdk / 'includes/nvdsinfer_custom_impl.h').touch()
@@ -28,6 +29,7 @@ class JetsonSetupTests(unittest.TestCase):
         shutil.copy(REPO / 'scripts/systemd/firmware-path.service', scripts / 'systemd')
         shutil.copy(REPO / 'scripts/systemd/squeakview-usb.conf', scripts / 'systemd')
         shutil.copy(REPO / 'scripts/jetson_usb_recovery.py', scripts)
+        (scripts / 'install_tensorrt10.py').write_text('print("private TensorRT setup")\n')
         self.release = self.root / 'nv_tegra_release'
         self.release.write_text('# R39 (release), REVISION: 2.1, BOARD: generic\n')
         self.unit = self.root / 'firmware-path.service'
@@ -97,6 +99,8 @@ esac
         self.assertEqual(commands.count('native-build\n'), 2)
         self.assertIn('libgstrtspserver-1.0-0', commands)
         self.assertIn('libmosquitto1 libmosquitto-dev', commands)
+        self.assertIn('libnvinfer10=10.16.2.10-1+cuda13.2', commands)
+        self.assertIn('private TensorRT setup', result.stdout)
         self.assertIn('systemctl enable firmware-path.service', commands)
         self.assertIn('systemctl mask sleep.target suspend.target hibernate.target', commands)
         self.assertIn('sleep-inactive-ac-type nothing', commands)
@@ -126,9 +130,9 @@ esac
         self.assertEqual(self.unit.read_text(), '[Service]\nExecStart=/bin/false\n')
         self.assertNotIn('native-build', self.log.read_text())
 
-    def test_both_sdk_versions_are_detected_and_forwarded_to_native_build(self):
-        for version, variant, layout in (('9.1.0', 'legacy', 'sources/includes'),
-                                         ('9.2.0', 'yolo26', 'includes')):
+    def test_supported_sdk_patches_are_forwarded_to_native_build(self):
+        for version, variant, layout in (('9.2.0', 'yolo26', 'includes'),
+                                         ('9.2.3', 'yolo26', 'includes')):
             sdk = self.root / version
             (sdk / layout).mkdir(parents=True)
             (sdk / layout / 'nvdsinfer_custom_impl.h').touch()
@@ -140,7 +144,7 @@ esac
             self.assertIn(f'native-sdk={sdk}', self.log.read_text())
 
     def test_unsupported_or_incomplete_sdk_stops_before_system_changes(self):
-        for version in ('9.3.0', '9.2.0'):
+        for version in ('9.1.0', '9.3.0', '9.2.0'):
             (self.sdk / 'version').write_text(f'Version: {version}\n')
             (self.sdk / 'includes/nvdsinfer_custom_impl.h').unlink(missing_ok=True)
             result = self.run_setup()

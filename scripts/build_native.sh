@@ -30,12 +30,6 @@ for path in "${required_paths[@]}"; do
   fi
 done
 
-CUDA_VER="${CUDA_VER:-$(/usr/local/cuda/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1)}"
-if [ -z "$CUDA_VER" ] || [ ! -x "/usr/local/cuda-$CUDA_VER/bin/nvcc" ]; then
-  printf '[FAIL] Could not resolve a versioned CUDA toolkit from nvcc (detected: %s).\n' "${CUDA_VER:-none}" >&2
-  exit 1
-fi
-
 printf 'Building FLIR GStreamer source with %s parallel job(s)...\n' "$BUILD_JOBS"
 cmake \
   -S "$APP_ROOT/native/flir_gst_source" \
@@ -44,23 +38,15 @@ cmake \
   -DDEEPSTREAM_INCLUDES="$DEEPSTREAM_INCLUDES"
 cmake --build "$APP_ROOT/native/flir_gst_source/build" --parallel "$BUILD_JOBS"
 
-# Share the exact SDK-version policy with the model-package builder.
-if [ "$PARSER_VARIANT" = yolo26 ]; then
-  printf 'Building parser-only YOLO26 library for DeepStream 9.2...\n'
-  cmake -S "$APP_ROOT/native/yolo26_pose_parser" -B "$APP_ROOT/native/yolo26_pose_parser/build" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_TESTING=ON \
-    -DBASELINE_PARSER= \
-    -DDEEPSTREAM_SDK="$DEEPSTREAM_SDK" \
-    -DDEEPSTREAM_INCLUDES="$DEEPSTREAM_INCLUDES"
-  cmake --build "$APP_ROOT/native/yolo26_pose_parser/build" --parallel "$BUILD_JOBS"
-  ctest --test-dir "$APP_ROOT/native/yolo26_pose_parser/build" --output-on-failure --no-tests=error
-else
-  printf 'Building legacy DeepStream 9.1 YOLO parser against CUDA %s...\n' "$CUDA_VER"
-  make -C "$APP_ROOT/native/nvdsinfer_custom_impl_yolo" \
-    "CUDA_VER=$CUDA_VER" "DEEPSTREAM_SDK=$DEEPSTREAM_SDK" \
-    "DEEPSTREAM_INCLUDES=$DEEPSTREAM_INCLUDES" -j"$BUILD_JOBS"
-fi
+printf 'Building parser-only YOLO26 library for DeepStream 9.2...\n'
+cmake -S "$APP_ROOT/native/yolo26_pose_parser" -B "$APP_ROOT/native/yolo26_pose_parser/build" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON \
+  -DBASELINE_PARSER= \
+  -DDEEPSTREAM_SDK="$DEEPSTREAM_SDK" \
+  -DDEEPSTREAM_INCLUDES="$DEEPSTREAM_INCLUDES"
+cmake --build "$APP_ROOT/native/yolo26_pose_parser/build" --parallel "$BUILD_JOBS"
+ctest --test-dir "$APP_ROOT/native/yolo26_pose_parser/build" --output-on-failure --no-tests=error
 
 FLIR_PLUGIN="$APP_ROOT/native/flir_gst_source/build/gstflirspinsrc.so"
 for output in "$FLIR_PLUGIN" "$YOLO_PARSER"; do
@@ -82,6 +68,8 @@ if ! nm -D "$YOLO_PARSER" 2>/dev/null | grep -E '[[:space:]]NvDsInferParseYolo26
   exit 1
 fi
 
+printf '[INFO] Plugin discovery may warn that optional Triton plugin libnvdsgst_inferserver.so cannot find libgrpcclient.so.\n'
+printf '[INFO] That specific warning can be ignored for SqueakView, which uses nvinfer instead of nvinferserver.\n'
 FLIR_INSPECT="$(
   GST_PLUGIN_PATH="$APP_ROOT/native/flir_gst_source/build:$DEEPSTREAM_SDK/lib/gst-plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
     gst-inspect-1.0 flirspinsrc

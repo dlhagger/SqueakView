@@ -1,8 +1,5 @@
 // CPU-only boundary tests against the production parser. No CUDA execution.
-#ifndef SQUEAKVIEW_POSE_PARSER_SOURCE
-#define SQUEAKVIEW_POSE_PARSER_SOURCE "../yolo_pose_parser.cpp"
-#endif
-#include SQUEAKVIEW_POSE_PARSER_SOURCE
+#include "../parser.cpp"
 #include <cassert>
 
 int main() {

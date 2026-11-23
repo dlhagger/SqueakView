@@ -648,7 +648,7 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
         return StartupResult(
             False, prepared, serial_handle, capture, error
         )
-    hooks.log("[DS] inference launched")
+    hooks.log("[CAPTURE] recording process launched")
 
     # Readiness is required for camera-only runs as well as controller runs.
     start_action = "START" if cfg.trigger_on else "START_BEHAVIOR"
@@ -657,12 +657,12 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
         timeout = hooks.ready_timeout()
         ready = hooks.wait_ready(timeout)
     except Exception as exc:
-        error = f"inference readiness check failed: {type(exc).__name__}: {exc}"
+        error = f"capture readiness check failed: {type(exc).__name__}: {exc}"
         hooks.log(f"[BACKEND] {error}")
         hooks.finalize_failure(error, True)
         return StartupResult(False, prepared, serial_handle, capture, error)
     if not ready:
-        error = f"inference was not ready within {timeout:.1f}s; controller was not started"
+        error = f"capture was not ready within {timeout:.1f}s; controller was not started"
         hooks.log(f"[BACKEND] {error}")
         hooks.finalize_failure(error, True)
         return StartupResult(False, prepared, serial_handle, capture, error)
@@ -671,7 +671,7 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
         hooks.finalize_failure(error, True)
         return StartupResult(False, prepared, serial_handle, capture, error)
     if hooks.run_finalized() or not capture.is_running():
-        error = "inference exited before the controller could be started"
+        error = "capture exited before the controller could be started"
         hooks.log(f"[BACKEND] {error}")
         hooks.finalize_failure(error, False)
         return StartupResult(False, prepared, serial_handle, capture, error)
@@ -681,7 +681,7 @@ def start_run(request: StartupRequest, hooks: StartupHooks) -> StartupResult:
     frame_deadline = hooks.monotonic() + FIRST_FRAME_TIMEOUT_S
     if serial_handle is not None:
         try:
-            hooks.log(f"[BACKEND] inference ready; sending {start_action}")
+            hooks.log(f"[BACKEND] capture ready; sending {start_action}")
             if not hooks.start_controller(serial_handle, int(cfg.arduino_fps)):
                 error = f"startup cancelled before controller {start_action}"
                 hooks.log(f"[BACKEND] {error}")

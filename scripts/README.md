@@ -45,8 +45,8 @@ its serial connection participates in the shared USB lock.
 | Script | Purpose | When to use it |
 | --- | --- | --- |
 | `setup_jetson.sh` | Install OS packages, configure serial access, disable sleep, enable the R39.2.x firmware workaround, sync the UV environment, and build native components as the desktop user. | Initial machine setup; it requests a reboot afterward. |
-| `build_pose_parser.sh` | Build the parser-only YOLO26 candidate and compare it against the legacy/model-package library. | Explicit equivalence testing; does not modify existing model packages. |
-| `build_native.sh` | Build and check the FLIR source and SDK-selected parser (9.2 parser-only; 9.1 legacy). | After native source changes or SDK updates. It does not install OS packages. |
+| `build_pose_parser.sh` | Build the parser-only YOLO26 candidate and compare it against an explicit `SQUEAKVIEW_POSE_BASELINE` library. | Explicit equivalence testing; does not modify existing model packages. |
+| `build_native.sh` | Build and check the FLIR source and DeepStream 9.2 parser-only library. | After native source changes or SDK updates. It does not install OS packages. |
 | `test.py` | Check dependencies, run nonempty unittest discovery, and build/run native EOS and pose-parser CTests. | Software changes or dependency upgrades; run with `.venv/bin/python scripts/test.py`. `--python-only` explicitly omits native checks. |
 | `preflight.sh` | Check system, model, controller access, and recording prerequisites. | The operator runs it before acquisition; it can also be run manually with the selected project/model environment. |
 | `qualify_run.py` | Evaluate a completed run against qualification limits. | Verify a run after acquisition. |
@@ -100,3 +100,25 @@ v2 analysis timeline for finalized runs; the teaching notebook uses it.
 
 Python command-line scripts provide `--help`. The shell setup/build scripts
 perform their work directly; they do not implement `--help`.
+
+## Private TensorRT 10 tools
+
+`python3 scripts/install_tensorrt10.py` installs the pinned ARM64 NVIDIA
+TensorRT 10.16.2.10 Python bindings and `trtexec` into `.venv/vendor` without
+changing the system TensorRT packages. It verifies fixed SHA256 hashes,
+checks the three matching TensorRT 10 OS runtime packages, tests the extracted
+bindings/tool before publication, and enables the bindings with a venv-local
+`.pth` file. It is safe to rerun and is called after UV sync by
+`setup_jetson.sh`. Run full setup on a new machine; use this standalone command
+to repair an existing environment. Restart SqueakView afterward.
+
+The shared pins are in `squeakview/common/tensorrt_runtime.py`; the installer
+and OS setup read them directly. Validation requires the private `trtexec`
+and never falls back to the system TensorRT 11 CLI.
+
+Checksum or loader failures before publication leave the existing bundle and
+binding path intact. If activation fails, the previous `.pth` contents are
+restored. Rerunning reuses a valid published bundle without downloading it
+again. For an existing incomplete or mismatched bundle, follow the error's
+instruction to move only that bundle directory aside, then rerun the installer;
+the rest of `.venv` can stay in place.

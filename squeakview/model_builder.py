@@ -234,11 +234,28 @@ def _prepare_export_environment() -> None:
 
 
 def _require_vendor_tensorrt(module_path: str) -> None:
+    from squeakview.common.tensorrt_runtime import bundled_tensorrt_python
+
+    if Path(module_path).resolve().is_relative_to(bundled_tensorrt_python().resolve()):
+        return
     if sys.prefix != sys.base_prefix and Path(module_path).resolve().is_relative_to(Path(sys.prefix).resolve()):
         raise RuntimeError(
             "TensorRT is being imported from the project environment instead of JetPack: "
             f"{module_path}. Remove the pip-installed TensorRT packages from .venv "
-            "and restart the builder; keep the JetPack system TensorRT installation."
+            "and run python3 scripts/install_tensorrt10.py to install the pinned NVIDIA tools."
+        )
+
+
+def _require_supported_tensorrt(version: str) -> None:
+    from squeakview.common.tensorrt_runtime import TENSORRT_VERSION
+
+    supported = TENSORRT_VERSION.split(".")[:2]
+    if version.split(".")[:2] != supported:
+        raise RuntimeError(
+            f"TensorRT Python bindings are {version}, but SqueakView's DeepStream 9.2 "
+            f"stack requires TensorRT {'.'.join(supported)}.x. System TensorRT libraries and Python "
+            "bindings can have different versions installed. Run python3 "
+            "scripts/install_tensorrt10.py and restart SqueakView before rebuilding."
         )
 
 
@@ -334,6 +351,7 @@ def build_model_package(
             import onnx
             import tensorrt as trt
             _require_vendor_tensorrt(trt.__file__)
+            _require_supported_tensorrt(trt.__version__)
             import torch
             import ultralytics
             from ultralytics import YOLO

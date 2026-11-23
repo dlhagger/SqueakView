@@ -19,32 +19,27 @@ def sdk_version(sdk_root: Path) -> str:
     if match is None:
         raise ValueError(f'Unrecognized DeepStream version in {version_file}')
     version = tuple(map(int, match.groups()[:2]))
-    if version not in {(9, 1), (9, 2)}:
-        raise ValueError(f'Parser selection requires DeepStream 9.1 or 9.2; found {match.group(0)}')
+    if version != (9, 2):
+        raise ValueError(f'Parser selection requires DeepStream 9.2; found {match.group(0)}')
     return '.'.join(match.groups())
 
 
 def sdk_headers(sdk_root: Path) -> Path:
     sdk_version(sdk_root)
-    for relative in ('includes', 'sources/includes'):
-        candidate = Path(sdk_root) / relative
-        if (candidate / 'nvdsinfer_custom_impl.h').is_file():
-            return candidate
-    raise ValueError(f'DeepStream headers missing under {sdk_root} (checked includes/ and sources/includes/)')
+    candidate = Path(sdk_root) / 'includes'
+    if (candidate / 'nvdsinfer_custom_impl.h').is_file():
+        return candidate
+    raise ValueError(f'DeepStream headers missing under {sdk_root} (checked includes/)')
 
 
 def parser_variant(sdk_root: Path) -> str:
-    version = tuple(map(int, sdk_version(sdk_root).split('.')[:2]))
-    if version == (9, 2):
-        return 'yolo26'
-    if version == (9, 1):
-        return 'legacy'
+    sdk_version(sdk_root)
+    return 'yolo26'
 
 
 def parser_library_for_sdk(native_root: Path, sdk_root: Path) -> Path:
-    if parser_variant(sdk_root) == 'yolo26':
-        return Path(native_root) / 'yolo26_pose_parser/build/libnvdsinfer_squeakview_pose.so'
-    return Path(native_root) / 'nvdsinfer_custom_impl_yolo/libnvdsinfer_custom_impl_Yolo.so'
+    sdk_version(sdk_root)
+    return Path(native_root) / 'yolo26_pose_parser/build/libnvdsinfer_squeakview_pose.so'
 
 
 if __name__ == '__main__':

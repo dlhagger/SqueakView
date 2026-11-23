@@ -17,7 +17,7 @@ class NativeBuildTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.app = self.root / 'app'
         for relative in ('scripts', 'squeakview/common', 'native/flir_gst_source',
-                         'native/yolo26_pose_parser', 'native/nvdsinfer_custom_impl_yolo'):
+                         'native/yolo26_pose_parser'):
             (self.app / relative).mkdir(parents=True)
         shutil.copy(ROOT / 'squeakview/common/parser_selection.py', self.app / 'squeakview/common')
         vendor = self.root / 'vendor'
@@ -45,9 +45,6 @@ if name == 'cmake' and '-B' in args:
     build.mkdir(parents=True, exist_ok=True)
     filename = 'gstflirspinsrc.so' if build.parent.name == 'flir_gst_source' else 'libnvdsinfer_squeakview_pose.so'
     (build / filename).write_text('test output')
-elif name == 'make':
-    directory = pathlib.Path(args[args.index('-C') + 1])
-    (directory / 'libnvdsinfer_custom_impl_Yolo.so').write_text('test output')
 elif name == 'nm':
     print('00000000 T NvDsInferParseYolo26Pose')
 elif name == 'gst-inspect-1.0':
@@ -72,35 +69,30 @@ elif name == 'gst-inspect-1.0':
                               env=dict(self.env, SQUEAKVIEW_DEEPSTREAM_SDK=str(sdk)),
                               text=True, capture_output=True)
 
-    def test_sdk_switch_dispatches_correct_build_and_ignores_optional_comparison(self):
-        for version, layout in (('9.1.0', 'sources/includes'), ('9.2.0', 'includes')):
-            sdk = self.sdk(version, layout)
-            self.log.unlink(missing_ok=True)
-            result = self.run_build(sdk)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            commands = [json.loads(line) for line in self.log.read_text().splitlines()]
-            self.assertIn(f'Detected DeepStream {version}', result.stdout)
-            if version == '9.1.0':
-                make = next(command for command in commands if command[0] == 'make')
-                self.assertIn(f'DEEPSTREAM_SDK={sdk}', make)
-                self.assertIn(f'DEEPSTREAM_INCLUDES={sdk / layout}', make)
-                self.assertFalse(any(command[0] == 'ctest' for command in commands))
-            else:
-                configure = next(command for command in commands
-                                 if command[0] == 'cmake' and '-S' in command
-                                 and command[command.index('-S') + 1].endswith('yolo26_pose_parser'))
-                self.assertIn('-DBUILD_TESTING=ON', configure)
-                self.assertIn('-DBASELINE_PARSER=', configure)
-                self.assertFalse(any(command[0] == 'make' for command in commands))
+    def test_modern_build_does_not_need_legacy_sources_or_comparison_baseline(self):
+        sdk = self.sdk('9.2.0', 'includes')
+        result = self.run_build(sdk)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertIn('Detected DeepStream 9.2.0', result.stdout)
+        configure = next(command for command in commands
+                         if command[0] == 'cmake' and '-S' in command
+                         and command[command.index('-S') + 1].endswith('yolo26_pose_parser'))
+        self.assertIn('-DBUILD_TESTING=ON', configure)
+        self.assertIn('-DBASELINE_PARSER=', configure)
+        self.assertTrue(any(command[0] == 'ctest' for command in commands))
+        self.assertFalse(any(command[0] == 'make' for command in commands))
 
     def test_unsupported_sdk_fails_before_any_build(self):
-        result = self.run_build(self.sdk('9.3.0', 'includes'))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('requires DeepStream 9.1 or 9.2', result.stderr)
-        self.assertFalse(self.log.exists())
+        for version in ('9.1.0', '9.3.0'):
+            with self.subTest(version=version):
+                result = self.run_build(self.sdk(version, 'includes'))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('requires DeepStream 9.2', result.stderr)
+                self.assertFalse(self.log.exists())
 
 
-@unittest.skipUnless(shutil.which('cmake') and shutil.which('make'), 'requires CMake and Make')
+@unittest.skipUnless(shutil.which('cmake'), 'requires CMake')
 class NativeBuildCacheTests(unittest.TestCase):
     def test_cmake_headers_follow_sdk_after_cached_override_or_layout_change(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -111,9 +103,10 @@ class NativeBuildCacheTests(unittest.TestCase):
                 f'cmake_minimum_required(VERSION 3.16)\nproject(layout NONE)\n'
                 f'include("{ROOT / "native/cmake/DeepStream.cmake"}")\n'
                 'file(WRITE "${CMAKE_BINARY_DIR}/headers.txt" "${DEEPSTREAM_INCLUDES}")\n')
-            for version, layout in (('9.1', 'sources/includes'), ('9.2', 'includes')):
+            for version, layout in (('sdk-a', 'includes'), ('sdk-b', 'includes')):
                 sdk = root / version
                 (sdk / layout).mkdir(parents=True)
+                (sdk / 'version').write_text('Version: 9.2.0\n')
                 (sdk / layout / 'nvdsinfer_custom_impl.h').touch()
                 result = subprocess.run(['cmake', '-S', str(project), '-B', str(root / 'build'),
                                          f'-DDEEPSTREAM_SDK={sdk}', '-DDEEPSTREAM_INCLUDES=/obsolete/headers'],
@@ -121,40 +114,14 @@ class NativeBuildCacheTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual((root / 'build/headers.txt').read_text(), str(sdk / layout))
 
-    def test_legacy_rebuilds_only_when_build_identity_changes(self):
+    def test_direct_cmake_rejects_91_even_with_modern_headers(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            shutil.copy(ROOT / 'native/nvdsinfer_custom_impl_yolo/Makefile', root)
-            (root / 'parser.cpp').write_text('int parser;\n')
-            compiler = root / 'compiler'
-            compiler.write_text('''#!/usr/bin/python3
-import pathlib, sys
-args = sys.argv[1:]
-pathlib.Path(args[args.index('-o') + 1]).touch()
-with open('compiler.log', 'a') as log: log.write('call\\n')
-''')
-            compiler.chmod(0o755)
-            for step, (version, layout) in enumerate((('9.1', 'sources/includes'),
-                                                      ('9.2', 'includes'),
-                                                      ('9.1', 'sources/includes')), start=1):
-                sdk = root / version
-                (sdk / layout).mkdir(parents=True, exist_ok=True)
-                (sdk / 'version').write_text(f'Version: {version}.0\n')
-                for header in ('nvdsinfer_custom_impl.h', 'nvdsinfer.h'):
-                    (sdk / layout / header).touch()
-                for _ in range(2):
-                    result = subprocess.run(['make', '-j2', 'CUDA_VER=13.2', f'CC={compiler}',
-                                             f'DEEPSTREAM_SDK={sdk}'], cwd=root, text=True, capture_output=True)
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                expected_calls = step * 2
-                self.assertEqual(len((root / 'compiler.log').read_text().splitlines()), expected_calls)
-            # An in-place SDK header update must invalidate the build as well.
-            (sdk / layout / 'nvdsinfer.h').write_text('// changed ABI header\n')
-            result = subprocess.run(['make', 'CUDA_VER=13.2', f'CC={compiler}',
-                                     f'DEEPSTREAM_SDK={sdk}'], cwd=root, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(len((root / 'compiler.log').read_text().splitlines()), 8)
-            result = subprocess.run(['make', 'CUDA_VER=13.3', f'CC={compiler}',
-                                     f'DEEPSTREAM_SDK={sdk}'], cwd=root, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(len((root / 'compiler.log').read_text().splitlines()), 10)
+            sdk = Path(directory) / 'sdk'
+            (sdk / 'includes').mkdir(parents=True)
+            (sdk / 'includes/nvdsinfer_custom_impl.h').touch()
+            (sdk / 'version').write_text('Version: 9.1.0\n')
+            result = subprocess.run(['cmake', '-S', str(ROOT / 'native/yolo26_pose_parser'),
+                                     '-B', str(Path(directory) / 'build'), f'-DDEEPSTREAM_SDK={sdk}'],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('requires DeepStream 9.2', result.stderr)

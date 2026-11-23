@@ -156,6 +156,12 @@ printf '[INFO] Package installation may request your sudo password.\n'
   libglib2.0-bin \
   gnome-settings-daemon
 
+# Major-versioned runtime packages coexist with JetPack's TensorRT 11 packages.
+# Keep Python bindings and trtexec private to .venv below, avoiding a system downgrade.
+TENSORRT_RUNTIME_SPECS="$(python3 "$ROOT/squeakview/common/tensorrt_runtime.py" --runtime-packages)"
+mapfile -t TENSORRT_RUNTIME_PACKAGES <<< "$TENSORRT_RUNTIME_SPECS"
+"${AS_ROOT[@]}" apt-get install -y --no-remove "${TENSORRT_RUNTIME_PACKAGES[@]}"
+
 printf '[PASS] VLC is installed.\n'
 printf '[PASS] FFmpeg/ffprobe is installed.\n'
 printf '[PASS] Build tools and GStreamer dependencies are installed.\n'
@@ -263,6 +269,7 @@ else
 fi
 run_as_desktop env UV_PROJECT_ENVIRONMENT="$ROOT/.venv" uv sync --locked --project "$ROOT"
 printf '[PASS] Python environment synchronized from uv.lock.\n'
+run_as_desktop python3 "$ROOT/scripts/install_tensorrt10.py"
 
 step 7 'Build and verify native camera and pose components'
 printf '[INFO] Building as desktop user: %s\n' "$TARGET_USER"

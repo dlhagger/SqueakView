@@ -22,10 +22,10 @@ from squeakview.common.failure_injection import FailurePlan
 
 
 class RunManifestServiceTests(unittest.TestCase):
-    def test_application_parser_identity_follows_selected_sdk_for_both_versions(self):
+    def test_application_parser_identity_follows_selected_sdk_patch(self):
         from squeakview import config as runtime_config
         from squeakview.common.parser_selection import parser_library_for_sdk
-        for version in ('9.1.0', '9.2.0'):
+        for version in ('9.2.0', '9.2.3'):
             (runtime_config.DEEPSTREAM_SDK_ROOT / 'version').write_text(f'Version: {version}\n')
             parser = parser_library_for_sdk(self.root / 'native', runtime_config.DEEPSTREAM_SDK_ROOT)
             parser.parent.mkdir(parents=True, exist_ok=True)
@@ -68,7 +68,7 @@ class RunManifestServiceTests(unittest.TestCase):
         from squeakview import config as runtime_config
         sdk = self.root / 'sdk'
         sdk.mkdir()
-        (sdk / 'version').write_text('Version: 9.1.0\n')
+        (sdk / 'version').write_text('Version: 9.2.0\n')
         sdk_patch = mock.patch.object(runtime_config, 'DEEPSTREAM_SDK_ROOT', sdk)
         sdk_patch.start()
         self.addCleanup(sdk_patch.stop)
